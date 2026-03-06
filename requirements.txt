@@ -1,0 +1,7 @@
+yfinance
+pandas
+numpy
+scikit-learn
+ta
+transformers
+torch
