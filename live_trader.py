@@ -19,6 +19,8 @@ import sys
 import subprocess
 import math
 
+from dotenv import load_dotenv
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Dependency check — install alpaca-trade-api if not present

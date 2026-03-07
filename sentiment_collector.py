@@ -15,6 +15,9 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from config import DATA_DIR, WATCHLIST
 from sentiment import _get_pipeline, _score_headline
 
