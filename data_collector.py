@@ -6,6 +6,7 @@ and saves cleaned DataFrames for downstream feature engineering.
 """
 
 import os
+import pandas as pd
 import yfinance as yf
 from config import WATCHLIST, HISTORY_PERIOD, DATA_DIR
 
@@ -24,6 +25,13 @@ def download_ticker(ticker: str) -> None:
         print(f"[WARNING] {ticker} — no data returned, skipping")
         return
 
+    # Flatten MultiIndex columns produced by recent yfinance versions
+    # e.g. ("Close", "AAPL") → "Close"
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df = df[["Close", "High", "Low", "Open", "Volume"]]
+    df.index.name = "Date"
     df.to_csv(path)
     print(f"[OK]      {ticker} — {len(df)} rows saved to {path}")
 
