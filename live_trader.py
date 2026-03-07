@@ -12,12 +12,16 @@ predictor.py, then submits orders according to the following rules:
 
 All orders are submitted as market orders.  Because the base URL points to
 paper-api.alpaca.markets this script CANNOT place live trades.
+
+Discord alerts are sent before and after order execution if
+DISCORD_WEBHOOK_URL is set in the environment.
 """
 
 import os
 import sys
 import subprocess
 import math
+from datetime import datetime
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -103,44 +107,154 @@ def get_owned_tickers(api: tradeapi.REST) -> dict[str, float]:
     return {p.symbol: float(p.qty) for p in positions}
 
 
+def get_equity(api: tradeapi.REST) -> float:
+    return float(api.get_account().equity)
+
+
 # ---------------------------------------------------------------------------
 # Order helpers
 # ---------------------------------------------------------------------------
-def shares_to_buy(api: tradeapi.REST, price: float, fraction: float = 0.20) -> int:
-    """
-    Calculate how many whole shares represent `fraction` of account equity.
-    Returns 0 if the account cannot afford at least one share.
-    """
-    account   = api.get_account()
-    equity    = float(account.equity)
-    budget    = equity * fraction
-    shares    = math.floor(budget / price)
-    return max(shares, 0)
+def compute_buy_qty(equity: float, price: float, fraction: float = 0.20) -> int:
+    """Whole shares that fit within `fraction` of account equity."""
+    return max(math.floor(equity * fraction / price), 0)
 
 
-def place_buy(api: tradeapi.REST, ticker: str, qty: int) -> None:
+def place_buy(api: tradeapi.REST, ticker: str, qty: int) -> dict:
+    """Submit a market buy order. Returns a result dict."""
     if qty <= 0:
         print(f"  [SKIP] {ticker} — insufficient equity for even 1 share")
+        return {"status": "skipped", "reason": "insufficient equity"}
+    try:
+        order = api.submit_order(
+            symbol        = ticker,
+            qty           = qty,
+            side          = "buy",
+            type          = "market",
+            time_in_force = "day",
+        )
+        print(f"  [BUY]  {ticker} x{qty} — order id {order.id}")
+        return {"status": "placed", "order_id": order.id}
+    except Exception as exc:
+        print(f"  [ERROR] {ticker} BUY failed: {exc}")
+        return {"status": "error", "reason": str(exc)}
+
+
+def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
+    """Submit a market sell order. Returns a result dict."""
+    try:
+        order = api.submit_order(
+            symbol        = ticker,
+            qty           = qty,
+            side          = "sell",
+            type          = "market",
+            time_in_force = "day",
+        )
+        print(f"  [SELL] {ticker} x{qty} — order id {order.id}")
+        return {"status": "placed", "order_id": order.id}
+    except Exception as exc:
+        print(f"  [ERROR] {ticker} SELL failed: {exc}")
+        return {"status": "error", "reason": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Discord alerting
+# ---------------------------------------------------------------------------
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+
+
+def send_discord(message: str) -> None:
+    """POST a message to the Discord webhook. Silently skips if URL not set."""
+    if not DISCORD_WEBHOOK_URL:
         return
-    order = api.submit_order(
-        symbol     = ticker,
-        qty        = qty,
-        side       = "buy",
-        type       = "market",
-        time_in_force = "day",
-    )
-    print(f"  [BUY]  {ticker} x{qty} — order id {order.id}")
+    try:
+        import requests
+        resp = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json    = {"content": message},
+            timeout = 10,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        print(f"  [Discord] Alert failed: {exc}")
 
 
-def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> None:
-    order = api.submit_order(
-        symbol     = ticker,
-        qty        = qty,
-        side       = "sell",
-        type       = "market",
-        time_in_force = "day",
-    )
-    print(f"  [SELL] {ticker} x{qty} — order id {order.id}")
+def build_pre_order_alert(planned: list[dict], timestamp: str) -> str:
+    """
+    Build the pre-order Discord message.
+
+    Each item in `planned` has:
+        ticker, action, qty, price, note, skip_reason
+    """
+    n_buy  = sum(1 for p in planned if p["action"] == "BUY"  and not p["skip_reason"])
+    n_sell = sum(1 for p in planned if p["action"] == "SELL" and not p["skip_reason"])
+    n_hold = sum(1 for p in planned if p["action"] == "HOLD")
+    n_skip = sum(1 for p in planned if p["skip_reason"])
+
+    lines = [
+        f"**Finance Bot — Pre-Trade Plan** | {timestamp}",
+        f"Summary: {n_buy} BUY | {n_sell} SELL | {n_hold} HOLD | {n_skip} skipped",
+        "```",
+    ]
+
+    for p in planned:
+        action      = p["action"]
+        ticker      = p["ticker"]
+        price       = p["price"]
+        qty         = p["qty"]
+        note        = f"  [{p['note']}]" if p["note"] else ""
+        skip_reason = f"  → {p['skip_reason']}" if p["skip_reason"] else ""
+
+        if action in ("BUY", "SELL") and not p["skip_reason"]:
+            lines.append(f"  {action:<4} {ticker:<6} x{qty:<4} @ ${price:>8.2f}{note}")
+        elif p["skip_reason"]:
+            lines.append(f"  {action:<4} {ticker:<6}        @ ${price:>8.2f}{note}{skip_reason}")
+        else:  # HOLD
+            lines.append(f"  {action:<4} {ticker:<6}        @ ${price:>8.2f}{note}")
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def build_post_order_alert(outcomes: list[dict], portfolio_value: float, timestamp: str) -> str:
+    """
+    Build the post-order Discord message.
+
+    Each item in `outcomes` has:
+        ticker, action, qty, price, status, order_id, reason
+    """
+    placed  = [o for o in outcomes if o["status"] == "placed"]
+    skipped = [o for o in outcomes if o["status"] == "skipped"]
+    errors  = [o for o in outcomes if o["status"] == "error"]
+
+    lines = [
+        f"**Finance Bot — Trade Results** | {timestamp}",
+        f"Portfolio value: **${portfolio_value:,.2f}**",
+        "```",
+    ]
+
+    if placed:
+        lines.append("Placed:")
+        for o in placed:
+            lines.append(f"  {o['action']:<4} {o['ticker']:<6} x{o['qty']:<4} @ ${o['price']:>8.2f}  order {o['order_id']}")
+    else:
+        lines.append("Placed:  none")
+
+    if skipped:
+        lines.append("Skipped:")
+        for o in skipped:
+            lines.append(f"  {o['action']:<4} {o['ticker']:<6}  — {o['reason']}")
+    else:
+        lines.append("Skipped: none")
+
+    if errors:
+        lines.append("Errors:")
+        for o in errors:
+            lines.append(f"  {o['action']:<4} {o['ticker']:<6}  — {o['reason']}")
+    else:
+        lines.append("Errors:  none")
+
+    lines.append("```")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -168,41 +282,97 @@ def run() -> None:
         print("  No signals generated. Exiting.")
         sys.exit(0)
 
-    # 4. Current positions
-    owned = get_owned_tickers(api)
-    print(f"\n  Current positions: {list(owned.keys()) or 'none'}\n")
+    # 4. Current positions and equity (fetched once for consistent sizing)
+    owned  = get_owned_tickers(api)
+    equity = get_equity(api)
+    print(f"\n  Current positions: {list(owned.keys()) or 'none'}")
+    print(f"  Account equity:    ${equity:,.2f}\n")
 
-    # 5. Execute logic
+    # 5. Build planned-action list (pre-order alert data + drives execution)
+    planned = []
+    for r in signals:
+        ticker = r["ticker"]
+        action = r["final_signal"]
+        price  = r["current_price"]
+        note   = r["note"]
+
+        if action == "BUY":
+            if ticker not in owned:
+                qty         = compute_buy_qty(equity, price)
+                skip_reason = "" if qty > 0 else "insufficient equity"
+            else:
+                qty         = 0
+                skip_reason = "already owned"
+
+        elif action == "SELL":
+            qty         = owned.get(ticker, 0)
+            skip_reason = "" if ticker in owned else "not owned"
+
+        else:  # HOLD
+            qty         = 0
+            skip_reason = ""
+
+        planned.append({
+            "ticker":      ticker,
+            "action":      action,
+            "qty":         qty,
+            "price":       price,
+            "note":        note,
+            "skip_reason": skip_reason,
+        })
+
+    # 6. Pre-order Discord alert
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    send_discord(build_pre_order_alert(planned, timestamp))
+
+    # 7. Execute orders and collect outcomes
     print("  Applying trading rules...")
     print("-" * 60)
 
-    for r in signals:
-        ticker       = r["ticker"]
-        final_signal = r["final_signal"]
-        price        = r["current_price"]
-        note         = f" ({r['note']})" if r["note"] else ""
+    outcomes = []
+    for p in planned:
+        ticker      = p["ticker"]
+        action      = p["action"]
+        qty         = p["qty"]
+        price       = p["price"]
+        note        = f" ({p['note']})" if p["note"] else ""
+        skip_reason = p["skip_reason"]
 
-        if final_signal == "BUY":
-            if ticker not in owned:
-                qty = shares_to_buy(api, price)
-                print(f"  Signal: BUY {ticker} @ ${price:.2f}{note}")
-                place_buy(api, ticker, qty)
-            else:
-                print(f"  Signal: BUY {ticker}{note} — already owned, skipping")
+        if action == "BUY" and not skip_reason:
+            print(f"  Signal: BUY {ticker} @ ${price:.2f}{note}")
+            result = place_buy(api, ticker, qty)
 
-        elif final_signal == "SELL":
-            if ticker in owned:
-                qty = owned[ticker]
-                print(f"  Signal: SELL {ticker} @ ${price:.2f}{note}")
-                place_sell(api, ticker, qty)
-            else:
-                print(f"  Signal: SELL {ticker}{note} — not owned, skipping")
+        elif action == "SELL" and not skip_reason:
+            print(f"  Signal: SELL {ticker} @ ${price:.2f}{note}")
+            result = place_sell(api, ticker, qty)
 
-        else:  # HOLD
+        elif action == "HOLD":
             print(f"  Signal: HOLD {ticker}{note} — no action")
+            result = {"status": "skipped", "reason": "HOLD signal"}
+
+        else:
+            print(f"  Signal: {action} {ticker}{note} — skipped ({skip_reason})")
+            result = {"status": "skipped", "reason": skip_reason}
+
+        outcomes.append({
+            "ticker":   ticker,
+            "action":   action,
+            "qty":      qty,
+            "price":    price,
+            "status":   result["status"],
+            "order_id": result.get("order_id", ""),
+            "reason":   result.get("reason", ""),
+        })
 
     print("-" * 60)
-    print("\n  Done.\n")
+
+    # 8. Post-order Discord alert (refresh equity for current portfolio value)
+    portfolio_value = get_equity(api)
+    timestamp_end   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    send_discord(build_post_order_alert(outcomes, portfolio_value, timestamp_end))
+
+    print(f"\n  Portfolio value: ${portfolio_value:,.2f}")
+    print("  Done.\n")
 
 
 if __name__ == "__main__":
