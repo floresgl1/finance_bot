@@ -12,7 +12,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from config import WATCHLIST, FEATURE_COLUMNS, CONFIDENCE_THRESHOLD, MODEL_DIR
+from config import WATCHLIST, FEATURE_COLUMNS, CONFIDENCE_THRESHOLD, MODEL_DIR, MODEL_FILENAME
 from features import load_and_process
 
 # --- Backtest settings ---
@@ -34,7 +34,7 @@ VAL_PCT   = 0.20
 
 def load_model():
     """Load the trained RandomForest model from MODEL_DIR."""
-    path = os.path.join(MODEL_DIR, "random_forest.joblib")
+    path = os.path.join(MODEL_DIR, MODEL_FILENAME)
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"No model found at {path} — run trainer.py first."
