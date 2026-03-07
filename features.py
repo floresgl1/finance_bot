@@ -12,9 +12,10 @@ from functools import lru_cache
 import numpy as np
 import pandas as pd
 import ta
-import yfinance as yf
 
 from config import DATA_DIR, WATCHLIST
+
+MARKET_DATA_DIR = os.path.join(DATA_DIR, "market")
 
 
 # Sector ETF for each ticker in the watchlist.
@@ -30,18 +31,50 @@ SECTOR_MAP = {
 
 
 @lru_cache(maxsize=None)
+def _load_market_close(symbol: str) -> pd.Series:
+    """
+    Load and cache the full Close price series for a market symbol from
+    data/market/<symbol>.csv.
+
+    Raises FileNotFoundError immediately with a clear message if the CSV is
+    missing — run market_data_collector.py to generate it.
+
+    Results are memoised so tickers sharing a sector ETF (e.g. all XLK stocks)
+    only trigger one file read per session.
+    """
+    filename = f"{symbol}.csv"
+    path = os.path.join(MARKET_DATA_DIR, filename)
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"\n[ERROR] {filename} not found in '{MARKET_DATA_DIR}'\n"
+            f"        Run: python market_data_collector.py\n"
+        )
+
+    df = pd.read_csv(path, dtype=str)
+
+    # Same defensive Date-index pattern used in load_and_process
+    if "Date" in df.columns:
+        df = df.set_index("Date")
+    else:
+        df = df.set_index(df.columns[0])
+
+    df.index = pd.to_datetime(df.index)
+    df.index.name = "Date"
+
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    close.index = close.index.tz_localize(None)
+    return close
+
+
 def _download_close(symbol: str, start: str, end: str) -> pd.Series:
     """
-    Download and cache daily close prices for any symbol.
+    Return cached Close prices for a market symbol, read from data/market/.
 
-    Results are memoised by (symbol, start, end) so that tickers sharing the
-    same sector ETF (e.g. all seven XLK stocks) trigger only one download per
-    session rather than one per ticker.
+    The start/end arguments are kept for call-site compatibility but are not
+    used for filtering — callers already reindex to the ticker's date range.
     """
-    data  = yf.download(symbol, start=start, end=end, auto_adjust=True, progress=False)
-    close = data["Close"].squeeze()
-    close.index = pd.to_datetime(close.index).tz_localize(None)
-    return close
+    return _load_market_close(symbol)
 
 
 def add_features(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
