@@ -4,6 +4,11 @@ Trains and evaluates the ML classification model.
 Splits data into three chronological sets (70% train / 20% validation /
 10% test), tunes the confidence threshold on validation, then reports
 final results on the held-out test set.
+
+XGBoost requires integer class labels, so a LabelEncoder is fitted on the
+training labels and saved alongside the model in a single bundle:
+    {"model": XGBClassifier, "encoder": LabelEncoder}
+predictor.py uses the encoder to decode predictions back to BUY/SELL/HOLD.
 """
 
 import os
@@ -11,29 +16,29 @@ import re
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import GridSearchCV
+from xgboost import XGBClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report, confusion_matrix
 
-from config import WATCHLIST, MODEL_DIR, CONFIDENCE_THRESHOLD, FEATURE_COLUMNS
+from config import WATCHLIST, MODEL_DIR, MODEL_FILENAME, CONFIDENCE_THRESHOLD, FEATURE_COLUMNS, XGB_PARAMS
 from features import load_and_process
 from labels import add_labels
 
 
 def apply_confidence_threshold(
-    model: RandomForestClassifier,
+    model: XGBClassifier,
     X: pd.DataFrame,
     threshold: float,
+    encoder: LabelEncoder,
 ) -> np.ndarray:
     """
-    Return predictions where BUY/SELL require the top class probability to
-    exceed `threshold`; otherwise the prediction is overridden to HOLD.
+    Return decoded string predictions (BUY/SELL/HOLD) where BUY/SELL require
+    the top class probability to exceed `threshold`; otherwise overridden to HOLD.
     """
     proba    = model.predict_proba(X)
-    labels   = np.array(model.classes_)
     top_idx  = np.argmax(proba, axis=1)
     top_prob = proba[np.arange(len(proba)), top_idx]
-    preds    = labels[top_idx].copy()
+    preds    = encoder.inverse_transform(top_idx).copy()
     preds[top_prob < threshold] = "HOLD"
     return preds
 
@@ -72,9 +77,10 @@ def build_dataset() -> tuple[pd.DataFrame, pd.Series]:
 
 
 def tune_threshold(
-    model: RandomForestClassifier,
+    model: XGBClassifier,
     X_val: pd.DataFrame,
     y_val: pd.Series,
+    encoder: LabelEncoder,
 ) -> float:
     """
     Search thresholds from 0.35 to 0.60 and return the one that maximises
@@ -90,7 +96,7 @@ def tune_threshold(
 
     for t in np.arange(0.35, 0.61, 0.05):
         t = round(float(t), 2)
-        y_pred  = apply_confidence_threshold(model, X_val, t)
+        y_pred  = apply_confidence_threshold(model, X_val, t, encoder)
         report  = classification_report(
             y_val, y_pred,
             labels=["BUY", "HOLD", "SELL"],
@@ -139,7 +145,7 @@ def _print_confusion(cm: np.ndarray, labels: list[str]) -> None:
 
 
 def train() -> None:
-    """Build the dataset, run walk-forward validation, train the model, and save it."""
+    """Build the dataset, train XGBoost with a LabelEncoder, and save the bundle."""
     print("=== Loading data ===")
     X, y = build_dataset()
 
@@ -152,38 +158,26 @@ def train() -> None:
     X_test,  y_test  = X.iloc[val_end:],          y.iloc[val_end:]
 
     print(f"\nTotal samples : {n}")
-    print(f"Train         : {len(X_train)} rows  ({X_train.index.min().date()} to{X_train.index.max().date()})")
-    print(f"Validation    : {len(X_val)} rows  ({X_val.index.min().date()} to{X_val.index.max().date()})")
-    print(f"Test          : {len(X_test)} rows  ({X_test.index.min().date()} to{X_test.index.max().date()})")
+    print(f"Train         : {len(X_train)} rows  ({X_train.index.min().date()} to {X_train.index.max().date()})")
+    print(f"Validation    : {len(X_val)} rows  ({X_val.index.min().date()} to {X_val.index.max().date()})")
+    print(f"Test          : {len(X_test)} rows  ({X_test.index.min().date()} to {X_test.index.max().date()})")
     print(f"\nClass distribution (train):\n{y_train.value_counts().to_string()}\n")
 
-    # --- Train on training set only ---
-    print("=== Training RandomForestClassifier with GridSearchCV ===")
-    param_grid = {
-        "n_estimators":     [100, 200, 300, 400],
-        "max_depth":        [3, 4, 5],
-        "min_samples_leaf": [30, 40, 50, 60],
-    }
-    base_estimator = RandomForestClassifier(
-        class_weight="balanced",
-        random_state=42,
-        
-    )
-    grid_search = GridSearchCV(
-        base_estimator,
-        param_grid,
-        scoring="f1_macro",
-        cv=5,
-        n_jobs=-1,
-        verbose=2,
-    )
-    grid_search.fit(X_train, y_train)
-    print(f"  Best parameters: {grid_search.best_params_}")
-    model = grid_search.best_estimator_
+    # --- Encode string labels to integers for XGBoost ---
+    # LabelEncoder sorts alphabetically: BUY→0, HOLD→1, SELL→2
+    le = LabelEncoder()
+    y_train_enc = le.fit_transform(y_train)
+    print(f"Label encoding: { {cls: i for i, cls in enumerate(le.classes_)} }")
+
+    # --- Train XGBoost with hyperparameters from config ---
+    print("\n=== Training XGBClassifier ===")
+    model = XGBClassifier(**XGB_PARAMS, random_state=42)
+    model.fit(X_train, y_train_enc)
+    print("  Training complete.")
 
     # --- Tune confidence threshold on validation set ---
     print("\n=== Tuning confidence threshold on validation set ===")
-    best_threshold = tune_threshold(model, X_val, y_val)
+    best_threshold = tune_threshold(model, X_val, y_val, le)
     print(f"\n  Best threshold: {best_threshold}  (maximises BUY F1 on validation)")
 
     # Persist the best threshold back to config.py so all modules use it
@@ -194,22 +188,22 @@ def train() -> None:
     labels = ["BUY", "HOLD", "SELL"]
     print("\n=== Evaluation on held-out TEST set (out-of-sample) ===")
 
-    y_pred_raw    = model.predict(X_test)
+    y_pred_raw    = le.inverse_transform(model.predict(X_test))
     print("Without threshold:")
     print(classification_report(y_test, y_pred_raw, target_names=labels, zero_division=0))
     _print_confusion(confusion_matrix(y_test, y_pred_raw, labels=labels), labels)
 
-    y_pred_thresh = apply_confidence_threshold(model, X_test, best_threshold)
+    y_pred_thresh = apply_confidence_threshold(model, X_test, best_threshold, le)
     n_forced      = int(np.sum((y_pred_thresh == "HOLD") & (y_pred_raw != "HOLD")))
     print(f"\nWith threshold = {best_threshold}  ({n_forced} predictions forced to HOLD):")
     print(classification_report(y_test, y_pred_thresh, target_names=labels, zero_division=0))
     _print_confusion(confusion_matrix(y_test, y_pred_thresh, labels=labels), labels)
 
-    # --- Save model ---
+    # --- Save model bundle ---
     os.makedirs(MODEL_DIR, exist_ok=True)
-    model_path = os.path.join(MODEL_DIR, "random_forest.joblib")
-    joblib.dump(model, model_path)
-    print(f"\nModel saved to {model_path}")
+    model_path = os.path.join(MODEL_DIR, MODEL_FILENAME)
+    joblib.dump({"model": model, "encoder": le}, model_path)
+    print(f"\nModel bundle saved to {model_path}")
 
 
 if __name__ == "__main__":

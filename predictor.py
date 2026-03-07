@@ -16,7 +16,7 @@ from datetime import date
 import joblib
 import numpy as np
 
-from config import WATCHLIST, MODEL_DIR, CONFIDENCE_THRESHOLD, FEATURE_COLUMNS
+from config import WATCHLIST, MODEL_DIR, MODEL_FILENAME, CONFIDENCE_THRESHOLD, FEATURE_COLUMNS
 from features import load_and_process
 from sentiment import get_sentiment_all
 
@@ -29,9 +29,15 @@ VETO_BUY_THRESHOLD  = -0.2   # BUY vetoed when sentiment falls below this
 VETO_SELL_THRESHOLD =  0.2   # SELL vetoed when sentiment rises above this
 
 
-def load_model():
-    """Load the trained RandomForest model from MODEL_DIR."""
-    path = os.path.join(MODEL_DIR, "random_forest.joblib")
+def load_model() -> dict:
+    """
+    Load the XGBoost model bundle from MODEL_DIR.
+
+    Returns a dict with keys:
+        model   — trained XGBClassifier
+        encoder — LabelEncoder that maps BUY/HOLD/SELL ↔ 0/1/2
+    """
+    path = os.path.join(MODEL_DIR, MODEL_FILENAME)
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"No trained model found at {path} — run trainer.py first."
@@ -39,9 +45,14 @@ def load_model():
     return joblib.load(path)
 
 
-def predict_ticker(ticker: str, model) -> dict:
+def predict_ticker(ticker: str, model_bundle: dict) -> dict:
     """
     Generate a base recommendation for a single ticker.
+
+    Args:
+        ticker       — the stock symbol
+        model_bundle — dict with keys 'model' (XGBClassifier) and
+                       'encoder' (LabelEncoder) as saved by trainer.py
 
     Returns a dict with:
         ticker        — the stock symbol
@@ -49,6 +60,9 @@ def predict_ticker(ticker: str, model) -> dict:
         confidence    — highest class probability as a percentage
         current_price — today's closing price in USD
     """
+    model   = model_bundle["model"]
+    encoder = model_bundle["encoder"]
+
     df = load_and_process(ticker)
     latest = df.iloc[-1]
 
@@ -56,10 +70,10 @@ def predict_ticker(ticker: str, model) -> dict:
     X = latest[FEATURE_COLUMNS].values.reshape(1, -1)
 
     proba    = model.predict_proba(X)[0]
-    labels   = np.array(model.classes_)
     top_idx  = int(np.argmax(proba))
     top_prob = float(proba[top_idx])
-    signal   = labels[top_idx] if top_prob >= CONFIDENCE_THRESHOLD else "HOLD"
+    # Decode integer prediction back to string label
+    signal   = encoder.inverse_transform([top_idx])[0] if top_prob >= CONFIDENCE_THRESHOLD else "HOLD"
 
     return {
         "ticker":        ticker,
