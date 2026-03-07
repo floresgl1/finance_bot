@@ -154,15 +154,23 @@ def load_and_process(ticker: str) -> pd.DataFrame:
     """Load a ticker's CSV from DATA_DIR, add features, and return the result."""
     path = os.path.join(DATA_DIR, f"{ticker}.csv")
 
-    # Read without parsing dates so non-date index values (e.g. "Ticker" or
-    # "AAPL") don't raise a DateParseError before we can clean them out.
-    df = pd.read_csv(path, index_col=0, dtype=str)
+    # Read without parsing dates so non-date values don't raise before we clean.
+    df = pd.read_csv(path, dtype=str)
 
-    # Drop any rows whose index cannot be interpreted as a date.
+    # Normalise index: if a "Date" column exists (CSV saved with a leading
+    # RangeIndex column), promote it; otherwise use whatever is in column 0.
+    if "Date" in df.columns:
+        df = df.set_index("Date")
+    else:
+        df = df.set_index(df.columns[0])
+
+    # Drop any rows whose index cannot be interpreted as a date (e.g. stray
+    # "Price" / "Ticker" header rows from older multi-level yfinance CSVs).
     valid_mask = pd.to_datetime(df.index, errors="coerce").notna()
     df = df[valid_mask]
 
     df.index = pd.to_datetime(df.index)
+    df.index.name = "Date"
 
     # Convert all columns to numeric; stray strings become NaN.
     for col in df.columns:
