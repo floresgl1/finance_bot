@@ -33,24 +33,30 @@ VAL_PCT   = 0.20
 # ---------------------------------------------------------------------------
 
 def load_model():
-    """Load the trained RandomForest model from MODEL_DIR."""
+    """Load the XGBoost model bundle from MODEL_DIR and unpack it.
+
+    Returns:
+        model   — trained XGBoost classifier
+        encoder — fitted LabelEncoder (use encoder.classes_ for class labels)
+    """
     path = os.path.join(MODEL_DIR, MODEL_FILENAME)
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"No model found at {path} — run trainer.py first."
         )
-    return joblib.load(path)
+    bundle = joblib.load(path)
+    return bundle["model"], bundle["encoder"]
 
 
-def load_all_tickers(model) -> dict[str, pd.DataFrame]:
+def load_all_tickers(model, encoder) -> dict[str, pd.DataFrame]:
     """
     Load, process, and generate model signals for every ticker in WATCHLIST.
 
-    Returns a dict mapping ticker toDataFrame with columns:
+    Returns a dict mapping ticker to DataFrame with columns:
         Close, Signal (prediction after confidence threshold), Confidence
     """
     ticker_data   = {}
-    model_classes = np.array(model.classes_)
+    model_classes = np.array(encoder.classes_)
 
     for ticker in WATCHLIST:
         try:
@@ -221,6 +227,7 @@ def run_backtest(
     split: str = "full",
     *,
     model=None,
+    encoder=None,
     ticker_data: dict | None = None,
 ) -> dict:
     """
@@ -236,11 +243,11 @@ def run_backtest(
     if split not in ("full", "train", "validation", "test"):
         raise ValueError(f"split must be 'full', 'train', 'validation', or 'test'; got '{split}'")
 
-    if model is None:
-        model = load_model()
+    if model is None or encoder is None:
+        model, encoder = load_model()
     if ticker_data is None:
         print("=== Loading data and generating signals ===")
-        ticker_data = load_all_tickers(model)
+        ticker_data = load_all_tickers(model, encoder)
         if not ticker_data:
             print("No data loaded — run data_collector.py first.")
             return {}
@@ -312,15 +319,15 @@ def _print_summary(stats: dict, label: str = "") -> None:
 
 if __name__ == "__main__":
     print("=== Loading data and generating signals ===")
-    _model       = load_model()
-    _ticker_data = load_all_tickers(_model)
+    _model, _encoder = load_model()
+    _ticker_data     = load_all_tickers(_model, _encoder)
 
     splits   = ["train", "validation", "test", "full"]
     all_stats = {}
 
     for sp in splits:
         print(f"\n--- Running split: {sp} ---")
-        stats = run_backtest(sp, model=_model, ticker_data=_ticker_data)
+        stats = run_backtest(sp, model=_model, encoder=_encoder, ticker_data=_ticker_data)
         all_stats[sp] = stats
 
     # Save the full-period equity curve for later visualisation

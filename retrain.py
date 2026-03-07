@@ -262,8 +262,8 @@ def run_rolling_backtest() -> dict:
 
     # --- Static model comparison (full-period, same data) ---
     print("\n=== Running static model backtest for comparison ===")
-    static_model  = load_model()
-    static_td     = load_all_tickers(static_model)
+    static_model, static_encoder = load_model()
+    static_td     = load_all_tickers(static_model, static_encoder)
     static_result = run_backtest("full", model=static_model, ticker_data=static_td)
 
     static_stats = {
