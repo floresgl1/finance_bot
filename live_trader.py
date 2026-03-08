@@ -20,6 +20,9 @@ Veto layers applied before execution:
   1. Sentiment veto  (FinBERT)
   2. Earnings veto   (recent Surprise%)
 
+Stop-loss check runs before model signals:
+  Loss > 10 % from avg entry → market sell + Discord alert
+
 All orders are submitted as market orders.  Because the base URL points to
 paper-api.alpaca.markets this script CANNOT place live trades.
 
@@ -199,6 +202,55 @@ def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Stop-loss
+# ---------------------------------------------------------------------------
+def check_stop_losses(
+    api: tradeapi.REST,
+    owned: dict[str, float],
+    equity: float,
+    stop_pct: float = 10.0,
+) -> tuple[list[str], dict[str, float]]:
+    """
+    Check every open position for a loss exceeding stop_pct and sell immediately.
+
+    Loss formula: (entry_price - current_price) / entry_price * 100
+
+    Sends a dedicated Discord alert for each triggered stop loss:
+        [STOP LOSS] AAPL sold — down 12.3%
+
+    Returns:
+        stopped_out — list of tickers that were sold
+        owned       — updated positions dict (stopped tickers removed)
+    """
+    positions   = api.list_positions()
+    stopped_out = []
+
+    for position in positions:
+        ticker        = position.symbol
+        current_price = float(position.current_price)
+        entry_price   = float(position.avg_entry_price)
+        qty           = float(position.qty)
+
+        loss_pct = (entry_price - current_price) / entry_price * 100
+
+        if loss_pct > stop_pct:
+            print(f"  [STOP LOSS] {ticker} — down {loss_pct:.1f}% — selling {qty} shares")
+            result = place_sell(api, ticker, qty)
+
+            alert = (
+                f"🛑 **[STOP LOSS]** {ticker} sold — down {loss_pct:.1f}%  "
+                f"(entry ${entry_price:.2f} → current ${current_price:.2f})"
+            )
+            send_discord(alert)
+
+            if result["status"] == "placed":
+                stopped_out.append(ticker)
+                owned.pop(ticker, None)
+
+    return stopped_out, owned
+
+
+# ---------------------------------------------------------------------------
 # Discord alerting
 # ---------------------------------------------------------------------------
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
@@ -318,19 +370,31 @@ def run() -> None:
 
     print("  Market is OPEN — proceeding with signal generation.\n")
 
-    # 3. Get today's signals
+    # 3. Stop-loss check — runs before model signals so stopped positions
+    #    are excluded from the signal execution pass
+    owned  = get_owned_tickers(api)
+    equity = get_equity(api)
+    print(f"  Checking stop losses on {len(owned)} open position(s)...")
+    stopped_out, owned = check_stop_losses(api, owned, equity)
+    if stopped_out:
+        print(f"  Stopped out: {stopped_out}")
+        # Refresh positions and equity after stop-loss sells
+        owned  = get_owned_tickers(api)
+        equity = get_equity(api)
+    else:
+        print("  No stop losses triggered.")
+
+    # 4. Get today's signals
     signals = get_signals()
     if not signals:
         print("  No signals generated. Exiting.")
         sys.exit(0)
 
-    # 4. Current positions and equity (fetched once for consistent sizing)
-    owned  = get_owned_tickers(api)
-    equity = get_equity(api)
+    # 5. Current positions and equity snapshot for signal execution
     print(f"\n  Current positions: {list(owned.keys()) or 'none'}")
     print(f"  Account equity:    ${equity:,.2f}\n")
 
-    # 5. Build planned-action list (pre-order alert data + drives execution)
+    # 6. Build planned-action list (pre-order alert data + drives execution)
     planned = []
     for r in signals:
         ticker = r["ticker"]
@@ -368,11 +432,11 @@ def run() -> None:
             "skip_reason": skip_reason,
         })
 
-    # 6. Pre-order Discord alert
+    # 7. Pre-order Discord alert
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     send_discord(build_pre_order_alert(planned, timestamp))
 
-    # 7. Execute orders and collect outcomes
+    # 8. Execute orders and collect outcomes
     print("  Applying trading rules...")
     print("-" * 60)
 
@@ -413,7 +477,7 @@ def run() -> None:
 
     print("-" * 60)
 
-    # 8. Post-order Discord alert (refresh equity for current portfolio value)
+    # 9. Post-order Discord alert (refresh equity for current portfolio value)
     portfolio_value = get_equity(api)
     timestamp_end   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     send_discord(build_post_order_alert(outcomes, portfolio_value, timestamp_end))
