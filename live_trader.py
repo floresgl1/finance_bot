@@ -4,11 +4,21 @@ live_trader.py — Alpaca paper-trading execution layer.
 Connects to Alpaca's paper-trading endpoint, fetches today's signals from
 predictor.py, then submits orders according to the following rules:
 
-  BUY  + not already owned  → buy shares  (20 % of account equity)
+  BUY  + not already owned  → buy shares (conviction-based % of equity)
   BUY  + already owned      → skip (already positioned)
   SELL + owned              → sell the entire position
   SELL + not owned          → skip (no position to close)
   HOLD                      → do nothing
+
+Position sizing is conviction-based (confidence score):
+  below 35 % → skip (treat as HOLD)
+  35 – 40 %  → 10 % of equity
+  40 – 45 %  → 15 % of equity
+  45 %+      → 20 % of equity
+
+Veto layers applied before execution:
+  1. Sentiment veto  (FinBERT)
+  2. Earnings veto   (recent Surprise%)
 
 All orders are submitted as market orders.  Because the base URL points to
 paper-api.alpaca.markets this script CANNOT place live trades.
@@ -70,11 +80,17 @@ def get_signals() -> list[dict]:
     """
     Return a list of signal dicts for every ticker in WATCHLIST.
 
+    Applies two veto layers in order:
+      1. Sentiment veto  (FinBERT)
+      2. Earnings veto   (recent Surprise% within 90 days)
+
     Each dict contains:
         ticker, signal, final_signal, confidence, current_price, sentiment, note
     """
     from config import WATCHLIST
-    from predictor import load_model, predict_ticker, apply_sentiment_veto
+    from predictor import (load_model, predict_ticker,
+                           apply_sentiment_veto,
+                           apply_earnings_veto, get_recent_earnings_surprise)
     from sentiment import get_sentiment_all
 
     model = load_model()
@@ -87,10 +103,17 @@ def get_signals() -> list[dict]:
         try:
             r     = predict_ticker(ticker, model)
             score = sentiments.get(ticker, {}).get("sentiment_score", 0.0)
-            final_signal, note = apply_sentiment_veto(r["signal"], score)
+
+            # 1. Sentiment veto
+            post_sent, sent_note = apply_sentiment_veto(r["signal"], score)
+
+            # 2. Earnings veto
+            surprise = get_recent_earnings_surprise(ticker)
+            final_signal, earn_note = apply_earnings_veto(post_sent, surprise)
+
             r["final_signal"] = final_signal
             r["sentiment"]    = score
-            r["note"]         = note
+            r["note"]         = earn_note or sent_note
             results.append(r)
         except Exception as exc:
             print(f"  [SKIP] {ticker} — {exc}")
@@ -114,6 +137,25 @@ def get_equity(api: tradeapi.REST) -> float:
 # ---------------------------------------------------------------------------
 # Order helpers
 # ---------------------------------------------------------------------------
+def get_position_size(confidence: float) -> float | None:
+    """
+    Map a model confidence score (0–100) to a portfolio fraction.
+
+    Tiers:
+      below 35  → None  (skip trade entirely, treat as HOLD)
+      35 – 40   → 0.10  (10 % of equity)
+      40 – 45   → 0.15  (15 % of equity)
+      45+       → 0.20  (20 % of equity)
+    """
+    if confidence < 35:
+        return None
+    if confidence < 40:
+        return 0.10
+    if confidence < 45:
+        return 0.15
+    return 0.20
+
+
 def compute_buy_qty(equity: float, price: float, fraction: float = 0.20) -> int:
     """Whole shares that fit within `fraction` of account equity."""
     return max(math.floor(equity * fraction / price), 0)
@@ -298,8 +340,13 @@ def run() -> None:
 
         if action == "BUY":
             if ticker not in owned:
-                qty         = compute_buy_qty(equity, price)
-                skip_reason = "" if qty > 0 else "insufficient equity"
+                fraction = get_position_size(r["confidence"])
+                if fraction is None:
+                    qty         = 0
+                    skip_reason = "below confidence threshold"
+                else:
+                    qty         = compute_buy_qty(equity, price, fraction)
+                    skip_reason = "" if qty > 0 else "insufficient equity"
             else:
                 qty         = 0
                 skip_reason = "already owned"
