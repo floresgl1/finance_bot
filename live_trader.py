@@ -202,28 +202,30 @@ def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Stop-loss
+# Stop-loss / take-profit
 # ---------------------------------------------------------------------------
-def check_stop_losses(
+def check_position_limits(
     api: tradeapi.REST,
     owned: dict[str, float],
     equity: float,
     stop_pct: float = 10.0,
+    take_pct: float = 15.0,
 ) -> tuple[list[str], dict[str, float]]:
     """
-    Check every open position for a loss exceeding stop_pct and sell immediately.
+    Check every open position for a stop-loss or take-profit trigger.
 
     Loss formula: (entry_price - current_price) / entry_price * 100
+    Gain formula: (current_price - entry_price) / entry_price * 100
 
-    Sends a dedicated Discord alert for each triggered stop loss:
-        [STOP LOSS] AAPL sold — down 12.3%
+    Stop-loss  — loss_pct > stop_pct (default 10 %): sells and sends 🛑 [STOP LOSS] alert
+    Take-profit — gain_pct > take_pct (default 15 %): sells and sends 🎯 [TAKE PROFIT] alert
 
     Returns:
-        stopped_out — list of tickers that were sold
-        owned       — updated positions dict (stopped tickers removed)
+        exited — list of tickers that were sold
+        owned  — updated positions dict (exited tickers removed)
     """
-    positions   = api.list_positions()
-    stopped_out = []
+    positions = api.list_positions()
+    exited    = []
 
     for position in positions:
         ticker        = position.symbol
@@ -232,22 +234,31 @@ def check_stop_losses(
         qty           = float(position.qty)
 
         loss_pct = (entry_price - current_price) / entry_price * 100
+        gain_pct = (current_price - entry_price) / entry_price * 100
 
         if loss_pct > stop_pct:
-            print(f"  [STOP LOSS] {ticker} — down {loss_pct:.1f}% — selling {qty} shares")
+            print(f"  [STOP LOSS]   {ticker} — down {loss_pct:.1f}% — selling {qty} shares")
             result = place_sell(api, ticker, qty)
-
-            alert = (
+            send_discord(
                 f"🛑 **[STOP LOSS]** {ticker} sold — down {loss_pct:.1f}%  "
                 f"(entry ${entry_price:.2f} → current ${current_price:.2f})"
             )
-            send_discord(alert)
-
             if result["status"] == "placed":
-                stopped_out.append(ticker)
+                exited.append(ticker)
                 owned.pop(ticker, None)
 
-    return stopped_out, owned
+        elif gain_pct > take_pct:
+            print(f"  [TAKE PROFIT] {ticker} — up {gain_pct:.1f}% — selling {qty} shares")
+            result = place_sell(api, ticker, qty)
+            send_discord(
+                f"🎯 **[TAKE PROFIT]** {ticker} sold — up {gain_pct:.1f}%  "
+                f"(entry ${entry_price:.2f} → current ${current_price:.2f})"
+            )
+            if result["status"] == "placed":
+                exited.append(ticker)
+                owned.pop(ticker, None)
+
+    return exited, owned
 
 
 # ---------------------------------------------------------------------------
@@ -375,9 +386,9 @@ def run() -> None:
     owned  = get_owned_tickers(api)
     equity = get_equity(api)
     print(f"  Checking stop losses on {len(owned)} open position(s)...")
-    stopped_out, owned = check_stop_losses(api, owned, equity)
-    if stopped_out:
-        print(f"  Stopped out: {stopped_out}")
+    exited, owned = check_position_limits(api, owned, equity)
+    if exited:
+        print(f"  Exited (stop-loss / take-profit): {exited}")
         # Refresh positions and equity after stop-loss sells
         owned  = get_owned_tickers(api)
         equity = get_equity(api)
