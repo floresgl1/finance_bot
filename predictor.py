@@ -11,14 +11,17 @@ Veto rules (thresholds are one-sided — only vetoes, no upgrades):
 import os
 import sys
 import io
-from datetime import date
+from datetime import date, timedelta
 
 import joblib
 import numpy as np
+import pandas as pd
 
 from config import WATCHLIST, MODEL_DIR, MODEL_FILENAME, CONFIDENCE_THRESHOLD, FEATURE_COLUMNS
 from features import load_and_process
 from sentiment import get_sentiment_all
+
+EARNINGS_DIR = os.path.join(os.path.dirname(__file__), "data", "earnings")
 
 # Ensure the terminal can render the star / warning emoji on Windows
 if hasattr(sys.stdout, "buffer"):
@@ -102,10 +105,56 @@ def apply_sentiment_veto(signal: str, score: float) -> tuple:
     return signal, ""
 
 
+def get_recent_earnings_surprise(ticker: str, window_days: int = 90) -> float | None:
+    """
+    Return the most recent Surprise(%) for a ticker within the last window_days days.
+
+    Returns None if the earnings CSV is missing or no report falls within the window.
+    """
+    path = os.path.join(EARNINGS_DIR, f"{ticker}.csv")
+    if not os.path.exists(path):
+        return None
+
+    try:
+        df = pd.read_csv(path, index_col="Date", parse_dates=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        today    = pd.Timestamp(date.today())
+        cutoff   = today - pd.Timedelta(days=window_days)
+        recent   = df[(df.index <= today) & (df.index >= cutoff)]
+        if recent.empty:
+            return None
+        return float(recent["Surprise(%)"].iloc[recent.index.argmax()])
+    except Exception:
+        return None
+
+
+def apply_earnings_veto(signal: str, surprise: float | None) -> tuple:
+    """
+    Apply the earnings surprise veto to a model signal.
+
+    Rules (only downgrades — never upgrades):
+      BUY  + surprise < -15%  =>  HOLD  ("earnings veto")
+      SELL + surprise > +15%  =>  HOLD  ("earnings veto")
+      No recent data (None)   =>  signal unchanged
+
+    Returns:
+        final_signal — 'BUY', 'SELL', or 'HOLD'
+        note         — 'earnings veto' if the signal was changed, else ''
+    """
+    if surprise is None:
+        return signal, ""
+    if signal == "BUY" and surprise < -15.0:
+        return "HOLD", "earnings veto"
+    if signal == "SELL" and surprise > 15.0:
+        return "HOLD", "earnings veto"
+    return signal, ""
+
+
 def run_bot() -> None:
     """
     Run predictions for every ticker in WATCHLIST, apply the sentiment
-    veto, and print a formatted recommendation table with a summary.
+    veto then the earnings veto, and print a formatted recommendation
+    table with a summary.
     """
     model = load_model()
 
@@ -113,9 +162,10 @@ def run_bot() -> None:
     sentiments = get_sentiment_all(WATCHLIST)
     print()
 
-    results = []
-    vetoes  = []
-    errors  = []
+    results         = []
+    sentiment_vetos = []
+    earnings_vetos  = []
+    errors          = []
 
     for ticker in WATCHLIST:
         try:
@@ -123,17 +173,29 @@ def run_bot() -> None:
             sent  = sentiments.get(ticker, {})
             score = sent.get("sentiment_score", 0.0)
 
-            final_signal, note = apply_sentiment_veto(r["signal"], score)
+            # 1. Sentiment veto
+            post_sent_signal, sent_note = apply_sentiment_veto(r["signal"], score)
+
+            # 2. Earnings veto (applied to signal after sentiment veto)
+            surprise = get_recent_earnings_surprise(ticker)
+            final_signal, earn_note = apply_earnings_veto(post_sent_signal, surprise)
+
+            note = earn_note or sent_note
             r["final_signal"] = final_signal
             r["sentiment"]    = score
             r["note"]         = note
 
             results.append(r)
 
-            if note:
-                vetoes.append(
+            if sent_note:
+                sentiment_vetos.append(
                     f"  {ticker}: {r['signal']} (conf {r['confidence']}%) "
                     f"vetoed — sentiment {score:+.3f}"
+                )
+            if earn_note:
+                earnings_vetos.append(
+                    f"  {ticker}: {post_sent_signal} (conf {r['confidence']}%) "
+                    f"vetoed — earnings surprise {surprise:+.1f}%"
                 )
         except Exception as e:
             errors.append((ticker, str(e)))
@@ -197,14 +259,19 @@ def run_bot() -> None:
     n_buy  = final_signals.count("BUY")
     n_sell = final_signals.count("SELL")
     n_hold = final_signals.count("HOLD")
-    n_veto = len(vetoes)
 
     print(f"\n  Summary:  {n_buy} BUY  |  {n_sell} SELL  |  {n_hold} HOLD  "
-          f"|  {n_veto} vetoed by sentiment")
+          f"|  {len(sentiment_vetos)} vetoed by sentiment  "
+          f"|  {len(earnings_vetos)} vetoed by earnings")
 
-    if vetoes:
+    if sentiment_vetos:
         print("\n  Sentiment vetoes (signal overridden to HOLD):")
-        for v in vetoes:
+        for v in sentiment_vetos:
+            print(v)
+
+    if earnings_vetos:
+        print("\n  Earnings vetoes (signal overridden to HOLD):")
+        for v in earnings_vetos:
             print(v)
 
     if errors:

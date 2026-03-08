@@ -158,6 +158,48 @@ def add_features(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     return df
 
 
+EARNINGS_DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "earnings")
+
+
+def _add_earnings_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """
+    Merge the most recent quarterly earnings surprise into each row of df.
+
+    Uses merge_asof with direction='backward' so each trading day inherits the
+    last reported Surprise(%) value.  The earnings CSVs are already shifted +1 day
+    (look-ahead bias prevention handled in data_collector.py).
+
+    Falls back to 0.0 (neutral signal) when the CSV is absent or has no data.
+    """
+    earnings_path = os.path.join(EARNINGS_DATA_DIR, f"{ticker}.csv")
+
+    if os.path.exists(earnings_path):
+        earnings_df = pd.read_csv(earnings_path, index_col="Date", parse_dates=True)
+        earnings_df.index = pd.to_datetime(earnings_df.index).tz_localize(None)
+        earnings_df = earnings_df.sort_index()
+
+        # merge_asof requires both sides to be sorted; reset index to use as key
+        stock_reset    = df.reset_index().sort_values("Date")
+        earnings_reset = earnings_df.reset_index().sort_values("Date")
+
+        merged = pd.merge_asof(
+            stock_reset,
+            earnings_reset[["Date", "Surprise(%)"]],
+            on="Date",
+            direction="backward",
+        )
+        merged = merged.set_index("Date")
+        merged.index = pd.to_datetime(merged.index)
+        df = merged
+    else:
+        df["Surprise(%)"] = float("nan")
+
+    df["earnings_surprise"] = df["Surprise(%)"].fillna(0.0)
+    df = df.drop(columns=["Surprise(%)"], errors="ignore")
+
+    return df
+
+
 def _add_sentiment_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """
     Attempt to merge daily sentiment scores for `ticker` into `df`.
@@ -216,6 +258,9 @@ def load_and_process(ticker: str) -> pd.DataFrame:
 
     # Merge sentiment features (gracefully no-ops if CSV is absent)
     df = _add_sentiment_features(df, ticker=ticker)
+
+    # Merge earnings surprise features (gracefully no-ops if CSV is absent)
+    df = _add_earnings_features(df, ticker=ticker)
 
     return df
 
