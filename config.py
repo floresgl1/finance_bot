@@ -65,6 +65,6 @@ FEATURE_COLUMNS = [
     "Stock_vs_Sector",
     "VIX_Level",
     "VIX_Change",
-    "sent_score_daily",
-    "sent_rolling_20d",
+    "sent_rolling_7d",
+    "sent_momentum_7d",
 ]

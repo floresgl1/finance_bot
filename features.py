@@ -200,27 +200,42 @@ def _add_earnings_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return df
 
 
+_SENTIMENT_CSV = os.path.join(DATA_DIR, "sentiment", "sentiment_scores.csv")
+
+
 def _add_sentiment_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """
-    Attempt to merge daily sentiment scores for `ticker` into `df`.
+    Merge daily sentiment scores for `ticker` into `df` and compute derived
+    rolling features.
 
-    Reads data/sentiment_TICKER.csv, merges on Date, forward-fills gaps,
-    then falls back to 0.0 for any remaining NaN.  If the CSV doesn't exist
-    both columns are filled with 0.0 and the function returns silently.
+    Reads data/sentiment/sentiment_scores.csv (produced by sentiment_collector.py),
+    filters to the given ticker, merges on Date, then computes:
+
+        sent_rolling_7d   — 7-day rolling mean of the daily sentiment score
+        sent_momentum_7d  — 7-day change in sentiment (score − score[t-7])
+
+    Forward-fills gaps and falls back to 0.0 when the CSV is absent.
     """
-    sent_path = os.path.join(DATA_DIR, f"sentiment_{ticker}.csv")
-
-    if os.path.exists(sent_path):
-        sent = pd.read_csv(sent_path, parse_dates=["Date"])
-        sent = sent.set_index("Date")[["sent_score_daily"]]
+    if os.path.exists(_SENTIMENT_CSV):
+        sent_all = pd.read_csv(_SENTIMENT_CSV, parse_dates=["Date"])
+        sent = (
+            sent_all[sent_all["Ticker"] == ticker]
+            .set_index("Date")[["sentiment_score"]]
+        )
         sent.index = pd.to_datetime(sent.index).tz_localize(None)
         df = df.join(sent, how="left")
     else:
-        df["sent_score_daily"] = float("nan")
+        df["sentiment_score"] = float("nan")
 
-    # Forward-fill then zero-fill any remaining gaps
-    df["sent_score_daily"] = df["sent_score_daily"].ffill().fillna(0.0)
-    df["sent_rolling_20d"] = df["sent_score_daily"].rolling(window=20).mean().fillna(0.0)
+    # Forward-fill gaps (weekends / holidays) then zero-fill any remainder
+    df["sentiment_score"] = df["sentiment_score"].ffill().fillna(0.0)
+
+    df["sent_rolling_7d"]  = df["sentiment_score"].rolling(window=7).mean().fillna(0.0)
+    df["sent_momentum_7d"] = (
+        df["sentiment_score"].diff(periods=7).fillna(0.0)
+    )
+
+    df = df.drop(columns=["sentiment_score"])
 
     return df
 
