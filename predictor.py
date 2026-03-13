@@ -21,8 +21,7 @@ from config import WATCHLIST, MODEL_DIR, MODEL_FILENAME, CONFIDENCE_THRESHOLD, F
 from features import load_and_process
 from sentiment import get_sentiment_all
 
-EARNINGS_DIR       = os.path.join(os.path.dirname(__file__), "data", "earnings")
-SENTIMENT_CSV_PATH = os.path.join(os.path.dirname(__file__), "data", "sentiment", "sentiment_scores.csv")
+EARNINGS_DIR = os.path.join(os.path.dirname(__file__), "data", "earnings")
 
 # Ensure the terminal can render the star / warning emoji on Windows
 if hasattr(sys.stdout, "buffer"):
@@ -149,70 +148,6 @@ def apply_earnings_veto(signal: str, surprise: float | None) -> tuple:
     if signal == "SELL" and surprise > 15.0:
         return "HOLD", "earnings veto"
     return signal, ""
-
-
-def load_sentiment_df() -> pd.DataFrame:
-    """
-    Load data/sentiment/sentiment_scores.csv once at startup.
-
-    Returns an empty DataFrame (with the expected columns) if the file is
-    missing or cannot be parsed, so callers never need to guard for None.
-    """
-    empty = pd.DataFrame(columns=["Date", "Ticker", "sentiment_score"])
-    if not os.path.exists(SENTIMENT_CSV_PATH):
-        return empty
-    try:
-        df = pd.read_csv(SENTIMENT_CSV_PATH, parse_dates=["Date"])
-        df["Date"] = pd.to_datetime(df["Date"]).dt.date
-        return df
-    except Exception:
-        return empty
-
-
-def sentiment_veto(
-    trade_date,
-    ticker: str,
-    model_signal: str,
-    sentiment_df: pd.DataFrame,
-) -> bool:
-    """
-    Return True if vetoed (signal should become HOLD),
-    False if the trade passes through unchanged.
-
-    Looks up the sentiment score for *ticker* on *trade_date* from the
-    pre-loaded sentiment_df (data/sentiment/sentiment_scores.csv).
-
-    Veto rules (only downgrades — never upgrades):
-      BUY  + sentiment_score <= -0.5  →  True  (HOLD)
-      SELL + sentiment_score >= +0.5  →  True  (HOLD)
-      No data present or score == 0.0 →  False (no veto)
-    """
-    if sentiment_df.empty:
-        return False
-
-    # Normalise trade_date to a plain date object for comparison
-    if hasattr(trade_date, "date"):
-        trade_date = trade_date.date()
-
-    rows = sentiment_df[
-        (sentiment_df["Ticker"] == ticker) &
-        (sentiment_df["Date"] == trade_date)
-    ]
-
-    if rows.empty:
-        return False
-
-    score = float(rows["sentiment_score"].iloc[-1])
-
-    # Treat an uninitialised / missing score as no data
-    if score == 0.0:
-        return False
-
-    if model_signal == "BUY" and score <= -0.5:
-        return True
-    if model_signal == "SELL" and score >= 0.5:
-        return True
-    return False
 
 
 def run_bot() -> None:
