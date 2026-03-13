@@ -463,6 +463,7 @@ def run() -> None:
             "action":      action,
             "qty":         qty,
             "price":       price,
+            "confidence":  r.get("confidence", 0.0),
             "note":        note,
             "skip_reason": skip_reason,
         })
@@ -470,6 +471,25 @@ def run() -> None:
     # 7. Pre-order Discord alert
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     send_discord(build_pre_order_alert(planned, timestamp))
+
+    # 7b. Log each decision to signal_log.csv — append-only, before execution
+    from signal_logger import log_signal
+    print("\n  Logging signals to signal_log.csv...")
+    for p in planned:
+        if p["action"] == "HOLD":
+            actual_action = "HOLD"
+        elif p["skip_reason"]:
+            actual_action = "SKIPPED"
+        else:
+            actual_action = p["action"]   # BUY or SELL
+        log_signal(
+            ticker        = p["ticker"],
+            model_signal  = p["action"],
+            price         = p["price"],
+            qty           = p["qty"],
+            confidence    = p["confidence"],
+            actual_action = actual_action,
+        )
 
     # 8. Execute orders and collect outcomes
     print("  Applying trading rules...")
