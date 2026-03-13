@@ -20,7 +20,8 @@ Always re-downloads (existing files are overwritten).
 import os
 import yfinance as yf
 
-from config import DATA_DIR, HISTORY_PERIOD
+from config import DATA_DIR, HISTORY_PERIOD, WATCHLIST
+from data_collector import download_ticker
 
 MARKET_SYMBOLS = ["SPY", "XLK", "XLF", "XLE", "XLV", "XLY", "^VIX"]
 MARKET_DATA_DIR = os.path.join(DATA_DIR, "market")
@@ -47,11 +48,15 @@ def download_market_symbol(symbol: str) -> None:
 
 
 def collect_all() -> None:
-    """Create data/market/ and (re-)download every market symbol."""
+    """Create data/market/, (re-)download every market symbol, and download ticker OHLCV data."""
     os.makedirs(MARKET_DATA_DIR, exist_ok=True)
 
     for symbol in MARKET_SYMBOLS:
         download_market_symbol(symbol)
+
+    print("\n=== Downloading ticker OHLCV data ===")
+    for ticker in WATCHLIST:
+        download_ticker(ticker)
 
 
 if __name__ == "__main__":
