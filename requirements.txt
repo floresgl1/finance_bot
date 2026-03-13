@@ -7,3 +7,4 @@ transformers
 torch
 python-dotenv
 xgboost
+requests

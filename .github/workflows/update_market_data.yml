@@ -1,0 +1,33 @@
+name: Update Market Data
+
+# Runs at 1:00 PM UTC on every weekday (Mon–Fri).
+# Can also be triggered manually from the Actions tab.
+on:
+  schedule:
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  update-market-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect market data
+        run: python market_data_collector.py
+
+      - name: Upload CSVs to PythonAnywhere
+        env:
+          PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+        run: python upload_to_pythonanywhere.py
