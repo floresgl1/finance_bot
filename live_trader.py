@@ -79,43 +79,65 @@ def market_is_open(api: tradeapi.REST) -> bool:
 # ---------------------------------------------------------------------------
 # Signal generation (reuses predictor.py logic, returns data instead of printing)
 # ---------------------------------------------------------------------------
-def get_signals() -> list[dict]:
+def get_signals(sentiment_df) -> list[dict]:
     """
     Return a list of signal dicts for every ticker in WATCHLIST.
 
     Applies two veto layers in order:
-      1. Sentiment veto  (FinBERT)
-      2. Earnings veto   (recent Surprise% within 90 days)
+      1. Earnings veto   (recent Surprise% within 90 days)
+      2. Sentiment veto  (CSV-based, thresholds ±0.5)
+
+    sentiment_df must be pre-loaded by the caller (load_sentiment_df()) so
+    the CSV is not re-read on every call.
 
     Each dict contains:
         ticker, signal, final_signal, confidence, current_price, sentiment, note
     """
+    import pandas as pd
+    from datetime import date as date_cls
     from config import WATCHLIST
     from predictor import (load_model, predict_ticker,
-                           apply_sentiment_veto,
-                           apply_earnings_veto, get_recent_earnings_surprise)
-    from sentiment import get_sentiment_all
+                           apply_earnings_veto, get_recent_earnings_surprise,
+                           sentiment_veto)
 
     model = load_model()
-
-    print("Fetching news sentiment...")
-    sentiments = get_sentiment_all(WATCHLIST)
+    today = date_cls.today()
 
     results = []
     for ticker in WATCHLIST:
         try:
-            r     = predict_ticker(ticker, model)
-            score = sentiments.get(ticker, {}).get("sentiment_score", 0.0)
+            r            = predict_ticker(ticker, model)
+            model_signal = r["signal"]
 
-            # 1. Sentiment veto
-            post_sent, sent_note = apply_sentiment_veto(r["signal"], score)
-
-            # 2. Earnings veto
+            # 1. Earnings veto
             surprise = get_recent_earnings_surprise(ticker)
-            final_signal, earn_note = apply_earnings_veto(post_sent, surprise)
+            post_earnings, earn_note = apply_earnings_veto(model_signal, surprise)
+
+            # 2. Sentiment veto (only if not already HOLD from earnings)
+            final_signal = post_earnings
+            sent_note    = ""
+            sent_score   = 0.0
+
+            if post_earnings != "HOLD":
+                vetoed = sentiment_veto(today, ticker, post_earnings, sentiment_df)
+                if vetoed:
+                    # Look up score for Discord alert
+                    rows = sentiment_df[
+                        (sentiment_df["Ticker"] == ticker) &
+                        (sentiment_df["Date"] == today)
+                    ]
+                    sent_score   = float(rows["sentiment_score"].iloc[-1]) if not rows.empty else 0.0
+                    final_signal = "HOLD"
+                    sent_note    = "sentiment veto"
+                    send_discord(
+                        f"\N{NO ENTRY} **Sentiment Veto:** {ticker} {today}  "
+                        f"Model said: {post_earnings}  "
+                        f"Sentiment score: {sent_score:.3f}  "
+                        f"Action: HOLD"
+                    )
 
             r["final_signal"] = final_signal
-            r["sentiment"]    = score
+            r["sentiment"]    = sent_score
             r["note"]         = earn_note or sent_note
             results.append(r)
         except Exception as exc:
@@ -395,8 +417,10 @@ def run() -> None:
     else:
         print("  No stop losses triggered.")
 
-    # 4. Get today's signals
-    signals = get_signals()
+    # 4. Get today's signals (sentiment_df loaded once here and passed down)
+    from predictor import load_sentiment_df
+    sentiment_df = load_sentiment_df()
+    signals = get_signals(sentiment_df)
     if not signals:
         print("  No signals generated. Exiting.")
         sys.exit(0)
