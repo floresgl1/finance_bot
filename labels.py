@@ -46,8 +46,8 @@ def add_labels(df: pd.DataFrame) -> pd.DataFrame:
     df = df.merge(market, on="Date", how="left")
     df = df.set_index("Date")
     df.index = pd.to_datetime(df.index)
-    df["spy_return_7d"] = df["spy_return_7d"].fillna(method="ffill")
-    df["vix_close"] = df["vix_close"].fillna(method="ffill")
+    df["spy_return_7d"] = df["spy_return_7d"].ffill()
+    df["vix_close"] = df["vix_close"].ffill()
 
     # 7-day forward return for this stock (computed after merge to stay aligned)
     stock_return_7d = df["Close"].pct_change(_WINDOW).shift(-_WINDOW)

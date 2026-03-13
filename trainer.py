@@ -181,8 +181,12 @@ def train() -> None:
     print(f"\n  Best threshold: {best_threshold}  (maximises BUY F1 on validation)")
 
     # Persist the best threshold back to config.py so all modules use it
-    update_config_threshold(best_threshold)
-    print(f"  config.py updated: CONFIDENCE_THRESHOLD = {best_threshold}")
+    answer = input(f"\n  Update config.py with CONFIDENCE_THRESHOLD = {best_threshold}? [y/N] ").strip().lower()
+    if answer == "y":
+        update_config_threshold(best_threshold)
+        print(f"  config.py updated: CONFIDENCE_THRESHOLD = {best_threshold}")
+    else:
+        print("  config.py not updated — keeping existing threshold.")
 
     # --- Final evaluation on the untouched test set ---
     labels = ["BUY", "HOLD", "SELL"]
@@ -202,8 +206,16 @@ def train() -> None:
     # --- Save model bundle ---
     os.makedirs(MODEL_DIR, exist_ok=True)
     model_path = os.path.join(MODEL_DIR, MODEL_FILENAME)
+
+    # Back up existing model before overwriting
+    if os.path.exists(model_path):
+        backup_path = os.path.join(MODEL_DIR, "XG_Boost_backup.joblib")
+        import shutil
+        shutil.copy2(model_path, backup_path)
+        print(f"\nExisting model backed up to {backup_path}")
+
     joblib.dump({"model": model, "encoder": le}, model_path)
-    print(f"\nModel bundle saved to {model_path}")
+    print(f"Model bundle saved to {model_path}")
 
 
 if __name__ == "__main__":
