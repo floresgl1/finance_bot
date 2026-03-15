@@ -18,12 +18,12 @@ EARNINGS_DIR = os.path.join(os.path.dirname(__file__), "data", "earnings")
 
 
 def download_ticker(ticker: str) -> None:
-    """Download historical OHLCV data for one ticker and save it as a CSV."""
-    path = os.path.join(DATA_DIR, f"{ticker}.csv")
+    """Download historical OHLCV data for one ticker and save it as a CSV.
 
-    if os.path.exists(path):
-        print(f"[SKIP]    {ticker} — already exists at {path}")
-        return
+    Always re-downloads and overwrites any existing file so stale data
+    is never silently kept.
+    """
+    path = os.path.join(DATA_DIR, f"{ticker}.csv")
 
     df = yf.download(ticker, period=HISTORY_PERIOD, auto_adjust=True, progress=False)
 

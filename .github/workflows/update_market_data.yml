@@ -26,8 +26,39 @@ jobs:
       - name: Collect market data
         run: python market_data_collector.py
 
+      - name: Collect headlines
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: python headlines_data_collector.py
+
       - name: Upload CSVs to PythonAnywhere
         env:
           PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
           PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
         run: python upload_to_pythonanywhere.py
+
+      - name: Upload headlines CSV to PythonAnywhere
+        env:
+          PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+        run: |
+          python - <<'EOF'
+          import os, sys, requests
+          token    = os.environ["PYTHONANYWHERE_TOKEN"]
+          username = os.environ["PYTHONANYWHERE_USERNAME"]
+          local    = "data/headlines/raw_headlines.csv"
+          remote   = f"/home/{username}/finance_bot/data/headlines/raw_headlines.csv"
+          url      = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{remote}"
+          with open(local, "rb") as fh:
+              r = requests.post(
+                  url,
+                  headers={"Authorization": f"Token {token}"},
+                  files={"content": fh},
+                  timeout=60,
+              )
+          if r.status_code in (200, 201):
+              print(f"[OK]    raw_headlines.csv  →  {remote}")
+          else:
+              print(f"[ERROR] HTTP {r.status_code}: {r.text.strip()}")
+              sys.exit(1)
+          EOF
