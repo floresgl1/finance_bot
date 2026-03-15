@@ -99,9 +99,9 @@ def apply_sentiment_veto(signal: str, score: float) -> tuple:
         note         — 'sentiment veto' if the signal was changed, else ''
     """
     if signal == "BUY" and score < VETO_BUY_THRESHOLD:
-        return "HOLD", "sentiment veto"
+        return "HOLD", "SENTIMENT_VETO"
     if signal == "SELL" and score > VETO_SELL_THRESHOLD:
-        return "HOLD", "sentiment veto"
+        return "HOLD", "SENTIMENT_VETO"
     return signal, ""
 
 
@@ -144,9 +144,9 @@ def apply_earnings_veto(signal: str, surprise: float | None) -> tuple:
     if surprise is None:
         return signal, ""
     if signal == "BUY" and surprise < -15.0:
-        return "HOLD", "earnings veto"
+        return "HOLD", "EARNINGS_VETO"
     if signal == "SELL" and surprise > 15.0:
-        return "HOLD", "earnings veto"
+        return "HOLD", "EARNINGS_VETO"
     return signal, ""
 
 

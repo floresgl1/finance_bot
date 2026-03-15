@@ -478,6 +478,18 @@ def run() -> None:
     for p in planned:
         if p["action"] == "HOLD":
             actual_action = "HOLD"
+        elif p["note"] == "EARNINGS_VETO":
+            actual_action = "EARNINGS_VETO"
+        elif p["note"] == "SENTIMENT_VETO":
+            actual_action = "SENTIMENT_VETO"
+        elif p["skip_reason"] == "below confidence threshold":
+            actual_action = "CONFIDENCE_SKIP"
+        elif p["skip_reason"] == "already owned":
+            actual_action = "ALREADY_OWNED"
+        elif p["skip_reason"] == "not owned":
+            actual_action = "NOT_OWNED"
+        elif p["skip_reason"] == "insufficient equity":
+            actual_action = "INSUFFICIENT_EQ"
         elif p["skip_reason"]:
             actual_action = "SKIPPED"
         else:

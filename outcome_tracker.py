@@ -8,7 +8,7 @@ data/signal_log.csv.
 
 For each pending row in data/signal_log.csv (result is blank):
   - evaluation_date > today         → skip (not reached yet)
-  - evaluation_date 3+ days ago     → mark SKIPPED (stale, price no longer reliable)
+  - evaluation_date 8+ days ago     → mark SKIPPED (stale, price no longer reliable)
   - evaluation_date <= today        → fetch outcome price, compute result
 
 Evaluation rules (±3 % threshold):
@@ -25,7 +25,7 @@ Evaluation rules (±3 % threshold):
           GOOD HOLD          otherwise
 
 Weekend / holiday: uses the last available close price on or before evaluation_date.
-Stale rows (3+ days past evaluation_date with no outcome): marked SKIPPED.
+Stale rows (8+ days past evaluation_date with no outcome): marked SKIPPED.
 All rows are preserved — no deletions (append-only semantics).
 """
 
@@ -42,7 +42,7 @@ from config import DATA_DIR
 # Config
 # ---------------------------------------------------------------------------
 SIGNAL_LOG_PATH = os.path.join(DATA_DIR, "signal_log.csv")
-STALE_DAYS      = 3      # days past evaluation_date before a row is considered stale
+STALE_DAYS      = 8      # days past evaluation_date before a row is considered stale
 WIN_THRESHOLD   = 0.03   # +3 %
 LOSS_THRESHOLD  = 0.03   # −3 %
 
