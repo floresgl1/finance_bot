@@ -98,7 +98,7 @@ def get_signals(sentiment_df=None) -> list[dict]:
     from config import WATCHLIST
     from predictor import (load_model, predict_ticker,
                            apply_earnings_veto, get_recent_earnings_surprise,
-                           sentiment_veto)
+                           apply_sentiment_veto)
 
     model = load_model()
     today = date_cls.today()
@@ -119,16 +119,13 @@ def get_signals(sentiment_df=None) -> list[dict]:
             sent_score   = 0.0
 
             if post_earnings != "HOLD" and sentiment_df is not None:
-                vetoed = sentiment_veto(today, ticker, post_earnings, sentiment_df)
-                if vetoed:
-                    # Look up score for Discord alert
-                    rows = sentiment_df[
-                        (sentiment_df["Ticker"] == ticker) &
-                        (sentiment_df["Date"] == today)
-                    ]
-                    sent_score   = float(rows["sentiment_score"].iloc[-1]) if not rows.empty else 0.0
-                    final_signal = "HOLD"
-                    sent_note    = "sentiment veto"
+                rows = sentiment_df[
+                    (sentiment_df["Ticker"] == ticker) &
+                    (sentiment_df["Date"] == today)
+                ]
+                sent_score = float(rows["sentiment_score"].iloc[-1]) if not rows.empty else 0.0
+                final_signal, sent_note = apply_sentiment_veto(post_earnings, sent_score)
+                if final_signal == "HOLD" and sent_note:
                     send_discord(
                         f"\N{NO ENTRY} **Sentiment Veto:** {ticker} {today}  "
                         f"Model said: {post_earnings}  "
