@@ -79,7 +79,7 @@ def market_is_open(api: tradeapi.REST) -> bool:
 # ---------------------------------------------------------------------------
 # Signal generation (reuses predictor.py logic, returns data instead of printing)
 # ---------------------------------------------------------------------------
-def get_signals(sentiment_df) -> list[dict]:
+def get_signals(sentiment_df=None) -> list[dict]:
     """
     Return a list of signal dicts for every ticker in WATCHLIST.
 
@@ -118,7 +118,7 @@ def get_signals(sentiment_df) -> list[dict]:
             sent_note    = ""
             sent_score   = 0.0
 
-            if post_earnings != "HOLD":
+            if post_earnings != "HOLD" and sentiment_df is not None:
                 vetoed = sentiment_veto(today, ticker, post_earnings, sentiment_df)
                 if vetoed:
                     # Look up score for Discord alert
@@ -417,10 +417,8 @@ def run() -> None:
     else:
         print("  No stop losses triggered.")
 
-    # 4. Get today's signals (sentiment_df loaded once here and passed down)
-    from predictor import load_sentiment_df
-    sentiment_df = load_sentiment_df()
-    signals = get_signals(sentiment_df)
+    # 4. Get today's signals
+    signals = get_signals()
     if not signals:
         print("  No signals generated. Exiting.")
         sys.exit(0)
