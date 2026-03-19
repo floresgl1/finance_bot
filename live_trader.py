@@ -39,6 +39,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
+from capital_allocator import check_add_to_position
+
 # ---------------------------------------------------------------------------
 # Dependency check — install alpaca-trade-api if not present
 # ---------------------------------------------------------------------------
@@ -441,9 +443,18 @@ def run() -> None:
                 else:
                     qty         = compute_buy_qty(equity, price, fraction)
                     skip_reason = "" if qty > 0 else "insufficient equity"
+                is_add_to_position = False
             else:
-                qty         = 0
-                skip_reason = "already owned"
+                alloc              = check_add_to_position(
+                    ticker                = ticker,
+                    confidence_normalized = r["confidence"] / 100.0,
+                    price                 = price,
+                    shares_owned          = owned[ticker],
+                    portfolio_value       = equity,
+                )
+                qty                = alloc["shares_to_buy"]
+                skip_reason        = alloc["skip_reason"]
+                is_add_to_position = (qty > 0)
 
         elif action == "SELL":
             qty         = owned.get(ticker, 0)
@@ -454,13 +465,14 @@ def run() -> None:
             skip_reason = ""
 
         planned.append({
-            "ticker":      ticker,
-            "action":      action,
-            "qty":         qty,
-            "price":       price,
-            "confidence":  r.get("confidence", 0.0),
-            "note":        note,
-            "skip_reason": skip_reason,
+            "ticker":             ticker,
+            "action":             action,
+            "qty":                qty,
+            "price":              price,
+            "confidence":         r.get("confidence", 0.0),
+            "note":               note,
+            "skip_reason":        skip_reason,
+            "is_add_to_position": is_add_to_position if action == "BUY" else False,
         })
 
     # 7. Pre-order Discord alert
@@ -479,6 +491,8 @@ def run() -> None:
             actual_action = "SENTIMENT_VETO"
         elif p["skip_reason"] == "below confidence threshold":
             actual_action = "CONFIDENCE_SKIP"
+        elif p["skip_reason"] == "INVALID_HEADROOM":
+            actual_action = "INVALID_HEADROOM"
         elif p["skip_reason"] == "already owned":
             actual_action = "ALREADY_OWNED"
         elif p["skip_reason"] == "not owned":
@@ -487,6 +501,8 @@ def run() -> None:
             actual_action = "INSUFFICIENT_EQ"
         elif p["skip_reason"]:
             actual_action = "SKIPPED"
+        elif p.get("is_add_to_position"):
+            actual_action = "ADD_TO_POSITION"
         else:
             actual_action = p["action"]   # BUY or SELL
         log_signal(

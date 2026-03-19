@@ -46,6 +46,14 @@ XGB_PARAMS = {
 # Random chance for 3 classes is 0.33; 0.45 requires meaningful conviction.
 CONFIDENCE_THRESHOLD = 0.35
 
+# Maximum fraction of total portfolio value allowed in any single position.
+# Used by capital_allocator.py to compute headroom before adding to a position.
+MAX_POSITION_PCT = 0.08
+
+# Minimum model confidence (0–1 scale) required to add shares to an already-owned
+# position.  Signals below this threshold keep the existing "already owned" skip.
+ADD_TO_POSITION_CONFIDENCE = 0.40
+
 # Technical indicator columns used as model input features.
 # Must stay in sync with the columns produced by features.add_features().
 FEATURE_COLUMNS = [
