@@ -2,19 +2,29 @@
 live_trader.py — Alpaca paper-trading execution layer.
 
 Connects to Alpaca's paper-trading endpoint, fetches today's signals from
-predictor.py, then submits orders according to the following rules:
+predictor.py, then executes trades one at a time in a stateful loop:
 
-  BUY  + not already owned  → buy shares (conviction-based % of equity)
-  BUY  + already owned      → skip (already positioned)
-  SELL + owned              → sell the entire position
-  SELL + not owned          → skip (no position to close)
-  HOLD                      → do nothing
+  Execution order:
+    1. SELLs  — sorted by confidence descending
+    2. BUYs   — sorted by confidence descending
+    3. HOLDs  — no action
 
-Position sizing is conviction-based (confidence score):
-  below 35 % → skip (treat as HOLD)
-  35 – 40 %  → 10 % of equity
-  40 – 45 %  → 15 % of equity
-  45 %+      → 20 % of equity
+  Before each trade:
+    - Fresh portfolio state is fetched from Alpaca (positions + equity).
+    - For BUYs on already-owned tickers, capital_allocator.py receives the
+      fresh state and returns the sizing decision.
+
+  Error handling:
+    - SELL errors are caught, logged, and the loop continues.
+    - INVALID_HEADROOM from capital_allocator skips to the next BUY signal.
+
+  Logging:
+    - Each signal is logged to signal_log.csv after its trade attempt,
+      with the actual execution outcome as actual_action.
+
+  Discord:
+    - A single summary notification is sent after all trades are complete.
+    - Stop-loss / take-profit and sentiment-veto alerts still fire immediately.
 
 Veto layers applied before execution:
   1. Sentiment veto  (FinBERT)
@@ -25,9 +35,6 @@ Stop-loss check runs before model signals:
 
 All orders are submitted as market orders.  Because the base URL points to
 paper-api.alpaca.markets this script CANNOT place live trades.
-
-Discord alerts are sent before and after order execution if
-DISCORD_WEBHOOK_URL is set in the environment.
 """
 
 import os
@@ -304,46 +311,9 @@ def send_discord(message: str) -> None:
         print(f"  [Discord] Alert failed: {exc}")
 
 
-def build_pre_order_alert(planned: list[dict], timestamp: str) -> str:
-    """
-    Build the pre-order Discord message.
-
-    Each item in `planned` has:
-        ticker, action, qty, price, note, skip_reason
-    """
-    n_buy  = sum(1 for p in planned if p["action"] == "BUY"  and not p["skip_reason"])
-    n_sell = sum(1 for p in planned if p["action"] == "SELL" and not p["skip_reason"])
-    n_hold = sum(1 for p in planned if p["action"] == "HOLD")
-    n_skip = sum(1 for p in planned if p["skip_reason"])
-
-    lines = [
-        f"**Finance Bot — Pre-Trade Plan** | {timestamp}",
-        f"Summary: {n_buy} BUY | {n_sell} SELL | {n_hold} HOLD | {n_skip} skipped",
-        "```",
-    ]
-
-    for p in planned:
-        action      = p["action"]
-        ticker      = p["ticker"]
-        price       = p["price"]
-        qty         = p["qty"]
-        note        = f"  [{p['note']}]" if p["note"] else ""
-        skip_reason = f"  → {p['skip_reason']}" if p["skip_reason"] else ""
-
-        if action in ("BUY", "SELL") and not p["skip_reason"]:
-            lines.append(f"  {action:<4} {ticker:<6} x{qty:<4} @ ${price:>8.2f}{note}")
-        elif p["skip_reason"]:
-            lines.append(f"  {action:<4} {ticker:<6}        @ ${price:>8.2f}{note}{skip_reason}")
-        else:  # HOLD
-            lines.append(f"  {action:<4} {ticker:<6}        @ ${price:>8.2f}{note}")
-
-    lines.append("```")
-    return "\n".join(lines)
-
-
 def build_post_order_alert(outcomes: list[dict], portfolio_value: float, timestamp: str) -> str:
     """
-    Build the post-order Discord message.
+    Build the post-order Discord summary message.
 
     Each item in `outcomes` has:
         ticker, action, qty, price, status, order_id, reason
@@ -410,7 +380,6 @@ def run() -> None:
     exited, owned = check_position_limits(api, owned, equity)
     if exited:
         print(f"  Exited (stop-loss / take-profit): {exited}")
-        # Refresh positions and equity after stop-loss sells
         owned  = get_owned_tickers(api)
         equity = get_equity(api)
     else:
@@ -422,140 +391,175 @@ def run() -> None:
         print("  No signals generated. Exiting.")
         sys.exit(0)
 
-    # 5. Current positions and equity snapshot for signal execution
-    print(f"\n  Current positions: {list(owned.keys()) or 'none'}")
-    print(f"  Account equity:    ${equity:,.2f}\n")
+    # 5. Sort: SELLs first (confidence desc), then BUYs (confidence desc), then HOLDs
+    sell_sigs = sorted(
+        [s for s in signals if s["final_signal"] == "SELL"],
+        key=lambda s: s.get("confidence", 0.0),
+        reverse=True,
+    )
+    buy_sigs = sorted(
+        [s for s in signals if s["final_signal"] == "BUY"],
+        key=lambda s: s.get("confidence", 0.0),
+        reverse=True,
+    )
+    hold_sigs = [s for s in signals if s["final_signal"] == "HOLD"]
+    ordered   = sell_sigs + buy_sigs + hold_sigs
 
-    # 6. Build planned-action list (pre-order alert data + drives execution)
-    planned = []
-    for r in signals:
-        ticker = r["ticker"]
-        action = r["final_signal"]
-        price  = r["current_price"]
-        note   = r["note"]
+    print(
+        f"\n  Signal queue: {len(sell_sigs)} SELL | "
+        f"{len(buy_sigs)} BUY | {len(hold_sigs)} HOLD"
+    )
+    print("-" * 60)
 
-        if action == "BUY":
+    from signal_logger import log_signal
+
+    outcomes = []
+
+    # 6. Stateful trade loop — one trade at a time with fresh Alpaca state each iteration
+    for r in ordered:
+        ticker     = r["ticker"]
+        final_sig  = r["final_signal"]
+        price      = r["current_price"]
+        confidence = r.get("confidence", 0.0)
+        note_str   = f" ({r['note']})" if r.get("note") else ""
+
+        # ------------------------------------------------------------------
+        # SELL
+        # ------------------------------------------------------------------
+        if final_sig == "SELL":
+            owned = get_owned_tickers(api)
+
             if ticker not in owned:
-                fraction = get_position_size(r["confidence"])
-                if fraction is None:
-                    qty         = 0
-                    skip_reason = "below confidence threshold"
-                else:
-                    qty         = compute_buy_qty(equity, price, fraction)
-                    skip_reason = "" if qty > 0 else "insufficient equity"
-                is_add_to_position = False
-            else:
-                alloc              = check_add_to_position(
+                print(f"  Signal: SELL {ticker}{note_str} — skipped (not owned)")
+                log_signal(ticker, "SELL", price, 0, confidence, "NOT_OWNED")
+                outcomes.append({
+                    "ticker": ticker, "action": "SELL", "qty": 0, "price": price,
+                    "status": "skipped", "order_id": "", "reason": "not owned",
+                })
+                continue
+
+            qty    = owned[ticker]
+            result = place_sell(api, ticker, qty)
+            actual_action = "SELL" if result["status"] == "placed" else "SELL_ERROR"
+            log_signal(ticker, "SELL", price, qty, confidence, actual_action)
+            outcomes.append({
+                "ticker":   ticker,
+                "action":   "SELL",
+                "qty":      qty,
+                "price":    price,
+                "status":   result["status"],
+                "order_id": result.get("order_id", ""),
+                "reason":   result.get("reason", ""),
+            })
+            if result["status"] == "placed":
+                equity = get_equity(api)
+            # Error → logged and recorded; loop continues to next signal
+
+        # ------------------------------------------------------------------
+        # BUY
+        # ------------------------------------------------------------------
+        elif final_sig == "BUY":
+            owned  = get_owned_tickers(api)
+            equity = get_equity(api)
+
+            if ticker in owned:
+                # Already owned — ask capital_allocator with fresh state
+                alloc = check_add_to_position(
                     ticker                = ticker,
-                    confidence_normalized = r["confidence"] / 100.0,
+                    confidence_normalized = confidence / 100.0,
                     price                 = price,
                     shares_owned          = owned[ticker],
                     portfolio_value       = equity,
                 )
-                qty                = alloc["shares_to_buy"]
-                skip_reason        = alloc["skip_reason"]
-                is_add_to_position = (qty > 0)
+                skip_reason = alloc["skip_reason"]
 
-        elif action == "SELL":
-            qty         = owned.get(ticker, 0)
-            skip_reason = "" if ticker in owned else "not owned"
+                if skip_reason == "INVALID_HEADROOM":
+                    print(f"  Signal: BUY {ticker}{note_str} — skipped (INVALID_HEADROOM)")
+                    log_signal(ticker, "BUY", price, 0, confidence, "INVALID_HEADROOM")
+                    outcomes.append({
+                        "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
+                        "status": "skipped", "order_id": "", "reason": "INVALID_HEADROOM",
+                    })
+                    continue
 
-        else:  # HOLD
-            qty         = 0
-            skip_reason = ""
+                if skip_reason:
+                    actual_skip = (
+                        "CONFIDENCE_SKIP" if skip_reason == "CONFIDENCE_SKIP"
+                        else "INSUFFICIENT_EQ"
+                    )
+                    print(f"  Signal: BUY {ticker}{note_str} — skipped ({skip_reason})")
+                    log_signal(ticker, "BUY", price, 0, confidence, actual_skip)
+                    outcomes.append({
+                        "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
+                        "status": "skipped", "order_id": "", "reason": skip_reason,
+                    })
+                    continue
 
-        planned.append({
-            "ticker":             ticker,
-            "action":             action,
-            "qty":                qty,
-            "price":              price,
-            "confidence":         r.get("confidence", 0.0),
-            "note":               note,
-            "skip_reason":        skip_reason,
-            "is_add_to_position": is_add_to_position if action == "BUY" else False,
-        })
+                qty    = alloc["shares_to_buy"]
+                is_add = True
 
-    # 7. Pre-order Discord alert
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    send_discord(build_pre_order_alert(planned, timestamp))
+            else:
+                # New position
+                fraction = get_position_size(confidence)
+                if fraction is None:
+                    print(f"  Signal: BUY {ticker}{note_str} — skipped (below confidence threshold)")
+                    log_signal(ticker, "BUY", price, 0, confidence, "CONFIDENCE_SKIP")
+                    outcomes.append({
+                        "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
+                        "status": "skipped", "order_id": "", "reason": "below confidence threshold",
+                    })
+                    continue
 
-    # 7b. Log each decision to signal_log.csv — append-only, before execution
-    from signal_logger import log_signal
-    print("\n  Logging signals to signal_log.csv...")
-    for p in planned:
-        if p["action"] == "HOLD":
-            actual_action = "HOLD"
-        elif p["note"] == "EARNINGS_VETO":
-            actual_action = "EARNINGS_VETO"
-        elif p["note"] == "SENTIMENT_VETO":
-            actual_action = "SENTIMENT_VETO"
-        elif p["skip_reason"] == "below confidence threshold":
-            actual_action = "CONFIDENCE_SKIP"
-        elif p["skip_reason"] == "INVALID_HEADROOM":
-            actual_action = "INVALID_HEADROOM"
-        elif p["skip_reason"] == "already owned":
-            actual_action = "ALREADY_OWNED"
-        elif p["skip_reason"] == "not owned":
-            actual_action = "NOT_OWNED"
-        elif p["skip_reason"] == "insufficient equity":
-            actual_action = "INSUFFICIENT_EQ"
-        elif p["skip_reason"]:
-            actual_action = "SKIPPED"
-        elif p.get("is_add_to_position"):
-            actual_action = "ADD_TO_POSITION"
-        else:
-            actual_action = p["action"]   # BUY or SELL
-        log_signal(
-            ticker        = p["ticker"],
-            model_signal  = p["action"],
-            price         = p["price"],
-            qty           = p["qty"],
-            confidence    = p["confidence"],
-            actual_action = actual_action,
-        )
+                qty = compute_buy_qty(equity, price, fraction)
+                if qty <= 0:
+                    print(f"  Signal: BUY {ticker}{note_str} — skipped (insufficient equity)")
+                    log_signal(ticker, "BUY", price, 0, confidence, "INSUFFICIENT_EQ")
+                    outcomes.append({
+                        "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
+                        "status": "skipped", "order_id": "", "reason": "insufficient equity",
+                    })
+                    continue
 
-    # 8. Execute orders and collect outcomes
-    print("  Applying trading rules...")
-    print("-" * 60)
+                is_add = False
 
-    outcomes = []
-    for p in planned:
-        ticker      = p["ticker"]
-        action      = p["action"]
-        qty         = p["qty"]
-        price       = p["price"]
-        note        = f" ({p['note']})" if p["note"] else ""
-        skip_reason = p["skip_reason"]
-
-        if action == "BUY" and not skip_reason:
-            print(f"  Signal: BUY {ticker} @ ${price:.2f}{note}")
+            label = "add to position" if is_add else "new position"
+            print(f"  Signal: BUY {ticker}{note_str} @ ${price:.2f} ({label})")
             result = place_buy(api, ticker, qty)
+            actual_action = (
+                ("ADD_TO_POSITION" if is_add else "BUY")
+                if result["status"] == "placed"
+                else "BUY_ERROR"
+            )
+            log_signal(ticker, "BUY", price, qty, confidence, actual_action)
+            outcomes.append({
+                "ticker":   ticker,
+                "action":   "BUY",
+                "qty":      qty,
+                "price":    price,
+                "status":   result["status"],
+                "order_id": result.get("order_id", ""),
+                "reason":   result.get("reason", ""),
+            })
 
-        elif action == "SELL" and not skip_reason:
-            print(f"  Signal: SELL {ticker} @ ${price:.2f}{note}")
-            result = place_sell(api, ticker, qty)
-
-        elif action == "HOLD":
-            print(f"  Signal: HOLD {ticker}{note} — no action")
-            result = {"status": "skipped", "reason": "HOLD signal"}
-
+        # ------------------------------------------------------------------
+        # HOLD
+        # ------------------------------------------------------------------
         else:
-            print(f"  Signal: {action} {ticker}{note} — skipped ({skip_reason})")
-            result = {"status": "skipped", "reason": skip_reason}
-
-        outcomes.append({
-            "ticker":   ticker,
-            "action":   action,
-            "qty":      qty,
-            "price":    price,
-            "status":   result["status"],
-            "order_id": result.get("order_id", ""),
-            "reason":   result.get("reason", ""),
-        })
+            print(f"  Signal: HOLD {ticker}{note_str} — no action")
+            log_signal(ticker, "HOLD", price, 0, confidence, "HOLD")
+            outcomes.append({
+                "ticker":   ticker,
+                "action":   "HOLD",
+                "qty":      0,
+                "price":    price,
+                "status":   "skipped",
+                "order_id": "",
+                "reason":   "HOLD signal",
+            })
 
     print("-" * 60)
 
-    # 9. Post-order Discord alert (refresh equity for current portfolio value)
+    # 7. Single post-execution Discord summary (after all trades complete)
     portfolio_value = get_equity(api)
     timestamp_end   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     send_discord(build_post_order_alert(outcomes, portfolio_value, timestamp_end))

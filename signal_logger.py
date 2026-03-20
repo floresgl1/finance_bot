@@ -1,7 +1,8 @@
 """
 signal_logger.py — Append-only logger for bot signal decisions.
 
-Called by live_trader.py just before order execution.
+Called by live_trader.py once per signal, *after* each trade attempt
+completes in the stateful execution loop (not pre-execution batch).
 Creates data/signal_log.csv with a header row on first run.
 outcome_price and result are intentionally left blank; they are
 filled later by outcome_tracker.py.
@@ -9,6 +10,20 @@ filled later by outcome_tracker.py.
 Schema:
     date, ticker, model_signal, price, qty, confidence,
     evaluation_date, actual_action, outcome_price, result
+
+Valid actual_action values:
+    BUY             — new position placed successfully
+    ADD_TO_POSITION — added shares to an already-owned position
+    SELL            — full position sold successfully
+    HOLD            — HOLD signal, no action taken
+    BUY_ERROR       — BUY attempted but Alpaca returned an error
+    SELL_ERROR      — SELL attempted but Alpaca returned an error
+    CONFIDENCE_SKIP — confidence below threshold, trade skipped
+    INVALID_HEADROOM— add-to-position blocked by MAX_POSITION_PCT cap
+    INSUFFICIENT_EQ — not enough equity to buy even 1 share
+    NOT_OWNED       — SELL signal but no position held
+    EARNINGS_VETO   — signal overridden by earnings surprise check
+    SENTIMENT_VETO  — signal overridden by sentiment score check
 """
 
 import csv
@@ -61,7 +76,7 @@ def log_signal(
     price         : current price at time of decision
     qty           : shares to be traded (0 for HOLD or skipped)
     confidence    : model confidence score (0–100)
-    actual_action : what will actually execute (BUY / SELL / HOLD / SKIPPED)
+    actual_action : execution outcome — see module docstring for valid values
     today         : override today's date; defaults to date.today()
     """
     _ensure_file()
