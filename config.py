@@ -54,6 +54,16 @@ MAX_POSITION_PCT = 0.08
 # position.  Signals below this threshold keep the existing "already owned" skip.
 ADD_TO_POSITION_CONFIDENCE = 0.40
 
+# Confidence tier thresholds
+ADD_TO_POSITION_CONFIDENCE_SMALL  = 0.40
+ADD_TO_POSITION_CONFIDENCE_NORMAL = 0.50
+ADD_TO_POSITION_CONFIDENCE_LARGE  = 0.65
+
+# Confidence tier position sizes
+SMALL_POSITION_PCT  = 0.03
+NORMAL_POSITION_PCT = 0.05
+LARGE_POSITION_PCT  = 0.07
+
 # Technical indicator columns used as model input features.
 # Must stay in sync with the columns produced by features.add_features().
 FEATURE_COLUMNS = [
