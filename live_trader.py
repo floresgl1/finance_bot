@@ -47,6 +47,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from capital_allocator import check_add_to_position
+from rebalancer import run_rebalancer
 
 # ---------------------------------------------------------------------------
 # Dependency check — install alpaca-trade-api if not present
@@ -311,11 +312,16 @@ def send_discord(message: str) -> None:
         print(f"  [Discord] Alert failed: {exc}")
 
 
-def build_post_order_alert(outcomes: list[dict], portfolio_value: float, timestamp: str) -> str:
+def build_post_order_alert(
+    outcomes: list[dict],
+    portfolio_value: float,
+    timestamp: str,
+    rebalancer_outcomes: list[dict] | None = None,
+) -> str:
     """
     Build the post-order Discord summary message.
 
-    Each item in `outcomes` has:
+    Each item in `outcomes` / `rebalancer_outcomes` has:
         ticker, action, qty, price, status, order_id, reason
     """
     placed  = [o for o in outcomes if o["status"] == "placed"]
@@ -348,6 +354,20 @@ def build_post_order_alert(outcomes: list[dict], portfolio_value: float, timesta
             lines.append(f"  {o['action']:<4} {o['ticker']:<6}  — {o['reason']}")
     else:
         lines.append("Errors:  none")
+
+    # Rebalanced section — only shown when the rebalancer acted
+    rb = rebalancer_outcomes or []
+    rb_placed = [o for o in rb if o["status"] == "placed"]
+    rb_failed = [o for o in rb if o["status"] == "error"]
+
+    if rb_placed or rb_failed:
+        lines.append("Rebalanced:")
+        for o in rb_placed:
+            lines.append(f"  SELL {o['ticker']:<6}  {o['qty']} share(s) @ ${o['price']:>8.2f}")
+        for o in rb_failed:
+            lines.append(f"  SELL {o['ticker']:<6}  {o['qty']} share(s) @ ${o['price']:>8.2f}  [ORDER FAILED: {o['reason']}]")
+    else:
+        lines.append("Rebalanced: none")
 
     lines.append("```")
     return "\n".join(lines)
@@ -403,7 +423,6 @@ def run() -> None:
         reverse=True,
     )
     hold_sigs = [s for s in signals if s["final_signal"] == "HOLD"]
-    ordered   = sell_sigs + buy_sigs + hold_sigs
 
     print(
         f"\n  Signal queue: {len(sell_sigs)} SELL | "
@@ -413,10 +432,58 @@ def run() -> None:
 
     from signal_logger import log_signal
 
-    outcomes = []
+    outcomes            = []
+    rebalancer_outcomes = []
 
-    # 6. Stateful trade loop — one trade at a time with fresh Alpaca state each iteration
-    for r in ordered:
+    # 6a. SELL pass — process all SELL signals first
+    for r in sell_sigs:
+        ticker     = r["ticker"]
+        price      = r["current_price"]
+        confidence = r.get("confidence", 0.0)
+        note_str   = f" ({r['note']})" if r.get("note") else ""
+
+        owned = get_owned_tickers(api)
+
+        if ticker not in owned:
+            print(f"  Signal: SELL {ticker}{note_str} — skipped (not owned)")
+            log_signal(ticker, "SELL", price, 0, confidence, "NOT_OWNED")
+            outcomes.append({
+                "ticker": ticker, "action": "SELL", "qty": 0, "price": price,
+                "status": "skipped", "order_id": "", "reason": "not owned",
+            })
+            continue
+
+        qty    = owned[ticker]
+        result = place_sell(api, ticker, qty)
+        actual_action = "SELL" if result["status"] == "placed" else "SELL_ERROR"
+        log_signal(ticker, "SELL", price, qty, confidence, actual_action)
+        outcomes.append({
+            "ticker":   ticker,
+            "action":   "SELL",
+            "qty":      qty,
+            "price":    price,
+            "status":   result["status"],
+            "order_id": result.get("order_id", ""),
+            "reason":   result.get("reason", ""),
+        })
+        if result["status"] == "placed":
+            equity = get_equity(api)
+        # Error → logged and recorded; loop continues to next signal
+
+    # 6b. Refresh after SELLs, then run rebalancer, then refresh again
+    owned  = get_owned_tickers(api)
+    equity = get_equity(api)
+
+    print("\n" + "-" * 60)
+    print("  Running rebalancer...")
+    rebalancer_outcomes = run_rebalancer(api)
+
+    owned  = get_owned_tickers(api)
+    equity = get_equity(api)
+    print("-" * 60 + "\n")
+
+    # 6c. BUY + HOLD pass
+    for r in buy_sigs + hold_sigs:
         ticker     = r["ticker"]
         final_sig  = r["final_signal"]
         price      = r["current_price"]
@@ -424,41 +491,9 @@ def run() -> None:
         note_str   = f" ({r['note']})" if r.get("note") else ""
 
         # ------------------------------------------------------------------
-        # SELL
-        # ------------------------------------------------------------------
-        if final_sig == "SELL":
-            owned = get_owned_tickers(api)
-
-            if ticker not in owned:
-                print(f"  Signal: SELL {ticker}{note_str} — skipped (not owned)")
-                log_signal(ticker, "SELL", price, 0, confidence, "NOT_OWNED")
-                outcomes.append({
-                    "ticker": ticker, "action": "SELL", "qty": 0, "price": price,
-                    "status": "skipped", "order_id": "", "reason": "not owned",
-                })
-                continue
-
-            qty    = owned[ticker]
-            result = place_sell(api, ticker, qty)
-            actual_action = "SELL" if result["status"] == "placed" else "SELL_ERROR"
-            log_signal(ticker, "SELL", price, qty, confidence, actual_action)
-            outcomes.append({
-                "ticker":   ticker,
-                "action":   "SELL",
-                "qty":      qty,
-                "price":    price,
-                "status":   result["status"],
-                "order_id": result.get("order_id", ""),
-                "reason":   result.get("reason", ""),
-            })
-            if result["status"] == "placed":
-                equity = get_equity(api)
-            # Error → logged and recorded; loop continues to next signal
-
-        # ------------------------------------------------------------------
         # BUY
         # ------------------------------------------------------------------
-        elif final_sig == "BUY":
+        if final_sig == "BUY":
             owned  = get_owned_tickers(api)
             equity = get_equity(api)
 
@@ -562,7 +597,7 @@ def run() -> None:
     # 7. Single post-execution Discord summary (after all trades complete)
     portfolio_value = get_equity(api)
     timestamp_end   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    send_discord(build_post_order_alert(outcomes, portfolio_value, timestamp_end))
+    send_discord(build_post_order_alert(outcomes, portfolio_value, timestamp_end, rebalancer_outcomes))
 
     print(f"\n  Portfolio value: ${portfolio_value:,.2f}")
     print("  Done.\n")
