@@ -133,6 +133,7 @@ def run() -> None:
 
     try:
         df = pd.read_csv(SIGNAL_LOG_PATH, dtype=str)
+        df["outcome_price"] = pd.to_numeric(df["outcome_price"], errors="coerce")
     except Exception as exc:
         print(f"[FATAL] Could not read signal log: {exc}")
         sys.exit(1)
@@ -201,7 +202,7 @@ def run() -> None:
             f"({change_pct:+.2f}%)  →  {result}"
         )
 
-        df.at[idx, "outcome_price"] = round(outcome_price, 4)
+        df.at[idx, "outcome_price"] = float(round(outcome_price, 4))
         df.at[idx, "result"]        = result
         updated += 1
 
