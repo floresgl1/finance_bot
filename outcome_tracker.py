@@ -41,10 +41,14 @@ from config import DATA_DIR
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-SIGNAL_LOG_PATH = os.path.join(DATA_DIR, "signal_log.csv")
-STALE_DAYS      = 8      # days past evaluation_date before a row is considered stale
-WIN_THRESHOLD   = 0.03   # +3 %
-LOSS_THRESHOLD  = 0.03   # −3 %
+SIGNAL_LOG_PATH    = os.path.join(DATA_DIR, "signal_log.csv")
+SPY_CSV_PATH       = os.path.join(DATA_DIR, "market", "SPY.csv")
+STALE_DAYS         = 8           # days past evaluation_date before a row is considered stale
+WIN_THRESHOLD      = 0.03        # +3 %
+LOSS_THRESHOLD     = 0.03        # −3 %
+STARTING_PORTFOLIO = 100_000.0   # bot's initial capital
+SPY_START_DATE     = date(2026, 3, 1)   # baseline date for SPY comparison
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +118,179 @@ def compute_result(model_signal: str, entry_price: float, outcome_price: float) 
         return "GOOD HOLD"
 
     return "NEUTRAL"
+
+
+# ---------------------------------------------------------------------------
+# Discord helper
+# ---------------------------------------------------------------------------
+def send_discord(message: str) -> None:
+    """POST a message to the Discord webhook. Silently skips if URL not set."""
+    if not DISCORD_WEBHOOK_URL:
+        print("[WARN] DISCORD_WEBHOOK_URL not set — skipping Discord notification")
+        return
+    try:
+        import requests
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+        resp.raise_for_status()
+    except Exception as exc:
+        print(f"[WARN] Discord notification failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Weekly summary helpers
+# ---------------------------------------------------------------------------
+def get_spy_start_price() -> float | None:
+    """
+    Return the SPY closing price on or after SPY_START_DATE.
+    Reads data/market/SPY.csv first; falls back to yfinance if the file is absent.
+    """
+    if os.path.exists(SPY_CSV_PATH):
+        try:
+            spy_df = pd.read_csv(SPY_CSV_PATH)
+            spy_df["Date"] = pd.to_datetime(spy_df["Date"]).dt.date
+            spy_df = spy_df.sort_values("Date")
+            eligible = spy_df[spy_df["Date"] >= SPY_START_DATE]
+            if not eligible.empty:
+                row = eligible.iloc[0]
+                print(f"  SPY start (CSV): {row['Date']} → ${float(row['Close']):.2f}")
+                return float(row["Close"])
+        except Exception as exc:
+            print(f"[WARN] Failed to read SPY CSV: {exc}")
+
+    # Fall back to yfinance
+    print(f"  [INFO] Fetching SPY start price via yfinance (on or after {SPY_START_DATE})")
+    try:
+        df = yf.download(
+            "SPY",
+            start=SPY_START_DATE.isoformat(),
+            end=(SPY_START_DATE + timedelta(days=7)).isoformat(),
+            auto_adjust=True,
+            progress=False,
+        )
+        if df.empty:
+            print("[WARN] yfinance returned no SPY data around start date")
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.index = pd.to_datetime(df.index).date
+        df = df.sort_index()
+        print(f"  SPY start (yfinance): {df.index[0]} → ${float(df['Close'].iloc[0]):.2f}")
+        return float(df["Close"].iloc[0])
+    except Exception as exc:
+        print(f"[ERROR] yfinance SPY start fetch failed: {exc}")
+        return None
+
+
+def get_current_portfolio_value() -> float | None:
+    """Fetch current portfolio equity from the Alpaca paper trading API."""
+    try:
+        try:
+            import alpaca_trade_api as tradeapi
+        except ImportError:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "alpaca-trade-api"])
+            import alpaca_trade_api as tradeapi
+
+        api_key    = os.environ.get("ALPACA_API_KEY")
+        secret_key = os.environ.get("ALPACA_SECRET_KEY")
+        if not api_key or not secret_key:
+            print("[WARN] ALPACA_API_KEY / ALPACA_SECRET_KEY not set — portfolio value unavailable")
+            return None
+
+        api = tradeapi.REST(
+            api_key, secret_key,
+            "https://paper-api.alpaca.markets",
+            api_version="v2",
+        )
+        return float(api.get_account().equity)
+    except Exception as exc:
+        print(f"[ERROR] Failed to fetch portfolio value from Alpaca: {exc}")
+        return None
+
+
+def weekly_summary() -> None:
+    """
+    Compute win rate and rate of return vs SPY, then post a summary to Discord.
+
+    Win rate = (WIN + GOOD HOLD) / (WIN + GOOD HOLD + LOSS + MISSED GAIN + MISSED OPPORTUNITY)
+    Bot RoR  = (current_portfolio − STARTING_PORTFOLIO) / STARTING_PORTFOLIO × 100
+    SPY RoR  = (spy_current − spy_at_SPY_START_DATE) / spy_at_SPY_START_DATE × 100
+    """
+    today = date.today()
+
+    print("=" * 60)
+    print("  Finance Bot — Weekly Summary")
+    print(f"  As of {today}")
+    print("=" * 60)
+
+    if not os.path.exists(SIGNAL_LOG_PATH):
+        print(f"[INFO] Signal log not found at '{SIGNAL_LOG_PATH}' — skipping weekly summary.")
+        return
+
+    try:
+        df = pd.read_csv(SIGNAL_LOG_PATH, dtype=str)
+    except Exception as exc:
+        print(f"[FATAL] Could not read signal log: {exc}")
+        return
+
+    # Only count rows that have been evaluated (not blank, not SKIPPED)
+    evaluated = df[
+        df["result"].notna()
+        & (df["result"].str.strip() != "")
+        & (df["result"].str.strip() != "SKIPPED")
+    ]
+
+    counts         = evaluated["result"].str.strip().value_counts().to_dict()
+    wins           = counts.get("WIN", 0)
+    good_holds     = counts.get("GOOD HOLD", 0)
+    losses         = counts.get("LOSS", 0)
+    missed_gains   = counts.get("MISSED GAIN", 0)
+    missed_opps    = counts.get("MISSED OPPORTUNITY", 0)
+    neutrals       = counts.get("NEUTRAL", 0)
+
+    denominator = wins + good_holds + losses + missed_gains + missed_opps
+    win_rate    = (wins + good_holds) / denominator * 100 if denominator > 0 else 0.0
+
+    print(
+        f"\n  WIN: {wins}  GOOD HOLD: {good_holds}  LOSS: {losses}  "
+        f"MISSED GAIN: {missed_gains}  MISSED OPPORTUNITY: {missed_opps}  NEUTRAL: {neutrals}"
+    )
+    print(f"  Win rate: {win_rate:.0f}%  (denominator: {denominator})\n")
+
+    # SPY return
+    spy_start   = get_spy_start_price()
+    spy_current = fetch_close_on_or_before("SPY", today)
+
+    if spy_start is not None and spy_current is not None:
+        spy_return = (spy_current - spy_start) / spy_start * 100
+        print(f"  SPY return: {spy_return:+.2f}%  (${spy_start:.2f} → ${spy_current:.2f})")
+        spy_str = f"{spy_return:+.2f}%"
+    else:
+        print("  [WARN] Could not compute SPY return")
+        spy_str = "N/A"
+
+    # Bot rate of return
+    portfolio_value = get_current_portfolio_value()
+    if portfolio_value is not None:
+        bot_return = (portfolio_value - STARTING_PORTFOLIO) / STARTING_PORTFOLIO * 100
+        print(f"  Bot return: {bot_return:+.2f}%  (${STARTING_PORTFOLIO:,.0f} → ${portfolio_value:,.2f})")
+        bot_str = f"{bot_return:+.2f}%"
+    else:
+        print("  [WARN] Could not compute bot rate of return")
+        bot_str = "N/A"
+
+    # Format and send Discord message
+    message = (
+        f"**Weekly Performance Update** ({today})\n"
+        f"Win Rate: {win_rate:.0f}% "
+        f"(WIN: {wins}, GOOD HOLD: {good_holds}, LOSS: {losses}, "
+        f"MISSED GAIN: {missed_gains}, MISSED OPPORTUNITY: {missed_opps}, NEUTRAL: {neutrals})\n"
+        f"Rate of Return: {bot_str} vs SPY: {spy_str}"
+    )
+
+    print(f"\n  Discord message preview:\n  {message}\n")
+    send_discord(message)
+    print("  Weekly summary complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -220,4 +397,7 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    if "--weekly" in sys.argv:
+        weekly_summary()
+    else:
+        run()
