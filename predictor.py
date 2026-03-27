@@ -16,6 +16,7 @@ from datetime import date, timedelta
 import joblib
 import numpy as np
 import pandas as pd
+import shap
 
 from config import WATCHLIST, MODEL_DIR, MODEL_FILENAME, CONFIDENCE_THRESHOLD, FEATURE_COLUMNS
 from features import load_and_process
@@ -78,11 +79,16 @@ def predict_ticker(ticker: str, model_bundle: dict) -> dict:
     # Decode integer prediction back to string label
     signal   = encoder.inverse_transform([top_idx])[0] if top_prob >= CONFIDENCE_THRESHOLD else "HOLD"
 
+    explainer = shap.TreeExplainer(model)
+    raw_shap  = explainer.shap_values(X)
+    shap_vals = dict(zip(FEATURE_COLUMNS, raw_shap[top_idx][0]))
+
     return {
         "ticker":        ticker,
         "signal":        signal,
         "confidence":    round(top_prob * 100, 1),
         "current_price": round(current_price, 2),
+        "shap_values":   shap_vals,
     }
 
 

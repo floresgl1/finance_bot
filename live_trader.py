@@ -317,6 +317,7 @@ def build_post_order_alert(
     portfolio_value: float,
     timestamp: str,
     rebalancer_outcomes: list[dict] | None = None,
+    shap_by_signal: dict | None = None,
 ) -> str:
     """
     Build the post-order Discord summary message.
@@ -370,6 +371,24 @@ def build_post_order_alert(
         lines.append("Rebalanced: none")
 
     lines.append("```")
+
+    # SHAP section — average feature contributions per signal group, top 3 by |value|
+    def _avg_top3_shap(shap_list: list[dict]) -> str:
+        if not shap_list:
+            return "—"
+        keys = shap_list[0].keys()
+        avg  = {k: sum(d.get(k, 0.0) for d in shap_list) / len(shap_list) for k in keys}
+        top3 = sorted(avg.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+        return ", ".join(f"{k.lower()} {v:+.2f}" for k, v in top3)
+
+    shap_data  = shap_by_signal or {}
+    shap_lines = ["**SHAP — Top drivers:**"]
+    for group in ("BUY", "HOLD", "SELL"):
+        shap_list = shap_data.get(group, [])
+        drivers   = _avg_top3_shap(shap_list)
+        shap_lines.append(f"{group} ({len(shap_list)} tickers): {drivers}")
+    lines.append("\n".join(shap_lines))
+
     return "\n".join(lines)
 
 
@@ -432,6 +451,7 @@ def run() -> None:
 
     from signal_logger import log_signal
 
+    shap_by_signal      = {"BUY": [], "HOLD": [], "SELL": []}
     outcomes            = []
     rebalancer_outcomes = []
 
@@ -441,6 +461,9 @@ def run() -> None:
         price      = r["current_price"]
         confidence = r.get("confidence", 0.0)
         note_str   = f" ({r['note']})" if r.get("note") else ""
+
+        if r.get("shap_values"):
+            shap_by_signal["SELL"].append(r["shap_values"])
 
         owned = get_owned_tickers(api)
 
@@ -494,6 +517,9 @@ def run() -> None:
         # BUY
         # ------------------------------------------------------------------
         if final_sig == "BUY":
+            if r.get("shap_values"):
+                shap_by_signal["BUY"].append(r["shap_values"])
+
             owned  = get_owned_tickers(api)
             equity = get_equity(api)
 
@@ -580,6 +606,9 @@ def run() -> None:
         # HOLD
         # ------------------------------------------------------------------
         else:
+            if r.get("shap_values"):
+                shap_by_signal["HOLD"].append(r["shap_values"])
+
             print(f"  Signal: HOLD {ticker}{note_str} — no action")
             log_signal(ticker, "HOLD", price, 0, confidence, "HOLD")
             outcomes.append({
@@ -597,7 +626,7 @@ def run() -> None:
     # 7. Single post-execution Discord summary (after all trades complete)
     portfolio_value = get_equity(api)
     timestamp_end   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    send_discord(build_post_order_alert(outcomes, portfolio_value, timestamp_end, rebalancer_outcomes))
+    send_discord(build_post_order_alert(outcomes, portfolio_value, timestamp_end, rebalancer_outcomes, shap_by_signal))
 
     print(f"\n  Portfolio value: ${portfolio_value:,.2f}")
     print("  Done.\n")

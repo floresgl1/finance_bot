@@ -8,3 +8,4 @@ torch
 python-dotenv
 xgboost
 requests
+shap
