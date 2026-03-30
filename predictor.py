@@ -80,8 +80,8 @@ def predict_ticker(ticker: str, model_bundle: dict) -> dict:
     signal   = encoder.inverse_transform([top_idx])[0] if top_prob >= CONFIDENCE_THRESHOLD else "HOLD"
 
     explainer = shap.TreeExplainer(model)
-    raw_shap  = explainer.shap_values(X)
-    shap_vals = dict(zip(FEATURE_COLUMNS, raw_shap[top_idx][0]))
+    raw_shap  = explainer(X).values
+    shap_vals = dict(zip(FEATURE_COLUMNS, raw_shap[0, :, top_idx]))
 
     return {
         "ticker":        ticker,
