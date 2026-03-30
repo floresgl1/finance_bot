@@ -119,9 +119,13 @@ def get_signals(sentiment_df=None) -> list[dict]:
             r            = predict_ticker(ticker, model)
             model_signal = r["signal"]
 
+            veto_reason = None
+
             # 1. Earnings veto
             surprise = get_recent_earnings_surprise(ticker)
             post_earnings, earn_note = apply_earnings_veto(model_signal, surprise)
+            if post_earnings != model_signal:
+                veto_reason = "EARNINGS_VETO"
 
             # 2. Sentiment veto (only if not already HOLD from earnings)
             final_signal = post_earnings
@@ -136,6 +140,7 @@ def get_signals(sentiment_df=None) -> list[dict]:
                 sent_score = float(rows["sentiment_score"].iloc[-1]) if not rows.empty else 0.0
                 final_signal, sent_note = apply_sentiment_veto(post_earnings, sent_score)
                 if final_signal == "HOLD" and sent_note:
+                    veto_reason = "SENTIMENT_VETO"
                     send_discord(
                         f"\N{NO ENTRY} **Sentiment Veto:** {ticker} {today}  "
                         f"Model said: {post_earnings}  "
@@ -146,6 +151,7 @@ def get_signals(sentiment_df=None) -> list[dict]:
             r["final_signal"] = final_signal
             r["sentiment"]    = sent_score
             r["note"]         = earn_note or sent_note
+            r["veto_reason"]  = veto_reason
             results.append(r)
         except Exception as exc:
             print(f"  [SKIP] {ticker} — {exc}")
@@ -610,7 +616,7 @@ def run() -> None:
                 shap_by_signal["HOLD"].append(r["shap_values"])
 
             print(f"  Signal: HOLD {ticker}{note_str} — no action")
-            log_signal(ticker, "HOLD", price, 0, confidence, "HOLD")
+            log_signal(ticker, "HOLD", price, 0, confidence, r.get("veto_reason") or "HOLD")
             outcomes.append({
                 "ticker":   ticker,
                 "action":   "HOLD",
