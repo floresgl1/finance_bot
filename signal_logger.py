@@ -24,6 +24,7 @@ Valid actual_action values:
     NOT_OWNED       — SELL signal but no position held
     EARNINGS_VETO   — signal overridden by earnings surprise check
     SENTIMENT_VETO  — signal overridden by sentiment score check
+    EXIT_SKIP       — BUY skipped because ticker was exited via stop-loss/take-profit this session
 """
 
 import csv

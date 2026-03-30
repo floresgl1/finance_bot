@@ -523,6 +523,16 @@ def run() -> None:
         # BUY
         # ------------------------------------------------------------------
         if final_sig == "BUY":
+            # Skip tickers that were exited via stop-loss/take-profit this session
+            if ticker in exited:
+                print(f"  Signal: BUY {ticker}{note_str} — skipped (EXIT_SKIP)")
+                log_signal(ticker, "BUY", price, 0, confidence, "EXIT_SKIP")
+                outcomes.append({
+                    "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
+                    "status": "skipped", "order_id": "", "reason": "EXIT_SKIP",
+                })
+                continue
+
             if r.get("shap_values"):
                 shap_by_signal["BUY"].append(r["shap_values"])
 
