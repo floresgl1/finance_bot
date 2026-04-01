@@ -589,12 +589,15 @@ def run() -> None:
             owned  = get_owned_tickers(api)
             equity = get_equity(api)
 
+            bar        = api.get_latest_trade(ticker)
+            live_price = float(bar.price)
+
             if ticker in owned:
                 # Already owned — ask capital_allocator with fresh state
                 alloc = check_add_to_position(
                     ticker                = ticker,
                     confidence_normalized = confidence / 100.0,
-                    price                 = price,
+                    price                 = live_price,
                     shares_owned          = owned[ticker],
                     portfolio_value       = equity,
                 )
@@ -637,7 +640,7 @@ def run() -> None:
                     })
                     continue
 
-                qty = compute_buy_qty(equity, price, fraction)
+                qty = compute_buy_qty(equity, live_price, fraction)
                 if qty <= 0:
                     print(f"  Signal: BUY {ticker}{note_str} — skipped (insufficient equity)")
                     log_signal(ticker, "BUY", price, 0, confidence, "INSUFFICIENT_EQ")
