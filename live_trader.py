@@ -564,16 +564,6 @@ def run() -> None:
         # BUY
         # ------------------------------------------------------------------
         if final_sig == "BUY":
-            # Skip if a STOP_LOSS_SELL was logged for this ticker within the past 7 calendar days
-            if was_stop_loss_recently(ticker):
-                print(f"  Signal: BUY {ticker}{note_str} — skipped (COOLDOWN_SKIP)")
-                log_signal(ticker, "BUY", price, 0, confidence, "COOLDOWN_SKIP")
-                outcomes.append({
-                    "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
-                    "status": "skipped", "order_id": "", "reason": "COOLDOWN_SKIP",
-                })
-                continue
-
             # Skip tickers that were exited via stop-loss/take-profit this session
             if ticker in exited:
                 print(f"  Signal: BUY {ticker}{note_str} — skipped (EXIT_SKIP)")
@@ -581,6 +571,16 @@ def run() -> None:
                 outcomes.append({
                     "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
                     "status": "skipped", "order_id": "", "reason": "EXIT_SKIP",
+                })
+                continue
+
+            # Skip if a STOP_LOSS_SELL was logged for this ticker within the past 7 calendar days
+            if was_stop_loss_recently(ticker):
+                print(f"  Signal: BUY {ticker}{note_str} — skipped (COOLDOWN_SKIP)")
+                log_signal(ticker, "BUY", price, 0, confidence, "COOLDOWN_SKIP")
+                outcomes.append({
+                    "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
+                    "status": "skipped", "order_id": "", "reason": "COOLDOWN_SKIP",
                 })
                 continue
 
