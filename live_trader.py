@@ -41,6 +41,7 @@ import os
 import sys
 import subprocess
 import math
+import time
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -655,6 +656,8 @@ def run() -> None:
             label = "add to position" if is_add else "new position"
             print(f"  Signal: BUY {ticker}{note_str} @ ${price:.2f} ({label})")
             result = place_buy(api, ticker, qty)
+            if result["status"] == "placed":
+                time.sleep(1)
             actual_action = (
                 ("ADD_TO_POSITION" if is_add else "BUY")
                 if result["status"] == "placed"
