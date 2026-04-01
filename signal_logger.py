@@ -25,6 +25,8 @@ Valid actual_action values:
     EARNINGS_VETO   — signal overridden by earnings surprise check
     SENTIMENT_VETO  — signal overridden by sentiment score check
     EXIT_SKIP       — BUY skipped because ticker was exited via stop-loss/take-profit this session
+    STOP_LOSS_SELL  — position sold by the stop-loss guard (loss > threshold)
+    COOLDOWN_SKIP   — BUY skipped because a STOP_LOSS_SELL was logged within the past 7 calendar days
 """
 
 import csv

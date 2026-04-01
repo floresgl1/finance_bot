@@ -237,6 +237,44 @@ def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Stop-loss cooldown check
+# ---------------------------------------------------------------------------
+def was_stop_loss_recently(ticker: str, days: int | None = None) -> bool:
+    """
+    Return True if a STOP_LOSS_SELL was logged for `ticker` within the past
+    `days` calendar days (today - log_date <= days).
+
+    Defaults to STOP_LOSS_COOLDOWN_DAYS from config.py when days is not supplied.
+    """
+    import csv as _csv
+    from datetime import date as _date
+    from signal_logger import SIGNAL_LOG_PATH
+    from config import STOP_LOSS_COOLDOWN_DAYS
+
+    if days is None:
+        days = STOP_LOSS_COOLDOWN_DAYS
+
+    if not os.path.exists(SIGNAL_LOG_PATH):
+        return False
+
+    today = _date.today()
+    try:
+        with open(SIGNAL_LOG_PATH, newline="") as fh:
+            for row in _csv.DictReader(fh):
+                if row["ticker"] != ticker or row["actual_action"] != "STOP_LOSS_SELL":
+                    continue
+                try:
+                    log_date = _date.fromisoformat(row["date"])
+                    if (today - log_date).days <= days:
+                        return True
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Stop-loss / take-profit
 # ---------------------------------------------------------------------------
 def check_position_limits(
@@ -279,6 +317,8 @@ def check_position_limits(
                 f"(entry ${entry_price:.2f} → current ${current_price:.2f})"
             )
             if result["status"] == "placed":
+                from signal_logger import log_signal
+                log_signal(ticker, "SELL", current_price, qty, 0.0, "STOP_LOSS_SELL")
                 exited.append(ticker)
                 owned.pop(ticker, None)
 
@@ -523,6 +563,16 @@ def run() -> None:
         # BUY
         # ------------------------------------------------------------------
         if final_sig == "BUY":
+            # Skip if a STOP_LOSS_SELL was logged for this ticker within the past 7 calendar days
+            if was_stop_loss_recently(ticker):
+                print(f"  Signal: BUY {ticker}{note_str} — skipped (COOLDOWN_SKIP)")
+                log_signal(ticker, "BUY", price, 0, confidence, "COOLDOWN_SKIP")
+                outcomes.append({
+                    "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
+                    "status": "skipped", "order_id": "", "reason": "COOLDOWN_SKIP",
+                })
+                continue
+
             # Skip tickers that were exited via stop-loss/take-profit this session
             if ticker in exited:
                 print(f"  Signal: BUY {ticker}{note_str} — skipped (EXIT_SKIP)")

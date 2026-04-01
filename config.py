@@ -46,6 +46,10 @@ XGB_PARAMS = {
 # Random chance for 3 classes is 0.33; 0.45 requires meaningful conviction.
 CONFIDENCE_THRESHOLD = 0.35
 
+# Number of calendar days after a STOP_LOSS_SELL during which a BUY on the
+# same ticker is blocked (logged as COOLDOWN_SKIP).
+STOP_LOSS_COOLDOWN_DAYS = 7
+
 # Maximum fraction of total portfolio value allowed in any single position.
 # Used by capital_allocator.py to compute headroom before adding to a position.
 MAX_POSITION_PCT = 0.08
