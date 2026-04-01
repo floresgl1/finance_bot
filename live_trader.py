@@ -241,39 +241,35 @@ def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
 # ---------------------------------------------------------------------------
 # Stop-loss cooldown check
 # ---------------------------------------------------------------------------
-def was_stop_loss_recently(ticker: str, days: int | None = None) -> bool:
+def get_cooldown_tickers() -> set[str]:
     """
-    Return True if a STOP_LOSS_SELL was logged for `ticker` within the past
-    `days` calendar days (today - log_date <= days).
-
-    Defaults to STOP_LOSS_COOLDOWN_DAYS from config.py when days is not supplied.
+    Read signal_log.csv once and return the set of tickers that had a
+    STOP_LOSS_SELL logged within the past STOP_LOSS_COOLDOWN_DAYS calendar days.
     """
     import csv as _csv
     from datetime import date as _date
     from signal_logger import SIGNAL_LOG_PATH
     from config import STOP_LOSS_COOLDOWN_DAYS
 
-    if days is None:
-        days = STOP_LOSS_COOLDOWN_DAYS
-
     if not os.path.exists(SIGNAL_LOG_PATH):
-        return False
+        return set()
 
-    today = _date.today()
+    today   = _date.today()
+    tickers = set()
     try:
         with open(SIGNAL_LOG_PATH, newline="") as fh:
             for row in _csv.DictReader(fh):
-                if row["ticker"] != ticker or row["actual_action"] != "STOP_LOSS_SELL":
+                if row["actual_action"] != "STOP_LOSS_SELL":
                     continue
                 try:
                     log_date = _date.fromisoformat(row["date"])
-                    if (today - log_date).days <= days:
-                        return True
+                    if (today - log_date).days <= STOP_LOSS_COOLDOWN_DAYS:
+                        tickers.add(row["ticker"])
                 except ValueError:
                     continue
     except OSError:
         pass
-    return False
+    return tickers
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +278,6 @@ def was_stop_loss_recently(ticker: str, days: int | None = None) -> bool:
 def check_position_limits(
     api: tradeapi.REST,
     owned: dict[str, float],
-    equity: float,
     stop_pct: float = 10.0,
     take_pct: float = 15.0,
 ) -> tuple[list[str], dict[str, float]]:
@@ -464,7 +459,7 @@ def run() -> None:
     owned  = get_owned_tickers(api)
     equity = get_equity(api)
     print(f"  Checking stop losses on {len(owned)} open position(s)...")
-    exited, owned = check_position_limits(api, owned, equity)
+    exited, owned = check_position_limits(api, owned)
     if exited:
         print(f"  Exited (stop-loss / take-profit): {exited}")
         owned  = get_owned_tickers(api)
@@ -554,6 +549,8 @@ def run() -> None:
     print("-" * 60 + "\n")
 
     # 6c. BUY + HOLD pass
+    cooldown_tickers = get_cooldown_tickers()
+
     for r in buy_sigs + hold_sigs:
         ticker     = r["ticker"]
         final_sig  = r["final_signal"]
@@ -576,7 +573,7 @@ def run() -> None:
                 continue
 
             # Skip if a STOP_LOSS_SELL was logged for this ticker within the past 7 calendar days
-            if was_stop_loss_recently(ticker):
+            if ticker in cooldown_tickers:
                 print(f"  Signal: BUY {ticker}{note_str} — skipped (COOLDOWN_SKIP)")
                 log_signal(ticker, "BUY", price, 0, confidence, "COOLDOWN_SKIP")
                 outcomes.append({
