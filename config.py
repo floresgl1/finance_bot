@@ -50,6 +50,9 @@ CONFIDENCE_THRESHOLD = 0.35
 # same ticker is blocked (logged as COOLDOWN_SKIP).
 STOP_LOSS_COOLDOWN_DAYS = 7
 
+# Logged when a BUY cannot be sized to even 1 share due to insufficient equity.
+INSUFFICIENT_EQUITY = "INSUFFICIENT_EQUITY"
+
 # Maximum fraction of total portfolio value allowed in any single position.
 # Used by capital_allocator.py to compute headroom before adding to a position.
 MAX_POSITION_PCT = 0.08

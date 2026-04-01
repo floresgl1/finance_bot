@@ -49,6 +49,7 @@ load_dotenv()
 
 from capital_allocator import check_add_to_position
 from rebalancer import run_rebalancer
+from config import INSUFFICIENT_EQUITY
 
 # ---------------------------------------------------------------------------
 # Dependency check — install alpaca-trade-api if not present
@@ -616,7 +617,7 @@ def run() -> None:
                 if skip_reason:
                     actual_skip = (
                         "CONFIDENCE_SKIP" if skip_reason == "CONFIDENCE_SKIP"
-                        else "INSUFFICIENT_EQ"
+                        else INSUFFICIENT_EQUITY
                     )
                     print(f"  Signal: BUY {ticker}{note_str} — skipped ({skip_reason})")
                     log_signal(ticker, "BUY", price, 0, confidence, actual_skip)
@@ -644,7 +645,7 @@ def run() -> None:
                 qty = compute_buy_qty(equity, live_price, fraction)
                 if qty <= 0:
                     print(f"  Signal: BUY {ticker}{note_str} — skipped (insufficient equity)")
-                    log_signal(ticker, "BUY", price, 0, confidence, "INSUFFICIENT_EQ")
+                    log_signal(ticker, "BUY", price, 0, confidence, INSUFFICIENT_EQUITY)
                     outcomes.append({
                         "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
                         "status": "skipped", "order_id": "", "reason": "insufficient equity",

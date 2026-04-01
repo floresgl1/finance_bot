@@ -38,6 +38,7 @@ from config import (
     SMALL_POSITION_PCT,
     NORMAL_POSITION_PCT,
     LARGE_POSITION_PCT,
+    INSUFFICIENT_EQUITY,
 )
 
 
@@ -117,7 +118,7 @@ def check_add_to_position(
 
     return {
         "shares_to_buy":   shares_to_buy,
-        "skip_reason":     "" if shares_to_buy > 0 else "INSUFFICIENT_EQUITY",
+        "skip_reason":     "" if shares_to_buy > 0 else INSUFFICIENT_EQUITY,
         "headroom":        headroom,
         "current_weight":  current_weight,
         "allocation_tier": tier_label,
