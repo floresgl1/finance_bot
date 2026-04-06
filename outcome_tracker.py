@@ -11,17 +11,17 @@ For each pending row in data/signal_log.csv (result is blank):
   - evaluation_date 8+ days ago     → mark SKIPPED (stale, price no longer reliable)
   - evaluation_date <= today        → fetch outcome price, compute result
 
-Evaluation rules (±3 % threshold):
-  BUY  → WIN  if outcome ≥ entry × 1.03
-          LOSS if outcome ≤ entry × 0.97
+Evaluation rules (±2 % threshold):
+  BUY  → WIN  if outcome ≥ entry × 1.02
+          LOSS if outcome ≤ entry × 0.98
           NEUTRAL otherwise
 
-  SELL → WIN  if outcome ≤ entry × 0.97   (price fell — sell was correct)
-          LOSS if outcome ≥ entry × 1.03   (price rose — sell was wrong)
+  SELL → WIN  if outcome ≤ entry × 0.98   (price fell — sell was correct)
+          LOSS if outcome ≥ entry × 1.02   (price rose — sell was wrong)
           NEUTRAL otherwise
 
-  HOLD → MISSED GAIN        if outcome ≥ entry × 1.03
-          MISSED OPPORTUNITY if outcome ≤ entry × 0.97
+  HOLD → MISSED GAIN        if outcome ≥ entry × 1.02
+          MISSED OPPORTUNITY if outcome ≤ entry × 0.98
           GOOD HOLD          otherwise
 
 Weekend / holiday: uses the last available close price on or before evaluation_date.
@@ -44,8 +44,8 @@ from config import DATA_DIR
 SIGNAL_LOG_PATH    = os.path.join(DATA_DIR, "signal_log.csv")
 SPY_CSV_PATH       = os.path.join(DATA_DIR, "market", "SPY.csv")
 STALE_DAYS         = 8           # days past evaluation_date before a row is considered stale
-WIN_THRESHOLD      = 0.03        # +3 %
-LOSS_THRESHOLD     = 0.03        # −3 %
+WIN_THRESHOLD      = 0.02        # +2 %
+LOSS_THRESHOLD     = 0.02        # −2 %
 STARTING_PORTFOLIO = 100_000.0   # bot's initial capital
 SPY_START_DATE     = date(2026, 3, 1)   # baseline date for SPY comparison
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
