@@ -49,7 +49,7 @@ load_dotenv()
 
 from capital_allocator import check_add_to_position
 from rebalancer import run_rebalancer
-from config import INSUFFICIENT_EQUITY
+from config import INSUFFICIENT_EQUITY, STALE_DAYS
 
 # ---------------------------------------------------------------------------
 # Dependency check — install alpaca-trade-api if not present
@@ -110,7 +110,7 @@ def get_signals(sentiment_df=None) -> list[dict]:
     from config import WATCHLIST
     from predictor import (load_model, predict_ticker,
                            apply_earnings_veto, get_recent_earnings_surprise,
-                           apply_sentiment_veto)
+                           apply_sentiment_veto, is_ticker_stale)
 
     model = load_model()
     today = date_cls.today()
@@ -118,6 +118,52 @@ def get_signals(sentiment_df=None) -> list[dict]:
     results = []
     for ticker in WATCHLIST:
         try:
+            stale, days_old = is_ticker_stale(ticker)
+            if stale:
+                # Translate sentinel values to human-readable age labels
+                if days_old == 9999:
+                    age_str = "parse error"
+                elif days_old == -1:
+                    age_str = "csv file missing"
+                else:
+                    age_str = f"{days_old} days old"
+
+                # Read the last known close price from the CSV for logging.
+                # If this fails the CSV is unreadable — log as CSV_INVALID_SKIP
+                # and skip entirely rather than appending a stale entry.
+                import pandas as _pd
+                import os as _os
+                from config import DATA_DIR as _DATA_DIR
+                _last_price = None
+                try:
+                    _csv_path = _os.path.join(_DATA_DIR, f"{ticker}.csv")
+                    _df = _pd.read_csv(_csv_path)
+                    _last_price = float(_df["Close"].iloc[-1])
+                except Exception:
+                    pass
+
+                if _last_price is None:
+                    from signal_logger import log_signal as _log_invalid
+                    print(f"  [CSV_INVALID_SKIP] {ticker} — could not read Close price, skipping")
+                    _log_invalid(ticker, "CSV_INVALID_SKIP", 0.0, 0, 0.0, "CSV_INVALID_SKIP")
+                    continue
+
+                print(f"  [STALE_SKIP] {ticker} — {age_str} (limit: {STALE_DAYS}d)")
+                results.append({
+                    "ticker":        ticker,
+                    "signal":        "STALE_SKIP",
+                    "final_signal":  "STALE_SKIP",
+                    "confidence":    0.0,
+                    "current_price": _last_price,
+                    "sentiment":     0.0,
+                    "note":          "STALE_SKIP",
+                    "veto_reason":   None,
+                    "shap_values":   {},
+                    "days_old":      days_old,
+                    "age_str":       age_str,
+                })
+                continue
+
             r            = predict_ticker(ticker, model)
             model_signal = r["signal"]
 
@@ -361,6 +407,7 @@ def build_post_order_alert(
     timestamp: str,
     rebalancer_outcomes: list[dict] | None = None,
     shap_by_signal: dict | None = None,
+    stale_skips: list[dict] | None = None,
 ) -> str:
     """
     Build the post-order Discord summary message.
@@ -412,6 +459,14 @@ def build_post_order_alert(
             lines.append(f"  SELL {o['ticker']:<6}  {o['qty']} share(s) @ ${o['price']:>8.2f}  [ORDER FAILED: {o['reason']}]")
     else:
         lines.append("Rebalanced: none")
+
+    stale = stale_skips or []
+    if stale:
+        lines.append(f"Stale data skipped (>{STALE_DAYS}d):")
+        for entry in stale:
+            lines.append(f"  SKIP {entry['ticker']:<6}  — {entry['age_str']}")
+    else:
+        lines.append("Stale data: none")
 
     lines.append("```")
 
@@ -472,6 +527,14 @@ def run() -> None:
     if not signals:
         print("  No signals generated. Exiting.")
         sys.exit(0)
+
+    # Separate and log stale-data skips before the main execution pass
+    from signal_logger import log_signal as _log_signal_early
+    stale_sigs = [s for s in signals if s["final_signal"] == "STALE_SKIP"]
+    signals    = [s for s in signals if s["final_signal"] != "STALE_SKIP"]
+    for r in stale_sigs:
+        print(f"  [STALE_SKIP] {r['ticker']} ({r['age_str']}) logged")
+        _log_signal_early(r["ticker"], "STALE_SKIP", r["current_price"], 0, 0.0, "STALE_SKIP")
 
     # 5. Sort: SELLs first (confidence desc), then BUYs (confidence desc), then HOLDs
     sell_sigs = sorted(
@@ -696,7 +759,7 @@ def run() -> None:
     # 7. Single post-execution Discord summary (after all trades complete)
     portfolio_value = get_equity(api)
     timestamp_end   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    send_discord(build_post_order_alert(outcomes, portfolio_value, timestamp_end, rebalancer_outcomes, shap_by_signal))
+    send_discord(build_post_order_alert(outcomes, portfolio_value, timestamp_end, rebalancer_outcomes, shap_by_signal, stale_skips=[{"ticker": r["ticker"], "age_str": r["age_str"]} for r in stale_sigs]))
 
     print(f"\n  Portfolio value: ${portfolio_value:,.2f}")
     print("  Done.\n")

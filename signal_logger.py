@@ -27,6 +27,8 @@ Valid actual_action values:
     EXIT_SKIP       — BUY skipped because ticker was exited via stop-loss/take-profit this session
     STOP_LOSS_SELL  — position sold by the stop-loss guard (loss > threshold)
     COOLDOWN_SKIP   — BUY skipped because a STOP_LOSS_SELL was logged within the past 7 calendar days
+    STALE_SKIP      — ticker skipped because its CSV data is older than STALE_DAYS calendar days
+    CSV_INVALID_SKIP— ticker skipped because its CSV is missing or the Close price could not be read
 """
 
 import csv

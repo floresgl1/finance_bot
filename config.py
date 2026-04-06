@@ -13,6 +13,10 @@ WATCHLIST = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'JPM', 'XOM', 'JNJ',
 # Number of calendar days ahead to measure the return used for labeling and prediction
 PREDICTION_DAYS = 7
 
+# Maximum age (calendar days) of a ticker's price CSV before it is considered stale
+# and skipped during signal generation (logged as STALE_SKIP).
+STALE_DAYS = PREDICTION_DAYS - 2
+
 # How far back to pull historical data from yfinance (e.g. "1y", "3y", "5y")
 HISTORY_PERIOD = "3y"
 
@@ -52,6 +56,12 @@ STOP_LOSS_COOLDOWN_DAYS = 7
 
 # Logged when a BUY cannot be sized to even 1 share due to insufficient equity.
 INSUFFICIENT_EQUITY = "INSUFFICIENT_EQUITY"
+
+# Logged when a ticker's price CSV is older than STALE_DAYS calendar days.
+STALE_SKIP = "STALE_SKIP"
+
+# Logged when a ticker's CSV is completely missing or its Close price cannot be read.
+CSV_INVALID_SKIP = "CSV_INVALID_SKIP"
 
 # Maximum fraction of total portfolio value allowed in any single position.
 # Used by capital_allocator.py to compute headroom before adding to a position.

@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import shap
 
-from config import WATCHLIST, MODEL_DIR, MODEL_FILENAME, CONFIDENCE_THRESHOLD, FEATURE_COLUMNS
+from config import WATCHLIST, MODEL_DIR, MODEL_FILENAME, CONFIDENCE_THRESHOLD, FEATURE_COLUMNS, DATA_DIR, STALE_DAYS
 from features import load_and_process
 from sentiment import get_sentiment_all
 
@@ -31,6 +31,31 @@ if hasattr(sys.stdout, "buffer"):
 # Veto thresholds: signals that conflict with sentiment this strongly are held
 VETO_BUY_THRESHOLD  = -0.2   # BUY vetoed when sentiment falls below this
 VETO_SELL_THRESHOLD =  0.2   # SELL vetoed when sentiment rises above this
+
+
+def is_ticker_stale(ticker: str) -> tuple[bool, int]:
+    """
+    Check whether a ticker's price CSV is too old to trade on.
+
+    Returns:
+        (is_stale, days_old)
+          is_stale — True when the CSV is missing, unreadable, or the most
+                     recent date is more than STALE_DAYS calendar days ago.
+                     Parse/IO failures are treated as stale so the bot never
+                     trades on bad data.
+          days_old — calendar days since the last row's date, or -1 when the
+                     file is missing, and 9999 when parsing fails.
+    """
+    path = os.path.join(DATA_DIR, f"{ticker}.csv")
+    if not os.path.exists(path):
+        return False, -1
+    try:
+        df       = pd.read_csv(path, parse_dates=["Date"])
+        max_date = pd.to_datetime(df["Date"]).max().date()
+        days_old = (date.today() - max_date).days
+        return days_old > STALE_DAYS, days_old
+    except Exception:
+        return True, 9999
 
 
 def load_model() -> dict:
