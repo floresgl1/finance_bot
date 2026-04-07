@@ -39,6 +39,7 @@ from config import (
     NORMAL_POSITION_PCT,
     LARGE_POSITION_PCT,
     INSUFFICIENT_EQUITY,
+    INVALID_PRICE_SKIP,
 )
 
 
@@ -80,6 +81,15 @@ def check_add_to_position(
         current_weight   — float, fraction of portfolio currently in this position
         allocation_tier  — str, "small" / "normal" / "large" (empty if skipped)
     """
+    if price <= 0:
+        return {
+            "shares_to_buy":   0,
+            "skip_reason":     INVALID_PRICE_SKIP,
+            "headroom":        0.0,
+            "current_weight":  0.0,
+            "allocation_tier": "",
+        }
+
     if confidence_normalized < ADD_TO_POSITION_CONFIDENCE:
         return {
             "shares_to_buy":   0,

@@ -63,6 +63,10 @@ STALE_SKIP = "STALE_SKIP"
 # Logged when a ticker's CSV is completely missing or its Close price cannot be read.
 CSV_INVALID_SKIP = "CSV_INVALID_SKIP"
 
+# Logged when capital_allocator receives a price of zero or negative, making share
+# sizing impossible.
+INVALID_PRICE_SKIP = "INVALID_PRICE_SKIP"
+
 # Maximum fraction of total portfolio value allowed in any single position.
 # Used by capital_allocator.py to compute headroom before adding to a position.
 MAX_POSITION_PCT = 0.08
