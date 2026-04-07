@@ -63,7 +63,10 @@ def _load_market_close(symbol: str) -> pd.Series:
     df.index.name = "Date"
 
     close = pd.to_numeric(df["Close"], errors="coerce")
-    close.index = close.index.tz_localize(None)
+    if close.index.tz is not None:
+        close.index = close.index.tz_convert(None)
+    else:
+        close.index = close.index.tz_localize(None)
     return close
 
 
@@ -178,7 +181,11 @@ def _add_earnings_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
     if os.path.exists(earnings_path):
         earnings_df = pd.read_csv(earnings_path, index_col="Date", parse_dates=True)
-        earnings_df.index = pd.to_datetime(earnings_df.index).tz_localize(None)
+        earnings_idx = pd.to_datetime(earnings_df.index)
+        if earnings_idx.tz is not None:
+            earnings_df.index = earnings_idx.tz_convert(None)
+        else:
+            earnings_df.index = earnings_idx.tz_localize(None)
         earnings_df = earnings_df.sort_index()
 
         # merge_asof requires both sides to be sorted; reset index to use as key
@@ -216,7 +223,11 @@ def _add_sentiment_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if os.path.exists(sent_path):
         sent = pd.read_csv(sent_path, parse_dates=["Date"])
         sent = sent.set_index("Date")[["sent_score_daily"]]
-        sent.index = pd.to_datetime(sent.index).tz_localize(None)
+        sent_idx = pd.to_datetime(sent.index)
+        if sent_idx.tz is not None:
+            sent.index = sent_idx.tz_convert(None)
+        else:
+            sent.index = sent_idx.tz_localize(None)
         df = df.join(sent, how="left")
     else:
         df["sent_score_daily"] = float("nan")
