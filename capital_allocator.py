@@ -41,6 +41,7 @@ from config import (
     INSUFFICIENT_EQUITY,
     INVALID_PRICE_SKIP,
     INVALID_PORTFOLIO_SKIP,
+    INVALID_SHARES_SKIP,
 )
 
 
@@ -86,6 +87,15 @@ def check_add_to_position(
         return {
             "shares_to_buy":   0,
             "skip_reason":     INVALID_PRICE_SKIP,
+            "headroom":        0.0,
+            "current_weight":  0.0,
+            "allocation_tier": "",
+        }
+
+    if shares_owned <= 0:
+        return {
+            "shares_to_buy":   0,
+            "skip_reason":     INVALID_SHARES_SKIP,
             "headroom":        0.0,
             "current_weight":  0.0,
             "allocation_tier": "",

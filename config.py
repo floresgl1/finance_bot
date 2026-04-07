@@ -71,6 +71,10 @@ INVALID_PRICE_SKIP = "INVALID_PRICE_SKIP"
 # preventing weight and headroom calculations (distinct from INVALID_HEADROOM).
 INVALID_PORTFOLIO_SKIP = "INVALID_PORTFOLIO_SKIP"
 
+# Logged when capital_allocator receives shares_owned of zero or negative, meaning
+# there is no existing position to add to — bypasses the position cap check.
+INVALID_SHARES_SKIP = "INVALID_SHARES_SKIP"
+
 # Maximum fraction of total portfolio value allowed in any single position.
 # Used by capital_allocator.py to compute headroom before adding to a position.
 MAX_POSITION_PCT = 0.08

@@ -31,6 +31,7 @@ Valid actual_action values:
     CSV_INVALID_SKIP— ticker skipped because its CSV is missing or the Close price could not be read
     INVALID_PRICE_SKIP— add-to-position blocked because price is zero or negative
     INVALID_PORTFOLIO_SKIP— add-to-position blocked because portfolio_value is zero or negative
+    INVALID_SHARES_SKIP — add-to-position blocked because shares_owned is zero or negative
 """
 
 import csv
