@@ -40,6 +40,7 @@ from config import (
     LARGE_POSITION_PCT,
     INSUFFICIENT_EQUITY,
     INVALID_PRICE_SKIP,
+    INVALID_PORTFOLIO_SKIP,
 )
 
 
@@ -102,7 +103,7 @@ def check_add_to_position(
     if portfolio_value <= 0:
         return {
             "shares_to_buy":   0,
-            "skip_reason":     "INVALID_HEADROOM",
+            "skip_reason":     INVALID_PORTFOLIO_SKIP,
             "headroom":        0.0,
             "current_weight":  0.0,
             "allocation_tier": "",

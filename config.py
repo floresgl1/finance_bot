@@ -67,6 +67,10 @@ CSV_INVALID_SKIP = "CSV_INVALID_SKIP"
 # sizing impossible.
 INVALID_PRICE_SKIP = "INVALID_PRICE_SKIP"
 
+# Logged when capital_allocator receives a portfolio_value of zero or negative,
+# preventing weight and headroom calculations (distinct from INVALID_HEADROOM).
+INVALID_PORTFOLIO_SKIP = "INVALID_PORTFOLIO_SKIP"
+
 # Maximum fraction of total portfolio value allowed in any single position.
 # Used by capital_allocator.py to compute headroom before adding to a position.
 MAX_POSITION_PCT = 0.08
