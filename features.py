@@ -152,6 +152,9 @@ def add_features(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     # Rising VIX = increasing market fear; 5-day window captures short-term spikes
     df["VIX_Change"] = vix_close.pct_change(periods=5)
 
+    # Replace inf values with NaN so dropna can catch them
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
     # Drop warm-up rows where any indicator is NaN (longest window: SMA_50 / Return_60d)
     df.dropna(inplace=True)
 
