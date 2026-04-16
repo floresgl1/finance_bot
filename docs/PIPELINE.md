@@ -228,7 +228,14 @@ filled later by outcome_tracker.py.
 
 Schema:
     date, ticker, model_signal, price, qty, confidence,
-    evaluation_date, actual_action, outcome_price, result
+    evaluation_date, actual_action, outcome_price, result,
+    shap_driver_1, shap_driver_2, shap_driver_3
+
+SHAP driver columns:
+    shap_driver_1/2/3 — top 3 feature names ranked by SHAP value (descending)
+                        for actual signal decisions (BUY, ADD_TO_POSITION,
+                        SELL, HOLD, BUY_ERROR, SELL_ERROR).
+                        Empty string for all skip/veto/stop-loss rows.
 
 Valid actual_action values:
     BUY             — new position placed successfully

@@ -9,7 +9,8 @@ filled later by outcome_tracker.py.
 
 Schema:
     date, ticker, model_signal, price, qty, confidence,
-    evaluation_date, actual_action, outcome_price, result
+    evaluation_date, actual_action, outcome_price, result,
+    shap_driver_1, shap_driver_2, shap_driver_3
 
 Valid actual_action values:
     BUY             — new position placed successfully
@@ -54,6 +55,9 @@ FIELDNAMES = [
     "actual_action",
     "outcome_price",
     "result",
+    "shap_driver_1",
+    "shap_driver_2",
+    "shap_driver_3",
 ]
 
 
@@ -73,6 +77,7 @@ def log_signal(
     qty: int | float,
     confidence: float,
     actual_action: str,
+    shap_values: dict | None = None,
     today: date | None = None,
 ) -> None:
     """
@@ -86,6 +91,9 @@ def log_signal(
     qty           : shares to be traded (0 for HOLD or skipped)
     confidence    : model confidence score (0–100)
     actual_action : execution outcome — see module docstring for valid values
+    shap_values   : dict of {feature_name: shap_value} from the model prediction;
+                    top 3 features by value (descending) are written to
+                    shap_driver_1/2/3. Pass None or omit for skip/error rows.
     today         : override today's date; defaults to date.today()
     """
     _ensure_file()
@@ -94,6 +102,14 @@ def log_signal(
         today = date.today()
 
     evaluation_date = today + timedelta(days=PREDICTION_DAYS)
+
+    if shap_values:
+        top_drivers = [item[0] for item in sorted(shap_values.items(), key=lambda x: x[1], reverse=True)[:3]]
+        shap_driver_1 = top_drivers[0] if len(top_drivers) > 0 else ""
+        shap_driver_2 = top_drivers[1] if len(top_drivers) > 1 else ""
+        shap_driver_3 = top_drivers[2] if len(top_drivers) > 2 else ""
+    else:
+        shap_driver_1 = shap_driver_2 = shap_driver_3 = ""
 
     row = {
         "date":            today.isoformat(),
@@ -106,6 +122,9 @@ def log_signal(
         "actual_action":   actual_action,
         "outcome_price":   "",
         "result":          "",
+        "shap_driver_1":   shap_driver_1,
+        "shap_driver_2":   shap_driver_2,
+        "shap_driver_3":   shap_driver_3,
     }
 
     try:

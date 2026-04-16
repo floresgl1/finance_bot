@@ -585,7 +585,7 @@ def run() -> None:
         qty    = owned[ticker]
         result = place_sell(api, ticker, qty)
         actual_action = "SELL" if result["status"] == "placed" else "SELL_ERROR"
-        log_signal(ticker, "SELL", price, qty, confidence, actual_action)
+        log_signal(ticker, "SELL", price, qty, confidence, actual_action, shap_values=r.get("shap_values"))
         outcomes.append({
             "ticker":   ticker,
             "action":   "SELL",
@@ -748,7 +748,7 @@ def run() -> None:
                 if result["status"] == "placed"
                 else "BUY_ERROR"
             )
-            log_signal(ticker, "BUY", price, qty, confidence, actual_action)
+            log_signal(ticker, "BUY", price, qty, confidence, actual_action, shap_values=r.get("shap_values"))
             outcomes.append({
                 "ticker":   ticker,
                 "action":   "BUY",
@@ -767,7 +767,7 @@ def run() -> None:
                 shap_by_signal["HOLD"].append(r["shap_values"])
 
             print(f"  Signal: HOLD {ticker}{note_str} — no action")
-            log_signal(ticker, "HOLD", price, 0, confidence, r.get("veto_reason") or "HOLD")
+            log_signal(ticker, "HOLD", price, 0, confidence, r.get("veto_reason") or "HOLD", shap_values=r.get("shap_values"))
             outcomes.append({
                 "ticker":   ticker,
                 "action":   "HOLD",
