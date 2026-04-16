@@ -75,6 +75,10 @@ INVALID_PORTFOLIO_SKIP = "INVALID_PORTFOLIO_SKIP"
 # there is no existing position to add to — bypasses the position cap check.
 INVALID_SHARES_SKIP = "INVALID_SHARES_SKIP"
 
+# Logged when a BUY is skipped because the rebalancer already trimmed that ticker
+# in the current session (model SELL → rebalancer skip → BUY skip chain).
+REBALANCER_TICKERS_SKIP = "REBALANCER_TICKERS_SKIP"
+
 # Maximum fraction of total portfolio value allowed in any single position.
 # Used by capital_allocator.py to compute headroom before adding to a position.
 MAX_POSITION_PCT = 0.08

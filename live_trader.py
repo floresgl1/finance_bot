@@ -49,7 +49,7 @@ load_dotenv()
 
 from capital_allocator import check_add_to_position
 from rebalancer import run_rebalancer
-from config import INSUFFICIENT_EQUITY, STALE_DAYS
+from config import INSUFFICIENT_EQUITY, STALE_DAYS, REBALANCER_TICKERS_SKIP
 
 # ---------------------------------------------------------------------------
 # Dependency check — install alpaca-trade-api if not present
@@ -600,12 +600,26 @@ def run() -> None:
         # Error → logged and recorded; loop continues to next signal
 
     # 6b. Refresh after SELLs, then run rebalancer, then refresh again
+
+    # Build skip list for the rebalancer: tickers where a model SELL was placed
+    sell_executed_tickers = [
+        o["ticker"] for o in outcomes
+        if o["status"] == "placed" and o["action"] == "SELL"
+    ]
+
     owned  = get_owned_tickers(api)
     equity = get_equity(api)
 
     print("\n" + "-" * 60)
     print("  Running rebalancer...")
-    rebalancer_outcomes = run_rebalancer(api)
+    rebalancer_outcomes = run_rebalancer(api, sell_executed_tickers)
+
+    # Tickers the rebalancer successfully trimmed — skip in the BUY pass to
+    # avoid immediately re-buying into a position that was just reduced
+    rebalancer_tickers = [
+        o["ticker"] for o in rebalancer_outcomes
+        if o["status"] == "placed"
+    ]
 
     owned  = get_owned_tickers(api)
     equity = get_equity(api)
@@ -642,6 +656,16 @@ def run() -> None:
                 outcomes.append({
                     "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
                     "status": "skipped", "order_id": "", "reason": "COOLDOWN_SKIP",
+                })
+                continue
+
+            # Skip if the rebalancer trimmed this ticker in the current session
+            if ticker in rebalancer_tickers:
+                print(f"  Signal: BUY {ticker}{note_str} — skipped (REBALANCER_TICKERS_SKIP)")
+                log_signal(ticker, "BUY", price, 0, confidence, REBALANCER_TICKERS_SKIP)
+                outcomes.append({
+                    "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
+                    "status": "skipped", "order_id": "", "reason": REBALANCER_TICKERS_SKIP,
                 })
                 continue
 

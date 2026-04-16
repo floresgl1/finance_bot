@@ -37,7 +37,7 @@ _TRIGGER_BUFFER = 0.001   # weight must exceed MAX_POSITION_PCT by this much
 _TARGET_OFFSET  = 0.005   # trim to (MAX_POSITION_PCT - _TARGET_OFFSET)
 
 
-def run_rebalancer(api) -> list[dict]:
+def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[dict]:
     """
     Inspect all open positions and sell shares in any that are overweight.
 
@@ -45,6 +45,10 @@ def run_rebalancer(api) -> list[dict]:
     ----------
     api : alpaca_trade_api.REST
         Live Alpaca client (paper or live).
+    sell_executed_tickers : list[str] | None
+        Tickers for which a model SELL order was placed successfully in the
+        current session.  These are skipped by the rebalancer to avoid a
+        double-sell on the same ticker in the same run.
 
     Returns
     -------
@@ -52,6 +56,7 @@ def run_rebalancer(api) -> list[dict]:
         One entry per rebalance action attempted, whether placed or failed.
         Each dict: ticker, action, qty, price, status, order_id, reason.
     """
+    _sell_skip = set(sell_executed_tickers) if sell_executed_tickers else set()
     outcomes: list[dict] = []
 
     # --- Fetch fresh portfolio state ----------------------------------------
@@ -79,6 +84,11 @@ def run_rebalancer(api) -> list[dict]:
 
     for position in positions:
         ticker = position.symbol
+
+        # --- Skip tickers already sold by model SELL this session -----------
+        if ticker in _sell_skip:
+            print(f"  [REBALANCER] {ticker} — already sold by model SELL, skipping")
+            continue
 
         # --- Parse position data (data inconsistency edge case) -------------
         try:

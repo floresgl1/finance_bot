@@ -32,6 +32,7 @@ Valid actual_action values:
     INVALID_PRICE_SKIP— add-to-position blocked because price is zero or negative
     INVALID_PORTFOLIO_SKIP— add-to-position blocked because portfolio_value is zero or negative
     INVALID_SHARES_SKIP — add-to-position blocked because shares_owned is zero or negative
+    REBALANCER_TICKERS_SKIP — BUY skipped because the rebalancer trimmed this ticker in the current session
 """
 
 import csv
