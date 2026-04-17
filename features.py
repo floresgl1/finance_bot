@@ -18,6 +18,11 @@ from config import DATA_DIR, WATCHLIST
 MARKET_DATA_DIR = os.path.join(DATA_DIR, "market")
 
 
+class StaleMarketDataError(Exception):
+    """Raised by features.py tripwire when CSV data is too old."""
+    pass
+
+
 # Sector ETF for each ticker in the watchlist.
 # Used to compute sector-relative momentum features.
 SECTOR_MAP = {
@@ -67,6 +72,17 @@ def _load_market_close(symbol: str) -> pd.Series:
         close.index = close.index.tz_convert(None)
     else:
         close.index = close.index.tz_localize(None)
+
+    # Layer 3 tripwire (see load_and_process for full rationale)
+    from datetime import date as _date
+    last_date = close.dropna().index[-1].date()
+    days_behind = (_date.today() - last_date).days
+    if days_behind > 5:
+        raise StaleMarketDataError(
+            f"Market symbol {symbol}: last row {last_date} is {days_behind} days "
+            f"behind today (>5 day tolerance). Layer 1 pipeline gate should have caught this."
+        )
+
     return close
 
 
@@ -275,6 +291,19 @@ def load_and_process(ticker: str) -> pd.DataFrame:
 
     # Merge earnings surprise features (gracefully no-ops if CSV is absent)
     df = _add_earnings_features(df, ticker=ticker)
+
+    # Layer 3 tripwire: defense-in-depth check
+    # Primary defense is Layer 1 pipeline gate in live_trader.check_market_data_freshness().
+    # This tripwire catches regressions where that gate is accidentally bypassed.
+    # 5-day tolerance accommodates long weekends (e.g. Tuesday after MLK Day).
+    from datetime import date as _date
+    last_row_date = df.index[-1].date()
+    days_behind = (_date.today() - last_row_date).days
+    if days_behind > 5:
+        raise StaleMarketDataError(
+            f"{ticker}: last row {last_row_date} is {days_behind} days behind today "
+            f"(>5 day tolerance). Layer 1 pipeline gate should have caught this."
+        )
 
     return df
 

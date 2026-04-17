@@ -42,14 +42,20 @@ import sys
 import subprocess
 import math
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 load_dotenv()
 
 from capital_allocator import check_add_to_position
 from rebalancer import run_rebalancer
-from config import INSUFFICIENT_EQUITY, STALE_DAYS, REBALANCER_TICKERS_SKIP
+from config import (
+    INSUFFICIENT_EQUITY,
+    STALE_DAYS,
+    REBALANCER_TICKERS_SKIP,
+    MAX_MARKET_DATA_AGE_HOURS,
+    STALE_MARKET_DATA,
+)
 
 # ---------------------------------------------------------------------------
 # Dependency check — install alpaca-trade-api if not present
@@ -86,6 +92,93 @@ def get_api() -> tradeapi.REST:
 def market_is_open(api: tradeapi.REST) -> bool:
     clock = api.get_clock()
     return clock.is_open
+
+
+# ---------------------------------------------------------------------------
+# Market data freshness gate (Layer 1)
+# ---------------------------------------------------------------------------
+def check_market_data_freshness(pipeline_start_time: datetime) -> tuple[bool, str, list[str]]:
+    """
+    Layer 1 freshness gate: verify all market data CSVs are recent.
+
+    Runs three checks per file:
+      1. Lower bound: mtime must be >= today 00:00:00 UTC (refresh ran today)
+      2. Upper bound: mtime must be < pipeline_start_time (refresh completed
+         before pipeline started; catches race condition where refresh writes
+         files mid-pipeline-execution)
+      3. Absolute age: now - mtime must be < MAX_MARKET_DATA_AGE_HOURS (24h)
+
+    Scans:
+      - data/*.csv (per-ticker OHLCV for WATCHLIST)
+      - data/market/*.csv (SPY, VIX, sector ETFs)
+
+    Returns:
+        (is_fresh, failure_reason, failed_files)
+        is_fresh=True  -> all files passed, safe to proceed
+        is_fresh=False -> at least one file failed; see failure_reason
+    """
+    import os
+    from datetime import timedelta
+    from config import DATA_DIR, WATCHLIST
+
+    now_utc = datetime.now(timezone.utc)
+    today_start_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    max_age = timedelta(hours=MAX_MARKET_DATA_AGE_HOURS)
+
+    # Build list of expected CSV paths
+    expected_files = []
+    for ticker in WATCHLIST:
+        expected_files.append(os.path.join(DATA_DIR, f"{ticker}.csv"))
+    market_dir = os.path.join(DATA_DIR, "market")
+    if os.path.isdir(market_dir):
+        for fname in os.listdir(market_dir):
+            if fname.endswith(".csv"):
+                expected_files.append(os.path.join(market_dir, fname))
+
+    failed_files = []
+    failure_reasons = []
+
+    for path in expected_files:
+        if not os.path.exists(path):
+            failed_files.append(os.path.basename(path))
+            failure_reasons.append(f"{os.path.basename(path)}: missing")
+            continue
+
+        mtime = datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc)
+
+        # Check 1: lower bound
+        if mtime < today_start_utc:
+            failed_files.append(os.path.basename(path))
+            failure_reasons.append(
+                f"{os.path.basename(path)}: mtime {mtime.isoformat()} before today 00:00 UTC"
+            )
+            continue
+
+        # Check 2: upper bound
+        if mtime >= pipeline_start_time:
+            failed_files.append(os.path.basename(path))
+            failure_reasons.append(
+                f"{os.path.basename(path)}: mtime {mtime.isoformat()} AFTER pipeline start "
+                f"{pipeline_start_time.isoformat()} (refresh raced with pipeline)"
+            )
+            continue
+
+        # Check 3: absolute age
+        if (now_utc - mtime) > max_age:
+            failed_files.append(os.path.basename(path))
+            failure_reasons.append(
+                f"{os.path.basename(path)}: mtime {mtime.isoformat()} older than "
+                f"{MAX_MARKET_DATA_AGE_HOURS}h"
+            )
+            continue
+
+    if failed_files:
+        reason = "; ".join(failure_reasons[:3])
+        if len(failure_reasons) > 3:
+            reason += f" (+ {len(failure_reasons) - 3} more)"
+        return (False, reason, failed_files)
+
+    return (True, "", [])
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +601,34 @@ def run() -> None:
         sys.exit(0)
 
     print("  Market is OPEN — proceeding with signal generation.\n")
+
+    # Layer 1: market data freshness gate
+    pipeline_start_time = datetime.now(timezone.utc)
+    print("  Checking market data freshness...")
+    is_fresh, reason, failed = check_market_data_freshness(pipeline_start_time)
+    if not is_fresh:
+        from signal_logger import log_signal
+        log_signal(
+            ticker="PIPELINE",
+            model_signal=STALE_MARKET_DATA,
+            price=0,
+            qty=0,
+            confidence=0,
+            actual_action=STALE_MARKET_DATA,
+        )
+        files_preview = ", ".join(failed[:5])
+        if len(failed) > 5:
+            files_preview += f" and {len(failed) - 5} more"
+        send_discord(
+            f"🚨 **PIPELINE HALTED — STALE MARKET DATA**\n"
+            f"Reason: {reason}\n"
+            f"Affected files: {files_preview}\n"
+            f"Pipeline start: {pipeline_start_time.isoformat()}\n"
+            f"No trades placed."
+        )
+        print(f"\n  [HALT] Market data freshness check failed: {reason}")
+        sys.exit(1)
+    print("  Market data freshness check passed.\n")
 
     # 3. Stop-loss check — runs before model signals so stopped positions
     #    are excluded from the signal execution pass

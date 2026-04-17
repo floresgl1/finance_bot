@@ -158,13 +158,78 @@ Returns:
     List of outcome dicts (same schema as live_trader outcomes):
         ticker, action, qty, price, status, order_id, reason
 
+## Market Data Freshness Checks
+
+Three independent layers guard against the pipeline executing on stale market data.
+The root cause that prompted this design: the GitHub Actions market data refresh
+drifted to 15:04 UTC while the PythonAnywhere scheduled task started at 15:00:26 UTC,
+causing the pipeline to read yesterday's CSVs and post identical predictions to Discord
+with no warning.
+
+### Layer 1 — Pipeline gate (`live_trader.check_market_data_freshness`)
+
+**Location:** `live_trader.py`, called immediately after the market-open check.
+
+Runs three mtime checks on every CSV in `data/*.csv` (per-ticker OHLCV) and
+`data/market/*.csv` (SPY, VIX, sector ETFs):
+
+1. **Lower bound:** `mtime >= today 00:00:00 UTC` — confirms the refresh ran today.
+2. **Upper bound:** `mtime < pipeline_start_time` — confirms the refresh *completed*
+   before the pipeline started; catches the race condition where the refresh is still
+   writing files while the pipeline has already begun reading them.
+3. **Absolute age:** `now - mtime < MAX_MARKET_DATA_AGE_HOURS (24h)` — final backstop
+   against unexpectedly old files.
+
+**On failure:**
+- Logs a `PIPELINE` row to `signal_log.csv` with `actual_action = STALE_MARKET_DATA`.
+- Sends a Discord alert with the failure reason, affected files, and pipeline start time.
+- Calls `sys.exit(1)` — no trades are placed.
+
+**New constants (defined in `config.py`):**
+- `MAX_MARKET_DATA_AGE_HOURS = 24`
+- `STALE_MARKET_DATA = "STALE_MARKET_DATA"`
+
+### Layer 2 — Per-ticker staleness check (`predictor.is_ticker_stale`)
+
+**Location:** `predictor.py`, called inside `get_signals()` for each ticker.
+
+Checks the mtime of each individual ticker CSV against `STALE_DAYS` (calendar days).
+Stale tickers are logged as `STALE_SKIP` and removed from the signal queue.
+This layer was already in place; it is not modified by this change.
+
+### Layer 3 — Tripwire inside `features.py`
+
+**Location:** `features.py`, at the end of `load_and_process()` and
+`_load_market_close()`.
+
+Inspects the *content* of the loaded DataFrame: if the last row's date is more than
+5 calendar days behind today, raises `StaleMarketDataError`.
+
+The 5-day tolerance accommodates long weekends (e.g. Tuesday after MLK Day, where the
+last trading day is Friday 4 days prior).
+
+This is a regression defense: if Layer 1 is accidentally bypassed (e.g. during a
+refactor), Layer 3 will still prevent a silent execution on stale data.
+
+**New exception class:** `StaleMarketDataError(Exception)` defined in `features.py`.
+
+### Cron schedule
+
+The `update_market_data.yml` workflow was shifted from `'0 13 * * 1-5'` (13:00 UTC)
+to `'0 12 * * 1-5'` (12:00 UTC) to widen the buffer between the market data refresh
+and the PythonAnywhere scheduled task (15:00 UTC). This gives the upload pipeline
+~3 hours of headroom instead of ~1 hour.
+
 ## Execution Order
 
 ```
 1. Connect to Alpaca (paper)
 2. Market-open check
+2a. Layer 1 freshness gate        (check_market_data_freshness — halts on failure)
 3. Stop-loss / take-profit check  (model-agnostic, fires before signals)
 4. Signal generation              (predictor.py → veto layers)
+    └─ Layer 2: is_ticker_stale() per ticker (STALE_SKIP)
+    └─ Layer 3: features.py tripwire raises StaleMarketDataError if content stale
 5. Stale-data filtering           (logged as STALE_SKIP, removed from queue)
 6a. SELL pass                     (confidence desc)
     └─ build sell_executed_tickers

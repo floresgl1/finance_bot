@@ -34,6 +34,7 @@ Valid actual_action values:
     INVALID_PORTFOLIO_SKIP— add-to-position blocked because portfolio_value is zero or negative
     INVALID_SHARES_SKIP — add-to-position blocked because shares_owned is zero or negative
     REBALANCER_TICKERS_SKIP — BUY skipped because the rebalancer trimmed this ticker in the current session
+    STALE_MARKET_DATA — pipeline halted: market data CSVs failed freshness check
 """
 
 import csv

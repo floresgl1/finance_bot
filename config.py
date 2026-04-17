@@ -79,6 +79,10 @@ INVALID_SHARES_SKIP = "INVALID_SHARES_SKIP"
 # in the current session (model SELL → rebalancer skip → BUY skip chain).
 REBALANCER_TICKERS_SKIP = "REBALANCER_TICKERS_SKIP"
 
+# Market data freshness check (Layer 1 in live_trader.py)
+MAX_MARKET_DATA_AGE_HOURS = 24
+STALE_MARKET_DATA = "STALE_MARKET_DATA"
+
 # Maximum fraction of total portfolio value allowed in any single position.
 # Used by capital_allocator.py to compute headroom before adding to a position.
 MAX_POSITION_PCT = 0.08
