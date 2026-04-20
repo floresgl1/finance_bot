@@ -54,6 +54,15 @@ CONFIDENCE_THRESHOLD = 0.35
 # same ticker is blocked (logged as COOLDOWN_SKIP).
 STOP_LOSS_COOLDOWN_DAYS = 7
 
+# Standing stop-loss (OTO) configuration
+STOP_LOSS_PCT              = 0.10   # 10% below entry; was hardcoded default in check_position_limits
+STOP_LOSS_CANCEL_TIMEOUT_S = 5      # max seconds to wait for Alpaca to process a cancel
+STOP_LOSS_POLL_INTERVAL_S  = 0.2    # seconds between status polls when awaiting cancel
+
+# New signal-logger action codes introduced by OTO stop-loss integration
+CANCEL_STOP_FAILED = "CANCEL_STOP_FAILED"
+STOP_BACKFILL      = "STOP_BACKFILL"
+
 # Logged when a BUY cannot be sized to even 1 share due to insufficient equity.
 INSUFFICIENT_EQUITY = "INSUFFICIENT_EQUITY"
 

@@ -30,7 +30,7 @@ Returns:
 
 import math
 
-from config import MAX_POSITION_PCT
+from config import MAX_POSITION_PCT, CANCEL_STOP_FAILED
 from signal_logger import log_signal
 
 _TRIGGER_BUFFER = 0.001   # weight must exceed MAX_POSITION_PCT by this much
@@ -126,6 +126,29 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
             f"trimming {qty} share(s) @ ${price:.2f}  "
             f"[raw={shares_to_sell}, cap={sell_cap}]"
         )
+
+        # --- Cancel any standing stop before issuing the trim SELL ----------
+        # Deferred imports avoid a circular import with live_trader.py, which
+        # imports run_rebalancer from this module at load time.
+        from live_trader import cancel_standing_stops, send_discord
+
+        cancel_ok, _ = cancel_standing_stops(api, ticker)
+        if not cancel_ok:
+            send_discord(
+                f"🚨 **[CANCEL_STOP_FAILED]** {ticker} — could not cancel standing stop; "
+                f"rebalancer trim skipped to avoid conflict. Manual review required."
+            )
+            log_signal(ticker, "REBALANCER", price, 0, 0.0, CANCEL_STOP_FAILED)
+            outcomes.append({
+                "ticker":   ticker,
+                "action":   "SELL",
+                "qty":      0,
+                "price":    price,
+                "status":   "skipped",
+                "order_id": "",
+                "reason":   "CANCEL_STOP_FAILED",
+            })
+            continue
 
         # --- Place trim order (order fail edge case) ------------------------
         try:

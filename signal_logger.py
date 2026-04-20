@@ -35,6 +35,8 @@ Valid actual_action values:
     INVALID_SHARES_SKIP — add-to-position blocked because shares_owned is zero or negative
     REBALANCER_TICKERS_SKIP — BUY skipped because the rebalancer trimmed this ticker in the current session
     STALE_MARKET_DATA — pipeline halted: market data CSVs failed freshness check
+    CANCEL_STOP_FAILED — SELL skipped because an existing standing stop-loss could not be cancelled
+    STOP_BACKFILL     — standing GTC stop-loss attached to a pre-existing position at startup
 """
 
 import csv

@@ -55,6 +55,11 @@ from config import (
     REBALANCER_TICKERS_SKIP,
     MAX_MARKET_DATA_AGE_HOURS,
     STALE_MARKET_DATA,
+    STOP_LOSS_PCT,
+    STOP_LOSS_CANCEL_TIMEOUT_S,
+    STOP_LOSS_POLL_INTERVAL_S,
+    CANCEL_STOP_FAILED,
+    STOP_BACKFILL,
 )
 
 # ---------------------------------------------------------------------------
@@ -341,19 +346,33 @@ def compute_buy_qty(equity: float, price: float, fraction: float = 0.20) -> int:
 
 
 def place_buy(api: tradeapi.REST, ticker: str, qty: int) -> dict:
-    """Submit a market buy order. Returns a result dict."""
+    """
+    Submit an OTO buy (market parent + GTC stop-loss child) and return a result dict.
+
+    The stop_price is computed from the most recent trade price at submission time, so
+    the logged entry estimate and the submitted stop are visible in the same line for
+    drift inspection.
+    """
     if qty <= 0:
         print(f"  [SKIP] {ticker} — insufficient equity for even 1 share")
         return {"status": "skipped", "reason": "insufficient equity"}
     try:
+        live_price_for_stop = float(api.get_latest_trade(ticker).price)
+        stop_price = round(live_price_for_stop * (1.0 - STOP_LOSS_PCT), 2)
+
         order = api.submit_order(
             symbol        = ticker,
             qty           = qty,
             side          = "buy",
             type          = "market",
-            time_in_force = "day",
+            time_in_force = "gtc",
+            order_class   = "oto",
+            stop_loss     = {"stop_price": stop_price},
         )
-        print(f"  [BUY]  {ticker} x{qty} — order id {order.id}")
+        print(
+            f"  [BUY]  {ticker} x{qty} — OTO entry est. ${live_price_for_stop:.2f} "
+            f"stop @ ${stop_price:.2f} — order id {order.id}"
+        )
         return {"status": "placed", "order_id": order.id}
     except Exception as exc:
         print(f"  [ERROR] {ticker} BUY failed: {exc}")
@@ -412,22 +431,94 @@ def get_cooldown_tickers() -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Stop-loss / take-profit
+# Standing stop-loss cancellation (required before any SELL)
+# ---------------------------------------------------------------------------
+def cancel_standing_stops(api, ticker: str) -> tuple[bool, list[str]]:
+    """
+    Cancel any open standing stop orders for `ticker`.
+
+    Queries Alpaca for open orders on `ticker` where side='sell' and type in
+    ('stop', 'stop_limit'). Cancels each one and polls until Alpaca reports a
+    terminal status.
+
+    Returns:
+        (success, cancelled_order_ids)
+        success=True  -> safe to proceed with a subsequent SELL on this ticker.
+                         May return (True, []) if no standing stop existed.
+        success=False -> at least one cancel errored or timed out. Caller MUST NOT
+                         attempt a subsequent SELL on this ticker this session.
+    """
+    try:
+        open_orders = api.list_orders(status="open", symbols=[ticker])
+    except Exception as exc:
+        print(f"  [CANCEL_STOPS] {ticker} — could not list open orders: {exc}")
+        return (False, [])
+
+    stops = [
+        o for o in open_orders
+        if o.side == "sell" and o.type in ("stop", "stop_limit")
+    ]
+
+    if not stops:
+        return (True, [])
+
+    if len(stops) > 1:
+        print(f"  [CANCEL_STOPS] {ticker} — WARNING: found {len(stops)} standing stops (expected 1)")
+
+    succeeded: list[str] = []
+    failed:    list[str] = []
+
+    for stop in stops:
+        try:
+            api.cancel_order(stop.id)
+        except Exception as exc:
+            print(f"  [CANCEL_STOPS] {ticker} — cancel request failed for order {stop.id}: {exc}")
+            failed.append(stop.id)
+            continue
+
+        deadline = time.time() + STOP_LOSS_CANCEL_TIMEOUT_S
+        terminal = False
+        while time.time() < deadline:
+            try:
+                current = api.get_order(stop.id)
+            except Exception as exc:
+                print(f"  [CANCEL_STOPS] {ticker} — status poll failed for order {stop.id}: {exc}")
+                break
+            if current.status in ("canceled", "filled"):
+                succeeded.append(stop.id)
+                terminal = True
+                break
+            time.sleep(STOP_LOSS_POLL_INTERVAL_S)
+
+        if not terminal:
+            print(f"  [CANCEL_STOPS] {ticker} — timeout awaiting cancel of order {stop.id}")
+            if stop.id not in failed:
+                failed.append(stop.id)
+
+    if failed:
+        return (False, succeeded)
+    return (True, succeeded)
+
+
+# ---------------------------------------------------------------------------
+# Take-profit (stop-loss is now enforced via standing OTO orders)
 # ---------------------------------------------------------------------------
 def check_position_limits(
     api: tradeapi.REST,
     owned: dict[str, float],
-    stop_pct: float = 10.0,
     take_pct: float = 15.0,
 ) -> tuple[list[str], dict[str, float]]:
     """
-    Check every open position for a stop-loss or take-profit trigger.
+    Check every open position for a take-profit trigger.
 
-    Loss formula: (entry_price - current_price) / entry_price * 100
     Gain formula: (current_price - entry_price) / entry_price * 100
 
-    Stop-loss  — loss_pct > stop_pct (default 10 %): sells and sends 🛑 [STOP LOSS] alert
-    Take-profit — gain_pct > take_pct (default 15 %): sells and sends 🎯 [TAKE PROFIT] alert
+    Take-profit — gain_pct > take_pct (default 15 %): sells and sends 🎯 [TAKE PROFIT] alert.
+
+    Stop-loss is now enforced via standing OTO orders placed at entry time; it is no
+    longer evaluated here. Before issuing a take-profit SELL the function cancels any
+    standing stop on the ticker; if the cancel fails the SELL is skipped so the two
+    orders cannot collide on the same position.
 
     Returns:
         exited — list of tickers that were sold
@@ -442,23 +533,19 @@ def check_position_limits(
         entry_price   = float(position.avg_entry_price)
         qty           = float(position.qty)
 
-        loss_pct = (entry_price - current_price) / entry_price * 100
         gain_pct = (current_price - entry_price) / entry_price * 100
 
-        if loss_pct > stop_pct:
-            print(f"  [STOP LOSS]   {ticker} — down {loss_pct:.1f}% — selling {qty} shares")
-            result = place_sell(api, ticker, qty)
-            send_discord(
-                f"🛑 **[STOP LOSS]** {ticker} sold — down {loss_pct:.1f}%  "
-                f"(entry ${entry_price:.2f} → current ${current_price:.2f})"
-            )
-            if result["status"] == "placed":
+        if gain_pct > take_pct:
+            cancel_ok, _ = cancel_standing_stops(api, ticker)
+            if not cancel_ok:
+                send_discord(
+                    f"🚨 **[CANCEL_STOP_FAILED]** {ticker} — could not cancel standing stop; "
+                    f"SELL skipped to avoid conflict. Manual review required."
+                )
                 from signal_logger import log_signal
-                log_signal(ticker, "SELL", current_price, qty, 0.0, "STOP_LOSS_SELL")
-                exited.append(ticker)
-                owned.pop(ticker, None)
+                log_signal(ticker, "SELL", current_price, 0, 0.0, CANCEL_STOP_FAILED)
+                continue
 
-        elif gain_pct > take_pct:
             print(f"  [TAKE PROFIT] {ticker} — up {gain_pct:.1f}% — selling {qty} shares")
             result = place_sell(api, ticker, qty)
             send_discord(
@@ -630,18 +717,59 @@ def run() -> None:
         sys.exit(1)
     print("  Market data freshness check passed.\n")
 
-    # 3. Stop-loss check — runs before model signals so stopped positions
-    #    are excluded from the signal execution pass
+    # 3. Backfill + take-profit pass — standing stop-loss is enforced via OTO orders
+    #    attached at entry time; take-profit is still evaluated in-script.
     owned  = get_owned_tickers(api)
     equity = get_equity(api)
-    print(f"  Checking stop losses on {len(owned)} open position(s)...")
+
+    # Backfill: attach a standing GTC stop-loss to any existing position that lacks one.
+    # Runs once per session at startup.
+    print("  Backfilling standing stops for existing positions...")
+    from signal_logger import log_signal as _log_backfill
+    positions = api.list_positions()
+    for position in positions:
+        ticker      = position.symbol
+        entry_price = float(position.avg_entry_price)
+        qty         = float(position.qty)
+
+        try:
+            existing = api.list_orders(status="open", symbols=[ticker])
+        except Exception as exc:
+            print(f"    [BACKFILL ERROR] {ticker} — could not list open orders: {exc}")
+            send_discord(f"⚠️ **Stop-loss backfill failed** for {ticker}: {exc}")
+            continue
+
+        has_stop = any(
+            o.side == "sell" and o.type in ("stop", "stop_limit")
+            for o in existing
+        )
+        if has_stop:
+            continue
+
+        stop_price = round(entry_price * (1.0 - STOP_LOSS_PCT), 2)
+        try:
+            api.submit_order(
+                symbol        = ticker,
+                qty           = qty,
+                side          = "sell",
+                type          = "stop",
+                stop_price    = stop_price,
+                time_in_force = "gtc",
+            )
+            print(f"    [BACKFILL] {ticker} standing stop @ ${stop_price:.2f} (entry ${entry_price:.2f})")
+            _log_backfill(ticker, "STOP_BACKFILL", entry_price, qty, 0.0, STOP_BACKFILL)
+        except Exception as exc:
+            print(f"    [BACKFILL ERROR] {ticker} — {exc}")
+            send_discord(f"⚠️ **Stop-loss backfill failed** for {ticker}: {exc}")
+
+    print(f"  Checking take-profits on {len(owned)} open position(s)...")
     exited, owned = check_position_limits(api, owned)
     if exited:
-        print(f"  Exited (stop-loss / take-profit): {exited}")
+        print(f"  Exited (take-profit): {exited}")
         owned  = get_owned_tickers(api)
         equity = get_equity(api)
     else:
-        print("  No stop losses triggered.")
+        print("  No take-profits triggered.")
 
     # 4. Get today's signals
     signals = get_signals()
@@ -703,7 +831,21 @@ def run() -> None:
             })
             continue
 
-        qty    = owned[ticker]
+        qty = owned[ticker]
+
+        cancel_ok, _ = cancel_standing_stops(api, ticker)
+        if not cancel_ok:
+            send_discord(
+                f"🚨 **[CANCEL_STOP_FAILED]** {ticker} — could not cancel standing stop; "
+                f"SELL skipped to avoid conflict. Manual review required."
+            )
+            log_signal(ticker, "SELL", price, 0, confidence, CANCEL_STOP_FAILED)
+            outcomes.append({
+                "ticker": ticker, "action": "SELL", "qty": 0, "price": price,
+                "status": "skipped", "order_id": "", "reason": "CANCEL_STOP_FAILED",
+            })
+            continue
+
         result = place_sell(api, ticker, qty)
         actual_action = "SELL" if result["status"] == "placed" else "SELL_ERROR"
         log_signal(ticker, "SELL", price, qty, confidence, actual_action, shap_values=r.get("shap_values"))

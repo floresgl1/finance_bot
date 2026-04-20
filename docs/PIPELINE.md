@@ -281,6 +281,36 @@ operations would cancel each other out within the same session.
 **Log:** `log_signal(ticker, "BUY", price, 0, confidence, REBALANCER_TICKERS_SKIP)`
 
 
+## Standing Stop-Loss Orders (OTO)
+
+Each model BUY is submitted as an Alpaca OTO order: a market parent plus a GTC
+stop-loss child priced at `STOP_LOSS_PCT` below the `api.get_latest_trade` price at
+submission time. Because the stop-loss leg lives on Alpaca's side as a standing order,
+positions remain protected between the once-daily bot runs — the in-script stop-loss
+poll that previously lived in `check_position_limits` has been removed. Time-in-force
+on the BUY parent is now `gtc` (was `day`) to satisfy Alpaca's standing-child
+requirement. Take-profit is still evaluated in-script inside `check_position_limits`.
+
+Helper `cancel_standing_stops(api, ticker) -> (success, cancelled_ids)` (`live_trader.py`)
+lists open sell orders of type `stop` / `stop_limit` for the ticker, cancels each one,
+and polls `api.get_order` every `STOP_LOSS_POLL_INTERVAL_S` seconds until the status is
+`canceled` or `filled`, up to `STOP_LOSS_CANCEL_TIMEOUT_S`. `filled` is treated as
+success (the stop fired during the cancel attempt, which is equivalent to the desired
+end state). Any timeout or exception marks the attempt failed. The helper must be
+called before every SELL path — model SELL, take-profit, and rebalancer trim — because
+a standing stop and a new market sell on the same position will collide. On a cancel
+failure the SELL is skipped and a `CANCEL_STOP_FAILED` Discord alert is posted.
+
+At startup, after the freshness gate passes, `run()` runs a one-shot backfill pass that
+attaches a standing GTC stop at `entry_price * (1 - STOP_LOSS_PCT)` to any existing
+position that does not already have one. This protects positions that were opened
+before the OTO change shipped.
+
+New action codes logged to `signal_log.csv`:
+
+- `STOP_BACKFILL` — standing stop attached to a pre-existing position at startup
+- `CANCEL_STOP_FAILED` — SELL skipped because an existing standing stop could not be cancelled
+
 ## LOGGING
 ### `signal_logger.py`
 signal_logger.py — Append-only logger for bot signal decisions.
