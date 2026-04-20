@@ -39,10 +39,11 @@ paper-api.alpaca.markets this script CANNOT place live trades.
 
 import os
 import sys
+import json
 import subprocess
 import math
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -60,6 +61,17 @@ from config import (
     STOP_LOSS_POLL_INTERVAL_S,
     CANCEL_STOP_FAILED,
     STOP_BACKFILL,
+    PORTFOLIO_SNAPSHOT_PATH,
+    HALT_FLAG_PATH,
+    MAX_SINGLE_DAY_LOSS_PCT,
+    MAX_ROLLING_LOSS_PCT,
+    ROLLING_LOSS_WINDOW_DAYS,
+    PORTFOLIO_SNAPSHOT_RETAIN_DAYS,
+    PORTFOLIO_HALT_SINGLE_DAY,
+    PORTFOLIO_HALT_ROLLING,
+    HALT_FLAG_PRESENT,
+    BUY_SKIPPED_HALT,
+    REBALANCER_SKIPPED_HALT,
 )
 
 # ---------------------------------------------------------------------------
@@ -71,6 +83,148 @@ except ImportError:
     print("[setup] alpaca-trade-api not found — installing...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "alpaca-trade-api"])
     import alpaca_trade_api as tradeapi
+
+
+# ---------------------------------------------------------------------------
+# Portfolio snapshot + halt-flag helpers (Finding #3)
+# ---------------------------------------------------------------------------
+def _read_portfolio_snapshot() -> dict[str, float]:
+    """
+    Read portfolio_snapshot.json from PORTFOLIO_SNAPSHOT_PATH.
+
+    Returns an empty dict if the file does not exist or is unreadable.
+    This is intentional: first-run bootstrap must succeed without a baseline.
+    """
+    if not os.path.exists(PORTFOLIO_SNAPSHOT_PATH):
+        return {}
+    try:
+        with open(PORTFOLIO_SNAPSHOT_PATH, "r") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): float(v) for k, v in data.items()}
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"  [SNAPSHOT] Warning: could not read {PORTFOLIO_SNAPSHOT_PATH}: {exc}")
+        return {}
+
+
+def _write_portfolio_snapshot(snapshot: dict[str, float]) -> None:
+    """
+    Write snapshot to PORTFOLIO_SNAPSHOT_PATH, pruned to the most recent
+    PORTFOLIO_SNAPSHOT_RETAIN_DAYS entries by date key (ISO format).
+
+    On write error: print a warning but do NOT raise. Snapshot loss is
+    degraded observability, not a reason to crash.
+    """
+    keys_sorted = sorted(snapshot.keys())
+    if len(keys_sorted) > PORTFOLIO_SNAPSHOT_RETAIN_DAYS:
+        keys_sorted = keys_sorted[-PORTFOLIO_SNAPSHOT_RETAIN_DAYS:]
+    pruned = {k: float(snapshot[k]) for k in keys_sorted}
+    try:
+        with open(PORTFOLIO_SNAPSHOT_PATH, "w") as fh:
+            json.dump(pruned, fh, indent=2, sort_keys=True)
+    except OSError as exc:
+        print(f"  [SNAPSHOT] Warning: could not write {PORTFOLIO_SNAPSHOT_PATH}: {exc}")
+
+
+def _previous_session_date(snapshot: dict[str, float], before_date: str) -> str | None:
+    """
+    Return the most recent date key in snapshot that is strictly less than
+    before_date (ISO 'YYYY-MM-DD'). Returns None if no such entry exists.
+    """
+    earlier = [d for d in snapshot.keys() if d < before_date]
+    if not earlier:
+        return None
+    return max(earlier)
+
+
+def _session_n_back(snapshot: dict[str, float], from_date: str, n: int) -> str | None:
+    """
+    Return the date key for the entry that is n trading sessions before
+    from_date. Sessions are the dates already present in snapshot, sorted
+    ascending. Returns None if snapshot has fewer than n entries before
+    from_date.
+
+    Note: this counts SNAPSHOT entries as sessions, not calendar days.
+    A weekend or market holiday that produced no entry is naturally skipped.
+    """
+    earlier = sorted(d for d in snapshot.keys() if d < from_date)
+    if len(earlier) < n:
+        return None
+    return earlier[-n]
+
+
+def check_portfolio_loss_limits(api) -> tuple[bool, str]:
+    """
+    Evaluate both tiers of the portfolio loss limit at session start.
+
+    Returns (should_halt, reason). When should_halt is True the caller must
+    skip BUYs and the rebalancer; SELLs and take-profit still run.
+    """
+    snapshot = _read_portfolio_snapshot()
+    current_equity = float(api.get_account().equity)
+    today_str = date.today().isoformat()
+
+    # Single-day check
+    prev_date = _previous_session_date(snapshot, today_str)
+    if prev_date is not None:
+        prev_equity = snapshot[prev_date]
+        if prev_equity > 0:
+            daily_loss = (prev_equity - current_equity) / prev_equity
+            if daily_loss > MAX_SINGLE_DAY_LOSS_PCT:
+                return (
+                    True,
+                    f"Single-day loss {daily_loss * 100:.2f}% exceeds "
+                    f"{MAX_SINGLE_DAY_LOSS_PCT * 100:.1f}% threshold "
+                    f"(prev {prev_date}: ${prev_equity:,.2f} -> today: ${current_equity:,.2f})"
+                )
+
+    # Rolling check
+    past_date = _session_n_back(snapshot, today_str, ROLLING_LOSS_WINDOW_DAYS)
+    if past_date is not None:
+        past_equity = snapshot[past_date]
+        if past_equity > 0:
+            rolling_loss = (past_equity - current_equity) / past_equity
+            if rolling_loss > MAX_ROLLING_LOSS_PCT:
+                return (
+                    True,
+                    f"Rolling {ROLLING_LOSS_WINDOW_DAYS}-session loss {rolling_loss * 100:.2f}% "
+                    f"exceeds {MAX_ROLLING_LOSS_PCT * 100:.1f}% threshold "
+                    f"(session {past_date}: ${past_equity:,.2f} -> today: ${current_equity:,.2f})"
+                )
+
+    return (False, "")
+
+
+def _write_halt_flag(reason: str) -> None:
+    """
+    Write HALT_FLAG_PATH with the halt reason and a UTC timestamp.
+    Overwrites existing flag file. On write error, print a warning —
+    a missing flag is a separate failure mode the operator will notice
+    via Discord alerts repeating the halt.
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    try:
+        with open(HALT_FLAG_PATH, "w") as fh:
+            fh.write(f"timestamp_utc: {ts}\n")
+            fh.write(f"reason: {reason}\n")
+    except OSError as exc:
+        print(f"  [HALT_FLAG] Warning: could not write {HALT_FLAG_PATH}: {exc}")
+
+
+def _check_halt_flag() -> tuple[bool, str]:
+    """
+    Returns (True, contents) if HALT_FLAG_PATH exists and is readable.
+    Returns (False, "") otherwise. Missing file is the normal case.
+    """
+    if not os.path.exists(HALT_FLAG_PATH):
+        return (False, "")
+    try:
+        with open(HALT_FLAG_PATH, "r") as fh:
+            return (True, fh.read())
+    except OSError as exc:
+        print(f"  [HALT_FLAG] Warning: could not read {HALT_FLAG_PATH}: {exc}")
+        return (True, "")
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +843,19 @@ def run() -> None:
 
     print("  Market is OPEN — proceeding with signal generation.\n")
 
+    # 2a. Halt flag: manual-reset circuit breaker from a prior portfolio halt.
+    halt_present, halt_contents = _check_halt_flag()
+    if halt_present:
+        from signal_logger import log_signal
+        log_signal("PIPELINE", "HALT_FLAG_PRESENT", 0, 0, 0, HALT_FLAG_PRESENT)
+        send_discord(
+            f"🛑 **Halt flag present — bot will not trade.**\n"
+            f"Contents:\n```{halt_contents}```\n"
+            f"Delete `{HALT_FLAG_PATH}` to resume."
+        )
+        print(f"\n  [HALT] Flag file present — exiting.\n{halt_contents}\n")
+        sys.exit(1)
+
     # Layer 1: market data freshness gate
     pipeline_start_time = datetime.now(timezone.utc)
     print("  Checking market data freshness...")
@@ -716,6 +883,28 @@ def run() -> None:
         print(f"\n  [HALT] Market data freshness check failed: {reason}")
         sys.exit(1)
     print("  Market data freshness check passed.\n")
+
+    # 3a. Portfolio-level loss limit — checked after freshness so we trust the
+    # equity read. On trip: write halt flag, alert, continue (SELLs still run).
+    halt_active = False
+    should_halt, halt_reason = check_portfolio_loss_limits(api)
+    if should_halt:
+        halt_active = True
+        _write_halt_flag(halt_reason)
+        action_code = (
+            PORTFOLIO_HALT_SINGLE_DAY
+            if "Single-day" in halt_reason
+            else PORTFOLIO_HALT_ROLLING
+        )
+        from signal_logger import log_signal as _log_halt
+        _log_halt("PIPELINE", action_code, 0, 0, 0, action_code)
+        send_discord(
+            f"🚨 **PORTFOLIO HALT TRIGGERED**\n{halt_reason}\n"
+            f"BUYs and rebalancer DISABLED for this session. SELLs and take-profit still active.\n"
+            f"Flag written to `{HALT_FLAG_PATH}` — delete manually to resume."
+        )
+        print(f"\n  [HALT] Portfolio loss limit tripped: {halt_reason}\n")
+        # continue — do NOT sys.exit. SELLs still run.
 
     # 3. Backfill + take-profit pass — standing stop-loss is enforced via OTO orders
     #    attached at entry time; take-profit is still evaluated in-script.
@@ -873,9 +1062,14 @@ def run() -> None:
     owned  = get_owned_tickers(api)
     equity = get_equity(api)
 
-    print("\n" + "-" * 60)
-    print("  Running rebalancer...")
-    rebalancer_outcomes = run_rebalancer(api, sell_executed_tickers)
+    if halt_active:
+        print("\n  [HALT] Rebalancer skipped — portfolio halt active.")
+        log_signal("PIPELINE", "REBALANCER", 0, 0, 0, REBALANCER_SKIPPED_HALT)
+        rebalancer_outcomes = []
+    else:
+        print("\n" + "-" * 60)
+        print("  Running rebalancer...")
+        rebalancer_outcomes = run_rebalancer(api, sell_executed_tickers)
 
     # Tickers the rebalancer successfully trimmed — skip in the BUY pass to
     # avoid immediately re-buying into a position that was just reduced
@@ -902,6 +1096,15 @@ def run() -> None:
         # BUY
         # ------------------------------------------------------------------
         if final_sig == "BUY":
+            if halt_active:
+                print(f"  Signal: BUY {ticker}{note_str} — skipped (halt active)")
+                log_signal(ticker, "BUY", price, 0, confidence, BUY_SKIPPED_HALT)
+                outcomes.append({
+                    "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
+                    "status": "skipped", "order_id": "", "reason": "BUY_SKIPPED_HALT",
+                })
+                continue
+
             # Skip tickers that were exited via stop-loss/take-profit this session
             if ticker in exited:
                 print(f"  Signal: BUY {ticker}{note_str} — skipped (EXIT_SKIP)")
@@ -1047,6 +1250,14 @@ def run() -> None:
     portfolio_value = get_equity(api)
     timestamp_end   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     send_discord(build_post_order_alert(outcomes, portfolio_value, timestamp_end, rebalancer_outcomes, shap_by_signal, stale_skips=[{"ticker": r["ticker"], "age_str": r["age_str"]} for r in stale_sigs]))
+
+    # 8. Persist today's equity to the portfolio snapshot (always, even on halt).
+    final_equity = get_equity(api)
+    today_str    = date.today().isoformat()
+    snapshot     = _read_portfolio_snapshot()
+    snapshot[today_str] = final_equity
+    _write_portfolio_snapshot(snapshot)
+    print(f"  Snapshot updated: {today_str} = ${final_equity:,.2f}")
 
     print(f"\n  Portfolio value: ${portfolio_value:,.2f}")
     print("  Done.\n")

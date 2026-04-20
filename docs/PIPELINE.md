@@ -225,18 +225,21 @@ and the PythonAnywhere scheduled task (15:00 UTC). This gives the upload pipelin
 ```
 1. Connect to Alpaca (paper)
 2. Market-open check
-2a. Layer 1 freshness gate        (check_market_data_freshness — halts on failure)
+2a. Halt flag check               (HALT_FLAG.txt present → log HALT_FLAG_PRESENT, Discord, sys.exit(1))
+2b. Layer 1 freshness gate        (check_market_data_freshness — halts on failure)
+2c. Portfolio loss limit          (check_portfolio_loss_limits — writes flag + sets halt_active on trip, no sys.exit)
 3. Stop-loss / take-profit check  (model-agnostic, fires before signals)
 4. Signal generation              (predictor.py → veto layers)
     └─ Layer 2: is_ticker_stale() per ticker (STALE_SKIP)
     └─ Layer 3: features.py tripwire raises StaleMarketDataError if content stale
 5. Stale-data filtering           (logged as STALE_SKIP, removed from queue)
-6a. SELL pass                     (confidence desc)
+6a. SELL pass                     (confidence desc — always runs, even when halt_active)
     └─ build sell_executed_tickers
-6b. Rebalancer                    (run_rebalancer, receives sell_executed_tickers)
+6b. Rebalancer                    (skipped when halt_active; REBALANCER_SKIPPED_HALT logged)
     └─ build rebalancer_tickers
-6c. BUY + HOLD pass               (confidence desc)
+6c. BUY + HOLD pass               (BUYs skipped when halt_active; BUY_SKIPPED_HALT logged)
 7. Discord summary
+8. Portfolio snapshot write       (today's final equity → portfolio_snapshot.json, always)
 ```
 
 ## Skip-List Coordination
@@ -279,6 +282,36 @@ operations would cancel each other out within the same session.
 **Skip code:** `REBALANCER_TICKERS_SKIP` (defined in `config.py`)
 
 **Log:** `log_signal(ticker, "BUY", price, 0, confidence, REBALANCER_TICKERS_SKIP)`
+
+
+## Portfolio-Level Daily Loss Limit (Circuit Breaker)
+
+A two-tier portfolio drawdown check runs at session start, after the Layer 1 freshness
+gate and before the stop-loss backfill. Tier 1 halts trading if today's equity is more
+than `MAX_SINGLE_DAY_LOSS_PCT` (5%) below the most recent previous session snapshot.
+Tier 2 halts trading if today's equity is more than `MAX_ROLLING_LOSS_PCT` (8%) below
+the session recorded `ROLLING_LOSS_WINDOW_DAYS` (5) snapshots ago. Sessions are counted
+as snapshot entries, not calendar days, so weekends and holidays are naturally skipped.
+
+Session-end equity is written to `portfolio_snapshot.json` on every run, including halted
+runs. The file is pruned to the most recent `PORTFOLIO_SNAPSHOT_RETAIN_DAYS` (30) entries.
+On first run, neither tier can trip because no baseline exists yet — this is intentional.
+
+A tripped check writes `HALT_FLAG.txt` (reason + UTC timestamp) and sets `halt_active=True`
+for the remainder of the session. `halt_active` disables the rebalancer and all BUYs;
+SELLs, take-profit, and standing Alpaca OTO stops continue to execute so existing risk
+can still be reduced. The halt flag persists across runs — every subsequent invocation
+sees the flag at startup, logs `HALT_FLAG_PRESENT`, sends a Discord alert, and exits
+without trading. There is no auto-resume; an operator must manually delete `HALT_FLAG.txt`
+to re-enable trading.
+
+New action codes logged to `signal_log.csv`:
+
+- `PORTFOLIO_HALT_SINGLE_DAY` — single-day drawdown tripped `MAX_SINGLE_DAY_LOSS_PCT`
+- `PORTFOLIO_HALT_ROLLING` — rolling-window drawdown tripped `MAX_ROLLING_LOSS_PCT`
+- `HALT_FLAG_PRESENT` — startup exit because `HALT_FLAG.txt` was present
+- `BUY_SKIPPED_HALT` — BUY skipped because a portfolio halt is active this session
+- `REBALANCER_SKIPPED_HALT` — rebalancer skipped because a portfolio halt is active
 
 
 ## Standing Stop-Loss Orders (OTO)

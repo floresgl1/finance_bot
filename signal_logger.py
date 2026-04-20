@@ -37,6 +37,11 @@ Valid actual_action values:
     STALE_MARKET_DATA — pipeline halted: market data CSVs failed freshness check
     CANCEL_STOP_FAILED — SELL skipped because an existing standing stop-loss could not be cancelled
     STOP_BACKFILL     — standing GTC stop-loss attached to a pre-existing position at startup
+    PORTFOLIO_HALT_SINGLE_DAY — pipeline halted: portfolio single-day drawdown exceeded MAX_SINGLE_DAY_LOSS_PCT
+    PORTFOLIO_HALT_ROLLING    — pipeline halted: portfolio rolling-window drawdown exceeded MAX_ROLLING_LOSS_PCT
+    HALT_FLAG_PRESENT         — pipeline exited at startup because the HALT_FLAG file was present
+    BUY_SKIPPED_HALT          — BUY skipped because a portfolio halt is active this session
+    REBALANCER_SKIPPED_HALT   — rebalancer pass skipped because a portfolio halt is active this session
 """
 
 import csv
