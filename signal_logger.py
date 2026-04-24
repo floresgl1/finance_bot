@@ -70,12 +70,40 @@ FIELDNAMES = [
 
 
 def _ensure_file() -> None:
-    """Create the CSV with a header row if it does not yet exist."""
+    """Create the CSV with a header row if it does not yet exist.
+
+    If the file exists, verify that its header matches FIELDNAMES.
+    Raises ValueError on schema drift to prevent silent data corruption.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(SIGNAL_LOG_PATH)), exist_ok=True)
+
     if not os.path.exists(SIGNAL_LOG_PATH):
         with open(SIGNAL_LOG_PATH, "w", newline="") as fh:
             csv.DictWriter(fh, fieldnames=FIELDNAMES).writeheader()
         print(f"  [LOG] Created signal log at {SIGNAL_LOG_PATH}")
+        return
+
+    # File exists — verify schema matches FIELDNAMES
+    with open(SIGNAL_LOG_PATH) as fh:
+        csv_reader = csv.reader(fh)
+        try:
+            header = next(csv_reader)
+        except StopIteration:
+            raise ValueError(
+                f"signal_log.csv exists but is empty (no header row).\n"
+                f"To fix: delete data/signal_log.csv on PA and let the bot "
+                f"recreate it, OR investigate why the file was truncated "
+                f"before proceeding."
+            )
+
+    if header != FIELDNAMES:
+        raise ValueError(
+            f"signal_log.csv header does not match FIELDNAMES.\n"
+            f"Expected ({len(FIELDNAMES)}): {FIELDNAMES}\n"
+            f"Found ({len(header)}): {header}\n"
+            f"To fix: update the header of data/signal_log.csv on PA to "
+            f"match FIELDNAMES."
+        )
 
 
 def log_signal(
