@@ -320,7 +320,15 @@ def run() -> None:
         return
 
     # Pending rows are those with a blank result
-    pending_mask = df["result"].isna() | (df["result"].str.strip() == "")
+    # Only ENTRY rows are evaluated for outcome — EXIT rows have no model
+    # signal or evaluation date and are excluded by design. Pre-migration
+    # rows (written before row_type existed) have NaN row_type; treat them
+    # as ENTRY for backward compatibility so they continue to evaluate.
+    row_type_series = df["row_type"].fillna("ENTRY") if "row_type" in df.columns else "ENTRY"
+    pending_mask = (
+        (df["result"].isna() | (df["result"].str.strip() == ""))
+        & (row_type_series == "ENTRY")
+    )
     pending_idx  = df[pending_mask].index
 
     if len(pending_idx) == 0:
