@@ -707,6 +707,16 @@ def check_position_limits(
                 f"(entry ${entry_price:.2f} → current ${current_price:.2f})"
             )
             if result["status"] == "placed":
+                from signal_logger import log_exit, find_open_entry_order_id
+                entry_order_id = find_open_entry_order_id(ticker) or "UNLINKED"
+                log_exit(
+                    ticker         = ticker,
+                    entry_order_id = entry_order_id,
+                    entry_price    = entry_price,
+                    exit_price     = current_price,
+                    exit_reason    = "TAKE_PROFIT",
+                    shares         = qty,
+                )
                 exited.append(ticker)
                 owned.pop(ticker, None)
 
@@ -1035,9 +1045,33 @@ def run() -> None:
             })
             continue
 
+        # Look up avg entry price from Alpaca BEFORE submitting the sell,
+        # because the position vanishes from api.get_position() after a full
+        # liquidation. If the lookup fails, default to price (the signal
+        # price) so realized_pnl degrades to zero rather than crashing.
+        try:
+            position_before_sell = api.get_position(ticker)
+            entry_price_for_exit = float(position_before_sell.avg_entry_price)
+        except Exception as exc:
+            print(f"  [WARN] Could not fetch avg_entry_price for {ticker}: {exc} — using signal price as fallback")
+            entry_price_for_exit = float(price)
+
         result = place_sell(api, ticker, qty)
         actual_action = "SELL" if result["status"] == "placed" else "SELL_ERROR"
         log_signal(ticker, "SELL", price, qty, confidence, actual_action, shap_values=r.get("shap_values"))
+
+        if result["status"] == "placed":
+            from signal_logger import log_exit, find_open_entry_order_id
+            entry_order_id = find_open_entry_order_id(ticker) or "UNLINKED"
+            log_exit(
+                ticker         = ticker,
+                entry_order_id = entry_order_id,
+                entry_price    = entry_price_for_exit,
+                exit_price     = price,
+                exit_reason    = "MODEL_SELL",
+                shares         = qty,
+            )
+
         outcomes.append({
             "ticker":   ticker,
             "action":   "SELL",
@@ -1214,7 +1248,11 @@ def run() -> None:
                 if result["status"] == "placed"
                 else "BUY_ERROR"
             )
-            log_signal(ticker, "BUY", price, qty, confidence, actual_action, shap_values=r.get("shap_values"))
+            log_signal(
+                ticker, "BUY", price, qty, confidence, actual_action,
+                shap_values=r.get("shap_values"),
+                entry_order_id=result.get("order_id") if result["status"] == "placed" else None,
+            )
             outcomes.append({
                 "ticker":   ticker,
                 "action":   "BUY",

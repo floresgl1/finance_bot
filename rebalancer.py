@@ -14,14 +14,13 @@ After each successful trim order the module re-fetches portfolio equity so
 subsequent weight checks are accurate.
 
 Edge cases:
-    Order fail       — REBALANCER_ORDER_FAIL logged; loop continues
+    Order fail       — no row logged; outcome dict records the error
     Data error       — logged and position skipped; loop continues
     Remaining shares — post-model-SELL positions are re-fetched fresh from
                        Alpaca, so zero-share positions are naturally excluded
 
 Log codes:
-    REBALANCER_SELL       — trim order placed successfully
-    REBALANCER_ORDER_FAIL — trim order submission failed
+    REBALANCE_TRIM   — trim order placed successfully (EXIT row with realized P&L)
 
 Returns:
     List of outcome dicts (same schema as live_trader outcomes):
@@ -160,7 +159,29 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
                 time_in_force = "day",
             )
             print(f"  [REBALANCER] {ticker} trim placed — order id {order.id}")
-            log_signal(ticker, "REBALANCER", price, qty, 0.0, "REBALANCER_SELL")
+
+            # Log as EXIT row — rebalancer is an operational trim, not a model signal
+            from signal_logger import log_exit, find_open_entry_order_id
+            entry_order_id = find_open_entry_order_id(ticker) or "UNLINKED"
+
+            # Avg entry price from the position (captured above in this function's
+            # position-parsing block). Re-fetch from Alpaca for safety in case the
+            # earlier parse used current_price only.
+            try:
+                position_fresh = api.get_position(ticker)
+                entry_price_for_exit = float(position_fresh.avg_entry_price)
+            except Exception as exc:
+                print(f"  [REBALANCER] Could not fetch avg_entry_price for {ticker}: {exc} — using current price as fallback")
+                entry_price_for_exit = float(price)
+
+            log_exit(
+                ticker         = ticker,
+                entry_order_id = entry_order_id,
+                entry_price    = entry_price_for_exit,
+                exit_price     = price,
+                exit_reason    = "REBALANCE_TRIM",
+                shares         = qty,
+            )
 
             # Refresh equity after each successful trim
             try:
@@ -180,7 +201,8 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
 
         except Exception as exc:
             print(f"  [REBALANCER] {ticker} trim order failed: {exc}")
-            log_signal(ticker, "REBALANCER", price, qty, 0.0, "REBALANCER_ORDER_FAIL")
+            # Note: no log_exit() on order failure — no position closed, nothing to log.
+            # The outcome dict below records the failure for Discord summary.
             outcomes.append({
                 "ticker":   ticker,
                 "action":   "SELL",
@@ -190,7 +212,7 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
                 "order_id": "",
                 "reason":   str(exc),
             })
-            # Log and continue to next position
+            # Continue to next position
 
     if not outcomes:
         print("  [REBALANCER] No positions required trimming.")
