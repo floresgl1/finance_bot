@@ -46,7 +46,7 @@ Valid actual_action values:
 
 import csv
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from config import DATA_DIR, PREDICTION_DAYS
 
@@ -66,6 +66,13 @@ FIELDNAMES = [
     "shap_driver_1",
     "shap_driver_2",
     "shap_driver_3",
+    "row_type",
+    "entry_order_id",
+    "exit_timestamp",
+    "exit_price",
+    "exit_reason",
+    "shares",
+    "realized_pnl",
 ]
 
 
@@ -115,22 +122,29 @@ def log_signal(
     actual_action: str,
     shap_values: dict | None = None,
     today: date | None = None,
+    entry_order_id: str | None = None,
 ) -> None:
     """
-    Append one row to signal_log.csv.
+    Append one ENTRY row to signal_log.csv.
 
     Parameters
     ----------
-    ticker        : stock symbol
-    model_signal  : final vetoed signal driving the decision (BUY / SELL / HOLD)
-    price         : current price at time of decision
-    qty           : shares to be traded (0 for HOLD or skipped)
-    confidence    : model confidence score (0–100)
-    actual_action : execution outcome — see module docstring for valid values
-    shap_values   : dict of {feature_name: shap_value} from the model prediction;
-                    top 3 features by value (descending) are written to
-                    shap_driver_1/2/3. Pass None or omit for skip/error rows.
-    today         : override today's date; defaults to date.today()
+    ticker         : stock symbol
+    model_signal   : final vetoed signal driving the decision (BUY / SELL / HOLD / etc)
+    price          : current price at time of decision
+    qty            : shares to be traded (0 for HOLD or skipped)
+    confidence     : model confidence score (0–100)
+    actual_action  : execution outcome — see module docstring for valid values
+    shap_values    : dict of {feature_name: shap_value} from the model prediction;
+                     top 3 features by value (descending) are written to
+                     shap_driver_1/2/3. Pass None or omit for skip/error rows.
+    today          : override today's date; defaults to date.today()
+    entry_order_id : Alpaca order UUID from a successful BUY placement, used to
+                     link ENTRY rows to future EXIT rows. Pass None for non-BUY
+                     rows, skips, errors, or HOLDs.
+
+    All exit-related columns (exit_timestamp, exit_price, exit_reason, shares,
+    realized_pnl) are left blank on ENTRY rows.
     """
     _ensure_file()
 
@@ -161,6 +175,13 @@ def log_signal(
         "shap_driver_1":   shap_driver_1,
         "shap_driver_2":   shap_driver_2,
         "shap_driver_3":   shap_driver_3,
+        "row_type":        "ENTRY",
+        "entry_order_id":  entry_order_id if entry_order_id else "",
+        "exit_timestamp":  "",
+        "exit_price":      "",
+        "exit_reason":     "",
+        "shares":          "",
+        "realized_pnl":    "",
     }
 
     try:
@@ -172,3 +193,123 @@ def log_signal(
         )
     except OSError as exc:
         print(f"  [LOG ERROR] {ticker} — could not write to signal log: {exc}")
+
+
+def log_exit(
+    ticker: str,
+    entry_order_id: str,
+    entry_price: float,
+    exit_price: float,
+    exit_reason: str,
+    shares: int | float,
+    today: date | None = None,
+) -> None:
+    """
+    Append one EXIT row to signal_log.csv.
+
+    Called when a position closes (take-profit, model-driven SELL, or
+    rebalancer trim). EXIT rows capture realized dollar P&L and link
+    back to the original ENTRY row via entry_order_id.
+
+    Parameters
+    ----------
+    ticker         : stock symbol
+    entry_order_id : Alpaca UUID from the original BUY order; links this
+                     EXIT row to its ENTRY row for analysis joins
+    entry_price    : avg entry price of the closed position
+    exit_price     : price at which the position closed
+    exit_reason    : "TAKE_PROFIT" | "MODEL_SELL" | "REBALANCE_TRIM"
+    shares         : number of shares closed
+    today          : override today's date; defaults to date.today()
+
+    ENTRY-only columns (model_signal, price, qty, confidence,
+    evaluation_date, actual_action, outcome_price, result,
+    shap_driver_1/2/3) are left blank on EXIT rows.
+    """
+    _ensure_file()
+
+    if today is None:
+        today = date.today()
+
+    exit_timestamp = datetime.now().isoformat(timespec="seconds")
+    realized_pnl = round((float(exit_price) - float(entry_price)) * float(shares), 4)
+
+    row = {
+        "date":            today.isoformat(),
+        "ticker":          ticker,
+        "model_signal":    "",
+        "price":           "",
+        "qty":             "",
+        "confidence":      "",
+        "evaluation_date": "",
+        "actual_action":   "",
+        "outcome_price":   "",
+        "result":          "",
+        "shap_driver_1":   "",
+        "shap_driver_2":   "",
+        "shap_driver_3":   "",
+        "row_type":        "EXIT",
+        "entry_order_id":  entry_order_id,
+        "exit_timestamp":  exit_timestamp,
+        "exit_price":      round(float(exit_price), 4),
+        "exit_reason":     exit_reason,
+        "shares":          int(shares),
+        "realized_pnl":    realized_pnl,
+    }
+
+    try:
+        with open(SIGNAL_LOG_PATH, "a", newline="") as fh:
+            csv.DictWriter(fh, fieldnames=FIELDNAMES).writerow(row)
+        print(
+            f"  [EXIT] {ticker:<6} {exit_reason:<14} "
+            f"entry ${float(entry_price):>8.2f} → exit ${float(exit_price):>8.2f}  "
+            f"P&L: ${realized_pnl:>+10.2f}"
+        )
+    except OSError as exc:
+        print(f"  [LOG ERROR] {ticker} — could not write exit to signal log: {exc}")
+
+
+def find_open_entry_order_id(ticker: str) -> str | None:
+    """
+    Return the entry_order_id of the most recent open ENTRY row for `ticker`.
+
+    An ENTRY row is "open" if no EXIT row exists with the same entry_order_id.
+
+    Used by exit-path code (take-profit, model-SELL, rebalancer) to link an
+    EXIT row back to the original BUY order.
+
+    Returns None if:
+      - signal_log.csv does not exist
+      - no ENTRY rows exist for ticker
+      - all ENTRY rows for ticker have matching EXIT rows
+      - ticker's most recent ENTRY row has a blank entry_order_id
+        (e.g., pre-migration rows or BUY errors where no order was placed)
+    """
+    if not os.path.exists(SIGNAL_LOG_PATH):
+        return None
+
+    try:
+        with open(SIGNAL_LOG_PATH, newline="") as fh:
+            reader = csv.DictReader(fh)
+            rows = list(reader)
+    except OSError:
+        return None
+
+    closed_order_ids = {
+        r["entry_order_id"] for r in rows
+        if r.get("row_type") == "EXIT" and r.get("entry_order_id")
+    }
+
+    entry_rows = [
+        r for r in rows
+        if r.get("row_type") == "ENTRY"
+        and r.get("ticker") == ticker
+        and r.get("entry_order_id")
+        and r["entry_order_id"] not in closed_order_ids
+    ]
+
+    if not entry_rows:
+        return None
+
+    entry_rows.sort(key=lambda r: r.get("date", ""), reverse=True)
+    return entry_rows[0]["entry_order_id"]
