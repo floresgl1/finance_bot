@@ -9,3 +9,5 @@ python-dotenv
 xgboost
 requests
 shap
+tavily-python
+tenacity
