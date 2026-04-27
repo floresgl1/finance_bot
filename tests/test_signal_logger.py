@@ -42,7 +42,7 @@ def test_missing_columns(monkeypatch, tmp_path):
 
     msg = str(excinfo.value)
     assert "does not match FIELDNAMES" in msg
-    assert "Expected (13)" in msg
+    assert f"Expected ({len(FIELDNAMES)})" in msg
     assert "Found (10)" in msg
     assert "To fix:" in msg
 
@@ -57,8 +57,8 @@ def test_extra_columns(monkeypatch, tmp_path):
         _ensure_file()
 
     msg = str(excinfo.value)
-    assert "Expected (13)" in msg
-    assert "Found (14)" in msg
+    assert f"Expected ({len(FIELDNAMES)})" in msg
+    assert f"Found ({len(FIELDNAMES) + 1})" in msg
     assert "bogus_extra_col" in msg
 
 

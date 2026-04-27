@@ -46,7 +46,7 @@ Valid actual_action values:
 
 import csv
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from config import DATA_DIR, PREDICTION_DAYS
 
@@ -138,7 +138,7 @@ def log_signal(
     shap_values    : dict of {feature_name: shap_value} from the model prediction;
                      top 3 features by value (descending) are written to
                      shap_driver_1/2/3. Pass None or omit for skip/error rows.
-    today          : override today's date; defaults to date.today()
+    today          : override today's date; defaults to datetime.now(timezone.utc).date()
     entry_order_id : Alpaca order UUID from a successful BUY placement, used to
                      link ENTRY rows to future EXIT rows. Pass None for non-BUY
                      rows, skips, errors, or HOLDs.
@@ -149,7 +149,7 @@ def log_signal(
     _ensure_file()
 
     if today is None:
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
 
     evaluation_date = today + timedelta(days=PREDICTION_DAYS)
 
@@ -220,7 +220,7 @@ def log_exit(
     exit_price     : price at which the position closed
     exit_reason    : "TAKE_PROFIT" | "MODEL_SELL" | "REBALANCE_TRIM"
     shares         : number of shares closed
-    today          : override today's date; defaults to date.today()
+    today          : override today's date; defaults to datetime.now(timezone.utc).date()
 
     ENTRY-only columns (model_signal, price, qty, confidence,
     evaluation_date, actual_action, outcome_price, result,
@@ -229,7 +229,7 @@ def log_exit(
     _ensure_file()
 
     if today is None:
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
 
     exit_timestamp = datetime.now().isoformat(timespec="seconds")
     realized_pnl = round((float(exit_price) - float(entry_price)) * float(shares), 4)
