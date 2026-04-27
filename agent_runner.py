@@ -99,12 +99,12 @@ def _parse_action(content: str) -> dict[str, Any]:
 def build_work_list(signal_log_df: pd.DataFrame, run_date: str) -> list[dict]:
     """Build the agent's work-list from the day's signal log.
 
-    Filters to row_type=ENTRY AND model_signal IN (BUY, SELL) AND timestamp matches run_date.
+    Filters to row_type=ENTRY AND model_signal IN (BUY, SELL) AND date equals run_date.
 
     Args:
         signal_log_df: DataFrame loaded from signal_log.csv.
-        run_date: ISO date string (e.g. "2026-04-26"). Filtering matches the
-            date portion of the timestamp column.
+        run_date: ISO date string (e.g. "2026-04-26"). The `date` column is a
+            YYYY-MM-DD string and is compared directly.
 
     Returns:
         List of dicts. Each dict has exactly the keys
@@ -114,13 +114,10 @@ def build_work_list(signal_log_df: pd.DataFrame, run_date: str) -> list[dict]:
     """
     df = signal_log_df
 
-    timestamps = pd.to_datetime(df["timestamp"], errors="coerce")
-    date_strings = timestamps.dt.date.astype(str)
-
     mask = (
         (df["row_type"] == "ENTRY")
-        & (df["signal"].isin(["BUY", "SELL"]))
-        & (date_strings == run_date)
+        & (df["model_signal"].isin(["BUY", "SELL"]))
+        & (df["date"] == run_date)
     )
     filtered = df[mask]
 
@@ -128,7 +125,7 @@ def build_work_list(signal_log_df: pd.DataFrame, run_date: str) -> list[dict]:
     for _, row in filtered.iterrows():
         work_list.append({
             "ticker": row["ticker"],
-            "model_signal": row["signal"],
+            "model_signal": row["model_signal"],
             "confidence": float(row["confidence"]),
             "shap_values": [
                 row["shap_driver_1"],

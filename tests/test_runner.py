@@ -50,17 +50,17 @@ def _decide_action(decision: str = "CONFIRM", reasoning: str = "Evidence for: x.
 
 def test_build_work_list_filters_to_buy_sell_entry_rows():
     df = pd.DataFrame({
-        "timestamp": [
-            "2026-04-26T10:00:00",
-            "2026-04-26T10:01:00",
-            "2026-04-26T10:02:00",
-            "2026-04-26T10:03:00",
-            "2026-04-26T10:04:00",
-            "2026-04-25T10:00:00",
+        "date": [
+            "2026-04-26",
+            "2026-04-26",
+            "2026-04-26",
+            "2026-04-26",
+            "2026-04-26",
+            "2026-04-25",
         ],
         "ticker": ["AAPL", "TSLA", "NFLX", "JPM", "GOOG", "MSFT"],
         "row_type": ["ENTRY", "ENTRY", "ENTRY", "EXIT", "ENTRY", "ENTRY"],
-        "signal": ["BUY", "SELL", "HOLD", "BUY", "BUY", "BUY"],
+        "model_signal": ["BUY", "SELL", "HOLD", "BUY", "BUY", "BUY"],
         "confidence": [0.71, 0.65, 0.40, 0.50, 0.55, 0.60],
         "shap_driver_1": ["a1", "b1", "c1", "d1", "e1", "f1"],
         "shap_driver_2": ["a2", "b2", "c2", "d2", "e2", "f2"],
@@ -187,10 +187,10 @@ def test_process_ticker_groq_api_failure_returns_api_failure_category():
 def test_run_agent_returns_full_artifact_with_one_decision(tmp_path):
     csv_path = tmp_path / "signal_log.csv"
     df = pd.DataFrame({
-        "timestamp": ["2026-04-26T10:00:00"],
+        "date": ["2026-04-26"],
         "ticker": ["AAPL"],
         "row_type": ["ENTRY"],
-        "signal": ["BUY"],
+        "model_signal": ["BUY"],
         "confidence": [0.71],
         "shap_driver_1": ["RSI_14"],
         "shap_driver_2": ["MACD"],
