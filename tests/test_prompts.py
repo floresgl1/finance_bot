@@ -3,6 +3,7 @@ import string
 from agent_prompts import (
     ALLOWED_VERDICTS,
     FEW_SHOT_EXAMPLES,
+    RETRY_MESSAGE_TEMPLATE,
     SYSTEM_PROMPT,
     USER_TEMPLATE,
 )
@@ -33,3 +34,12 @@ def test_system_prompt_contains_verdict_instruction():
 def test_few_shots_use_only_allowed_verdicts():
     for example in FEW_SHOT_EXAMPLES:
         assert example["agent_decision"] in ALLOWED_VERDICTS
+
+
+def test_retry_message_template_has_parse_error_placeholder():
+    placeholders = {
+        field_name
+        for _, field_name, _, _ in string.Formatter().parse(RETRY_MESSAGE_TEMPLATE)
+        if field_name is not None
+    }
+    assert placeholders == {"parse_error"}

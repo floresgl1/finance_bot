@@ -11,3 +11,4 @@ requests
 shap
 tavily-python
 tenacity
+groq

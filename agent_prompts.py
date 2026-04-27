@@ -74,6 +74,18 @@ Top SHAP drivers: {shap_values}
 Use the search_news tool to gather recent news, then return a JSON object matching the per-decision schema."""
 
 
+RETRY_MESSAGE_TEMPLATE = """Your last response could not be parsed.
+Error: {parse_error}
+
+Please respond with a single JSON object matching one of these shapes:
+
+{{"action": "search_news", "action_input": {{"query": "<your search query>"}}}}
+
+{{"action": "decide", "action_input": {{"agent_decision": "<CONFIRM|VETO|ABSTAIN>", "agent_reasoning": "<your reasoning>"}}}}
+
+Respond with the JSON object only, no surrounding prose."""
+
+
 _EXAMPLES_TEXT = "\n\n".join(
     f"Example {i + 1}:\n{json.dumps(example, indent=2)}"
     for i, example in enumerate(FEW_SHOT_EXAMPLES)
@@ -94,11 +106,37 @@ Convergent evidence is required for CONFIRM and VETO. ABSTAIN is the default whe
 
 BUY and SELL signals are evaluated symmetrically — flip the polarity of "supports" vs. "contradicts" based on the signal direction. A SELL is CONFIRMED by bearish news and VETOED by bullish news.
 
-OUTPUT FORMAT
+OUTPUT PROTOCOL
 
-Return a single JSON object matching the per-decision schema. Required keys: ticker, model_signal, confidence, shap_values, news_query, sources_checked, agent_decision, agent_reasoning.
+You operate in a multi-turn ReAct loop. On each turn you must respond with EXACTLY ONE JSON object — no surrounding prose, no markdown code fences, no commentary before or after. Anything else will fail to parse.
 
-The agent_decision field MUST be one of "CONFIRM", "VETO", or "ABSTAIN" (case-sensitive). No other strings are permitted.
+The JSON you emit must take one of two shapes:
+
+1. search_news — fetch recent news for the ticker. The runner executes the search and returns the results in the next user message. Shape:
+
+   {{"action": "search_news", "action_input": {{"query": "<natural-language query>"}}}}
+
+2. decide — terminate the loop with your final verdict. Shape:
+
+   {{"action": "decide", "action_input": {{"agent_decision": "<CONFIRM|VETO|ABSTAIN>", "agent_reasoning": "<your reasoning>"}}}}
+
+   agent_decision must be exactly one of "CONFIRM", "VETO", or "ABSTAIN" (case-sensitive). agent_reasoning must follow the reasoning template below.
+
+When you call search_news, the runner replies with a user message containing the observation — a list of news items, each with url, title, and snippet:
+
+   {{"observation": [{{"url": "...", "title": "...", "snippet": "..."}}, ...]}}
+
+Read the observation, then either call search_news again with a refined query or emit a decide action with your final verdict. Output rule: respond with a single JSON object only.
+
+PROTOCOL EXAMPLES
+
+After receiving the initial task, your first turn emits a search_news action. For example:
+
+   {{"action": "search_news", "action_input": {{"query": "Apple iPhone services revenue guidance"}}}}
+
+After receiving an observation containing news items, your next turn emits a decide action. For example:
+
+   {{"action": "decide", "action_input": {{"agent_decision": "CONFIRM", "agent_reasoning": "Evidence for: Q1 iPhone sales beat by 8%, Services revenue at record. Evidence against: None found. Verdict: Convergent bullish news on core revenue drivers supports the BUY signal."}}}}
 
 REASONING TEMPLATE
 
@@ -108,7 +146,9 @@ The agent_reasoning field MUST follow this exact structural template:
 
 Where <X> and <Y> are short summaries citing the news items considered, and <Z> is a one-sentence justification of the verdict.
 
-FEW-SHOT EXAMPLES
+DECISION-QUALITY EXAMPLES
+
+The following examples illustrate the kind of analysis the agent should produce — each shows the full decision record assembled by the runner from the agent's emitted decide action plus the search_news results that fed it. The agent_decision and agent_reasoning fields are what you emit through the decide action; the runner records the surrounding context.
 
 {_EXAMPLES_TEXT}
 """
