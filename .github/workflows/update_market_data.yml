@@ -62,3 +62,13 @@ jobs:
               print(f"[ERROR] HTTP {r.status_code}: {r.text.strip()}")
               sys.exit(1)
           EOF
+
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d "{\"content\": \"Workflow Failure Detected\nRepository: ${{ github.repository }}\nBranch: ${{ github.ref_name }}\nFailed Jobs: 1\nFailed Jobs List: ${{ github.job }}\nWorkflow: ${{ github.workflow }}\nRun: ${{ github.run_number }} - $(date -u)\"}" \
+               "$DISCORD_WEBHOOK_URL"
