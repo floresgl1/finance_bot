@@ -118,6 +118,15 @@ def send_discord_summary(envelope: dict) -> None:
             f"ABSTAIN {c['ABSTAIN']}, ERROR {c['ERROR']}"
         )
 
+    run_status = envelope.get("run_status", "UNKNOWN")
+    halt_details = envelope.get("halt_details", []) or []
+    footer_lines = ["---", f"Run status: {run_status}"]
+    if halt_details:
+        footer_lines.append(f"Halt rows detected (date {run_date}):")
+        for entry in halt_details:
+            footer_lines.append(f"  • {entry['actual_action']}")
+    content = content + "\n" + "\n".join(footer_lines)
+
     try:
         requests.post(webhook, json={"content": content}, timeout=10)
     except Exception as exc:

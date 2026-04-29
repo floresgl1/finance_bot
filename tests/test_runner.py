@@ -11,11 +11,37 @@ os.environ.setdefault("TAVILY_API_KEY", "test")
 import agent_runner
 from agent_runner import (
     MAX_AGENT_STEPS,
+    _determine_run_status,
     build_work_list,
     process_ticker,
     run_agent,
 )
 from agent_tools import SearchNewsError
+
+
+def _signal_log_df(rows: list[dict]) -> pd.DataFrame:
+    """Build a signal_log DataFrame with all expected columns from a row list.
+
+    Each input dict supplies the meaningful columns; missing columns are
+    filled with safe defaults so build_work_list and _determine_run_status
+    can both operate.
+    """
+    defaults = {
+        "date": "",
+        "ticker": "",
+        "row_type": "",
+        "model_signal": "",
+        "confidence": 0.0,
+        "actual_action": "",
+        "shap_driver_1": "",
+        "shap_driver_2": "",
+        "shap_driver_3": "",
+    }
+    filled = []
+    for row in rows:
+        merged = {**defaults, **row}
+        filled.append(merged)
+    return pd.DataFrame(filled)
 
 
 def _make_completion(content: str):
@@ -195,6 +221,7 @@ def test_run_agent_returns_full_artifact_with_one_decision(tmp_path):
         "shap_driver_1": ["RSI_14"],
         "shap_driver_2": ["MACD"],
         "shap_driver_3": ["sent_rolling_7d"],
+        "actual_action": [""],
     })
     df.to_csv(str(csv_path), index=False)
 
@@ -221,3 +248,125 @@ def test_run_agent_returns_full_artifact_with_one_decision(tmp_path):
     assert result["run_duration_seconds"] >= 0
     assert len(result["decisions"]) == 1
     assert result["run_error"] is None
+
+
+# --- run_status / halt_details ---------------------------------------------
+
+
+def test_determine_run_status_normal():
+    df = _signal_log_df([
+        {
+            "date": "2026-04-28",
+            "ticker": "AAPL",
+            "row_type": "ENTRY",
+            "model_signal": "BUY",
+            "confidence": 0.7,
+        },
+    ])
+    work_list = [_work_item("AAPL", "BUY")]
+
+    status, halt_details = _determine_run_status(df, work_list, "2026-04-28")
+
+    assert status == "NORMAL"
+    assert halt_details == []
+
+
+def test_determine_run_status_no_signals():
+    df = _signal_log_df([
+        {
+            "date": "2026-04-28",
+            "ticker": "AAPL",
+            "row_type": "ENTRY",
+            "model_signal": "HOLD",
+            "confidence": 0.4,
+        },
+    ])
+
+    status, halt_details = _determine_run_status(df, [], "2026-04-28")
+
+    assert status == "NO_SIGNALS"
+    assert halt_details == []
+
+
+def test_determine_run_status_pipeline_halted():
+    df = _signal_log_df([
+        {"date": "2026-04-28", "ticker": "PIPELINE", "actual_action": "STALE_MARKET_DATA"},
+    ])
+
+    status, halt_details = _determine_run_status(df, [], "2026-04-28")
+
+    assert status == "PIPELINE_HALTED"
+    assert halt_details == [
+        {"actual_action": "STALE_MARKET_DATA", "date": "2026-04-28"},
+    ]
+
+
+def test_determine_run_status_loss_limit_halted_single_cause():
+    df = _signal_log_df([
+        {"date": "2026-04-28", "ticker": "PIPELINE", "actual_action": "PORTFOLIO_HALT_SINGLE_DAY"},
+    ])
+
+    status, halt_details = _determine_run_status(df, [], "2026-04-28")
+
+    assert status == "LOSS_LIMIT_HALTED"
+    assert halt_details == [
+        {"actual_action": "PORTFOLIO_HALT_SINGLE_DAY", "date": "2026-04-28"},
+    ]
+
+
+def test_determine_run_status_loss_limit_priority_over_pipeline_halted():
+    df = _signal_log_df([
+        {"date": "2026-04-28", "ticker": "PIPELINE", "actual_action": "STALE_MARKET_DATA"},
+        {"date": "2026-04-28", "ticker": "PIPELINE", "actual_action": "PORTFOLIO_HALT_SINGLE_DAY"},
+    ])
+
+    status, halt_details = _determine_run_status(df, [], "2026-04-28")
+
+    assert status == "LOSS_LIMIT_HALTED"
+    assert halt_details == [
+        {"actual_action": "STALE_MARKET_DATA", "date": "2026-04-28"},
+        {"actual_action": "PORTFOLIO_HALT_SINGLE_DAY", "date": "2026-04-28"},
+    ]
+
+
+def test_run_agent_agent_error_path_populates_status_fields(tmp_path):
+    bad_path = tmp_path / "does_not_exist.csv"
+
+    fake_git = MagicMock()
+    fake_git.stdout = "abc1234\n"
+    fake_git.returncode = 0
+
+    with patch("agent_runner.subprocess.run", return_value=fake_git):
+        result = run_agent(signal_log_path=str(bad_path), run_date="2026-04-28")
+
+    assert result["run_status"] == "AGENT_ERROR"
+    assert result["halt_details"] == []
+    assert result["decisions"] == []
+    assert result["run_error"] is not None
+    assert "workspace setup failed" in result["run_error"]
+
+
+def test_determine_run_status_multiple_loss_limit_rows_preserve_order():
+    df = _signal_log_df([
+        {"date": "2026-04-28", "ticker": "PIPELINE", "actual_action": "PORTFOLIO_HALT_SINGLE_DAY"},
+        {"date": "2026-04-28", "ticker": "PIPELINE", "actual_action": "REBALANCER_SKIPPED_HALT"},
+    ])
+
+    status, halt_details = _determine_run_status(df, [], "2026-04-28")
+
+    assert status == "LOSS_LIMIT_HALTED"
+    assert halt_details == [
+        {"actual_action": "PORTFOLIO_HALT_SINGLE_DAY", "date": "2026-04-28"},
+        {"actual_action": "REBALANCER_SKIPPED_HALT", "date": "2026-04-28"},
+    ]
+
+
+def test_determine_run_status_filters_pipeline_rows_by_date():
+    df = _signal_log_df([
+        {"date": "2026-04-27", "ticker": "PIPELINE", "actual_action": "STALE_MARKET_DATA"},
+    ])
+
+    status, halt_details = _determine_run_status(df, [], "2026-04-28")
+
+    assert status == "NO_SIGNALS"
+    assert halt_details == []

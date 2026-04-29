@@ -29,6 +29,16 @@ ERROR_CATEGORIES = frozenset({
     "UNEXPECTED",
 })
 
+LOSS_LIMIT_HALT_CODES = frozenset({
+    "HALT_FLAG_PRESENT",
+    "PORTFOLIO_HALT_SINGLE_DAY",
+    "PORTFOLIO_HALT_ROLLING",
+    "REBALANCER_SKIPPED_HALT",
+})
+PIPELINE_HALT_CODES = frozenset({
+    "STALE_MARKET_DATA",
+})
+
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
@@ -94,6 +104,35 @@ def _parse_action(content: str) -> dict[str, Any]:
             raise ValueError("decide action_input.agent_reasoning must be a string")
 
     return obj
+
+
+def _determine_run_status(
+    signal_log_df: pd.DataFrame,
+    work_list: list[dict],
+    run_date: str,
+) -> tuple[str, list[dict]]:
+    pipeline_rows = signal_log_df[
+        (signal_log_df["ticker"] == "PIPELINE")
+        & (signal_log_df["date"] == run_date)
+    ]
+
+    halt_details = [
+        {"actual_action": row["actual_action"], "date": run_date}
+        for _, row in pipeline_rows.iterrows()
+    ]
+
+    actions_today = set(pipeline_rows["actual_action"])
+
+    if actions_today & LOSS_LIMIT_HALT_CODES:
+        status = "LOSS_LIMIT_HALTED"
+    elif actions_today & PIPELINE_HALT_CODES:
+        status = "PIPELINE_HALTED"
+    elif len(work_list) == 0:
+        status = "NO_SIGNALS"
+    else:
+        status = "NORMAL"
+
+    return status, halt_details
 
 
 def build_work_list(signal_log_df: pd.DataFrame, run_date: str) -> list[dict]:
@@ -294,9 +333,13 @@ def run_agent(signal_log_path: str, run_date: str) -> dict:
             "llm_model": GROQ_MODEL,
             "run_started_at": run_started_at,
             "run_duration_seconds": float(run_duration),
+            "run_status": "AGENT_ERROR",
+            "halt_details": [],
             "decisions": [],
             "run_error": f"workspace setup failed: {type(e).__name__}: {e}",
         }
+
+    run_status, halt_details = _determine_run_status(df, work_list, run_date)
 
     decisions = [process_ticker(item) for item in work_list]
 
@@ -307,6 +350,8 @@ def run_agent(signal_log_path: str, run_date: str) -> dict:
         "llm_model": GROQ_MODEL,
         "run_started_at": run_started_at,
         "run_duration_seconds": float(run_duration),
+        "run_status": run_status,
+        "halt_details": halt_details,
         "decisions": decisions,
         "run_error": None,
     }
