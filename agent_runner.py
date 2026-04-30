@@ -15,6 +15,7 @@ from agent_prompts import (
     USER_TEMPLATE,
 )
 from agent_tools import SearchNewsError, search_news
+from config import AGENT_ELIGIBLE_ACTIONS
 
 
 MAX_AGENT_STEPS = 5
@@ -138,7 +139,11 @@ def _determine_run_status(
 def build_work_list(signal_log_df: pd.DataFrame, run_date: str) -> list[dict]:
     """Build the agent's work-list from the day's signal log.
 
-    Filters to row_type=ENTRY AND model_signal IN (BUY, SELL) AND date equals run_date.
+    Filters to row_type=ENTRY AND model_signal IN (BUY, SELL) AND date equals
+    run_date AND actual_action IN AGENT_ELIGIBLE_ACTIONS. The actual_action
+    filter excludes rows where the trade was skipped (NOT_OWNED,
+    INSUFFICIENT_EQUITY, REBALANCER_TICKERS_SKIP, etc.) — those rows carry no
+    SHAP values, so the agent would run on generic fallback queries.
 
     Args:
         signal_log_df: DataFrame loaded from signal_log.csv.
@@ -157,6 +162,7 @@ def build_work_list(signal_log_df: pd.DataFrame, run_date: str) -> list[dict]:
         (df["row_type"] == "ENTRY")
         & (df["model_signal"].isin(["BUY", "SELL"]))
         & (df["date"] == run_date)
+        & (df["actual_action"].isin(AGENT_ELIGIBLE_ACTIONS))
     )
     filtered = df[mask]
 

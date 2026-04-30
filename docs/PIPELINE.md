@@ -390,6 +390,19 @@ Valid actual_action values:
 **DESIGN DECISION:**
 `signal_logger.py` logs after each trade attempt, rather than before because actual_action requires a reason code to be populated to be properly logged.
 
+### `agent_runner.py` — `build_work_list()` filter
+
+The news-validation agent only consumes rows whose `actual_action` is in
+`config.AGENT_ELIGIBLE_ACTIONS = {"BUY", "ADD_TO_POSITION", "SELL"}`. Skip
+codes (`NOT_OWNED`, `INSUFFICIENT_EQUITY`, `REBALANCER_TICKERS_SKIP`,
+`HOLD`, `EARNINGS_VETO`, etc.) are intentionally excluded because those rows
+carry no SHAP values — `signal_logger.py` only attaches `shap_driver_*` for
+real model-driven decisions. Without SHAP drivers the agent falls back to
+generic queries that have no thesis grounding, wasting compute and
+degrading evidence quality. The filter is applied in addition to the
+existing `row_type=ENTRY`, `model_signal IN (BUY, SELL)`, and `date`
+filters; it does not replace them.
+
 ### `outcome_tracker.py`
 outcome_tracker.py — Daily evaluator for bot signal accuracy.
 

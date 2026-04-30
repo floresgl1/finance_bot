@@ -72,6 +72,16 @@ STALE_SKIP = "STALE_SKIP"
 # Logged when a ticker's CSV is completely missing or its Close price cannot be read.
 CSV_INVALID_SKIP = "CSV_INVALID_SKIP"
 
+# Gates which signal_log rows the news-validation agent will pick up. Only
+# rows whose actual_action represents a real model-driven trade attempt are
+# eligible — skip codes (NOT_OWNED, INSUFFICIENT_EQUITY, REBALANCER_TICKERS_SKIP,
+# etc.) carry no SHAP values and would force the agent into generic fallback
+# queries with no thesis grounding. ADD_TO_POSITION is included because it is
+# a real BUY-shaped decision the agent can validate; SELL is included because
+# it is a real model-driven exit. Plain HOLD is excluded — the agent only
+# validates BUY/SELL theses.
+AGENT_ELIGIBLE_ACTIONS = {"BUY", "ADD_TO_POSITION", "SELL"}
+
 # Logged when capital_allocator receives a price of zero or negative, making share
 # sizing impossible.
 INVALID_PRICE_SKIP = "INVALID_PRICE_SKIP"

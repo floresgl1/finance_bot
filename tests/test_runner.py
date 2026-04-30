@@ -87,6 +87,7 @@ def test_build_work_list_filters_to_buy_sell_entry_rows():
         "ticker": ["AAPL", "TSLA", "NFLX", "JPM", "GOOG", "MSFT"],
         "row_type": ["ENTRY", "ENTRY", "ENTRY", "EXIT", "ENTRY", "ENTRY"],
         "model_signal": ["BUY", "SELL", "HOLD", "BUY", "BUY", "BUY"],
+        "actual_action": ["BUY", "SELL", "HOLD", "BUY", "BUY", "BUY"],
         "confidence": [0.71, 0.65, 0.40, 0.50, 0.55, 0.60],
         "shap_driver_1": ["a1", "b1", "c1", "d1", "e1", "f1"],
         "shap_driver_2": ["a2", "b2", "c2", "d2", "e2", "f2"],
@@ -101,6 +102,88 @@ def test_build_work_list_filters_to_buy_sell_entry_rows():
         assert set(d.keys()) == {"ticker", "model_signal", "confidence", "shap_values"}
         assert isinstance(d["shap_values"], list)
         assert len(d["shap_values"]) == 3
+
+
+# --- AGENT_ELIGIBLE_ACTIONS filter ----------------------------------------
+
+
+def _eligibility_row(ticker: str, actual_action, model_signal: str = "BUY") -> dict:
+    return {
+        "date": "2026-04-29",
+        "ticker": ticker,
+        "row_type": "ENTRY",
+        "model_signal": model_signal,
+        "actual_action": actual_action,
+        "confidence": 0.6,
+        "shap_driver_1": "RSI_14",
+        "shap_driver_2": "MACD",
+        "shap_driver_3": "sent_rolling_7d",
+    }
+
+
+def test_build_work_list_includes_actual_action_buy():
+    df = pd.DataFrame([_eligibility_row("AAPL", "BUY", "BUY")])
+
+    result = build_work_list(df, run_date="2026-04-29")
+
+    assert [d["ticker"] for d in result] == ["AAPL"]
+
+
+def test_build_work_list_includes_actual_action_add_to_position():
+    df = pd.DataFrame([_eligibility_row("NFLX", "ADD_TO_POSITION", "BUY")])
+
+    result = build_work_list(df, run_date="2026-04-29")
+
+    assert [d["ticker"] for d in result] == ["NFLX"]
+
+
+def test_build_work_list_includes_actual_action_sell():
+    df = pd.DataFrame([_eligibility_row("TSLA", "SELL", "SELL")])
+
+    result = build_work_list(df, run_date="2026-04-29")
+
+    assert [d["ticker"] for d in result] == ["TSLA"]
+
+
+def test_build_work_list_excludes_actual_action_not_owned():
+    df = pd.DataFrame([_eligibility_row("AAPL", "NOT_OWNED", "SELL")])
+
+    result = build_work_list(df, run_date="2026-04-29")
+
+    assert result == []
+
+
+def test_build_work_list_excludes_actual_action_hold():
+    df = pd.DataFrame([_eligibility_row("AAPL", "HOLD", "BUY")])
+
+    result = build_work_list(df, run_date="2026-04-29")
+
+    assert result == []
+
+
+def test_build_work_list_excludes_actual_action_rebalancer_sell():
+    df = pd.DataFrame([_eligibility_row("AAPL", "REBALANCER_SELL", "SELL")])
+
+    result = build_work_list(df, run_date="2026-04-29")
+
+    assert result == []
+
+
+def test_build_work_list_excludes_actual_action_stop_backfill():
+    df = pd.DataFrame([_eligibility_row("AAPL", "STOP_BACKFILL", "BUY")])
+
+    result = build_work_list(df, run_date="2026-04-29")
+
+    assert result == []
+
+
+def test_build_work_list_excludes_actual_action_nan():
+    import numpy as np
+    df = pd.DataFrame([_eligibility_row("AAPL", np.nan, "BUY")])
+
+    result = build_work_list(df, run_date="2026-04-29")
+
+    assert result == []
 
 
 def test_process_ticker_happy_path_search_then_decide():
@@ -221,7 +304,7 @@ def test_run_agent_returns_full_artifact_with_one_decision(tmp_path):
         "shap_driver_1": ["RSI_14"],
         "shap_driver_2": ["MACD"],
         "shap_driver_3": ["sent_rolling_7d"],
-        "actual_action": [""],
+        "actual_action": ["BUY"],
     })
     df.to_csv(str(csv_path), index=False)
 
