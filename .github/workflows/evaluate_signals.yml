@@ -243,3 +243,92 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python outcome_tracker.py --weekly
+
+      # ------------------------------------------------------------------
+      # Edge degradation monitor — runs in the same weekly slot as the
+      # summary so we get one cadence for retrain-trigger decisions.
+      # Reads the signal_log.csv already downloaded above; reads/writes
+      # data/edge_monitor_state.json to PA so transition tracking
+      # survives across runner instances.
+      # ------------------------------------------------------------------
+      - name: Download edge_monitor_state.json from PythonAnywhere
+        if: steps.download.outputs.has_data == 'true'
+        env:
+          PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+        run: |
+          python - <<'PYEOF'
+          import os
+
+          import requests
+
+          token    = os.environ["PYTHONANYWHERE_TOKEN"]
+          username = os.environ["PYTHONANYWHERE_USERNAME"]
+          remote   = f"/home/{username}/finance_bot/data/edge_monitor_state.json"
+          local    = os.path.join("data", "edge_monitor_state.json")
+
+          os.makedirs("data", exist_ok=True)
+
+          url  = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{remote}"
+          resp = requests.get(
+              url,
+              headers={"Authorization": f"Token {token}"},
+              timeout=30,
+          )
+
+          if resp.status_code == 404:
+              print("[INFO] edge_monitor_state.json not found on PythonAnywhere — first run.")
+          else:
+              resp.raise_for_status()
+              with open(local, "wb") as fh:
+                  fh.write(resp.content)
+              print(f"[OK] Downloaded edge_monitor_state.json ({len(resp.content):,} bytes)")
+          PYEOF
+
+      - name: Run edge monitor
+        if: steps.download.outputs.has_data == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python edge_monitor.py
+
+      - name: Upload edge_monitor_state.json to PythonAnywhere
+        if: steps.download.outputs.has_data == 'true'
+        env:
+          PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+        run: |
+          python - <<'PYEOF'
+          import os
+          import sys
+
+          import requests
+
+          token    = os.environ["PYTHONANYWHERE_TOKEN"]
+          username = os.environ["PYTHONANYWHERE_USERNAME"]
+          remote   = f"/home/{username}/finance_bot/data/edge_monitor_state.json"
+          local    = os.path.join("data", "edge_monitor_state.json")
+
+          if not os.path.exists(local):
+              print("[WARN] edge_monitor_state.json not found locally — nothing to upload.")
+              sys.exit(0)
+
+          url = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{remote}"
+
+          try:
+              with open(local, "rb") as fh:
+                  resp = requests.post(
+                      url,
+                      headers={"Authorization": f"Token {token}"},
+                      files={"content": fh},
+                      timeout=60,
+                  )
+          except requests.exceptions.RequestException as exc:
+              print(f"[ERROR] Upload request failed: {exc}")
+              sys.exit(1)
+
+          if resp.status_code in (200, 201):
+              print(f"[OK] Uploaded edge_monitor_state.json → {remote}")
+          else:
+              print(f"[ERROR] Upload failed — HTTP {resp.status_code}: {resp.text.strip()}")
+              sys.exit(1)
+          PYEOF

@@ -125,6 +125,12 @@ SMALL_POSITION_PCT  = 0.03
 NORMAL_POSITION_PCT = 0.05
 LARGE_POSITION_PCT  = 0.07
 
+# --- Edge degradation monitor (edge_monitor.py) ---
+EDGE_BREAKEVEN_HIT_RATE = 0.31        # below this → alert (from 2026-04-19 baseline)
+EDGE_STALENESS_DAYS     = 10          # if most recent WIN/LOSS evaluation older than this → stale alert
+EDGE_WINDOW_SIZE        = 30          # rolling window over last N evaluated BUYs
+EDGE_MONITOR_STATE_PATH = "data/edge_monitor_state.json"
+
 # Technical indicator columns used as model input features.
 # Must stay in sync with the columns produced by features.add_features().
 FEATURE_COLUMNS = [
