@@ -62,6 +62,8 @@ from config import (
     STOP_LOSS_POLL_INTERVAL_S,
     CANCEL_STOP_FAILED,
     STOP_BACKFILL,
+    STOP_BACKFILL_FAILED,
+    TAKE_PROFIT_FAILED,
     PORTFOLIO_SNAPSHOT_PATH,
     HALT_FLAG_PATH,
     MAX_SINGLE_DAY_LOSS_PCT,
@@ -732,11 +734,11 @@ def check_position_limits(
 
             print(f"  [TAKE PROFIT] {ticker} — up {gain_pct:.1f}% — selling {qty} shares")
             result = place_sell(api, ticker, qty)
-            send_discord(
-                f"🎯 **[TAKE PROFIT]** {ticker} sold — up {gain_pct:.1f}%  "
-                f"(entry ${entry_price:.2f} → current ${current_price:.2f})"
-            )
             if result["status"] == "placed":
+                send_discord(
+                    f"🎯 **[TAKE PROFIT]** {ticker} sold — up {gain_pct:.1f}%  "
+                    f"(entry ${entry_price:.2f} → current ${current_price:.2f})"
+                )
                 from signal_logger import log_exit, find_open_entry_order_id
                 entry_order_id = find_open_entry_order_id(ticker) or "UNLINKED"
                 log_exit(
@@ -749,6 +751,14 @@ def check_position_limits(
                 )
                 exited.append(ticker)
                 owned.pop(ticker, None)
+            else:
+                from signal_logger import log_signal
+                log_signal(ticker, "SELL", current_price, qty, 0.0, TAKE_PROFIT_FAILED)
+                send_discord(
+                    f"🚨 **[TAKE_PROFIT_FAILED]** {ticker} — sell order failed: "
+                    f"{result.get('reason', 'unknown')}. Position still open at {gain_pct:.1f}% gain. "
+                    f"Manual review required."
+                )
 
     return exited, owned
 
@@ -965,6 +975,7 @@ def run() -> None:
             existing = api.list_orders(status="open", symbols=[ticker])
         except Exception as exc:
             print(f"    [BACKFILL ERROR] {ticker} — could not list open orders: {exc}")
+            _log_backfill(ticker, "STOP_BACKFILL_FAILED", entry_price, qty, 0.0, STOP_BACKFILL_FAILED)
             send_discord(f"⚠️ **Stop-loss backfill failed** for {ticker}: {exc}")
             continue
 
@@ -989,6 +1000,7 @@ def run() -> None:
             _log_backfill(ticker, "STOP_BACKFILL", entry_price, qty, 0.0, STOP_BACKFILL)
         except Exception as exc:
             print(f"    [BACKFILL ERROR] {ticker} — {exc}")
+            _log_backfill(ticker, "STOP_BACKFILL_FAILED", entry_price, qty, 0.0, STOP_BACKFILL_FAILED)
             send_discord(f"⚠️ **Stop-loss backfill failed** for {ticker}: {exc}")
 
     print(f"  Checking take-profits on {len(owned)} open position(s)...")

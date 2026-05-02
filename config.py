@@ -62,6 +62,8 @@ STOP_LOSS_POLL_INTERVAL_S  = 0.2    # seconds between status polls when awaiting
 # New signal-logger action codes introduced by OTO stop-loss integration
 CANCEL_STOP_FAILED = "CANCEL_STOP_FAILED"
 STOP_BACKFILL      = "STOP_BACKFILL"
+STOP_BACKFILL_FAILED = "STOP_BACKFILL_FAILED"
+TAKE_PROFIT_FAILED = "TAKE_PROFIT_FAILED"
 
 # Logged when a BUY cannot be sized to even 1 share due to insufficient equity.
 INSUFFICIENT_EQUITY = "INSUFFICIENT_EQUITY"
