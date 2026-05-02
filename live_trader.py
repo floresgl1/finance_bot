@@ -56,6 +56,7 @@ from config import (
     REBALANCER_TICKERS_SKIP,
     MAX_MARKET_DATA_AGE_HOURS,
     STALE_MARKET_DATA,
+    STALE_MARKET_DATA_SKIP,
     STOP_LOSS_PCT,
     STOP_LOSS_CANCEL_TIMEOUT_S,
     STOP_LOSS_POLL_INTERVAL_S,
@@ -340,6 +341,25 @@ def check_market_data_freshness(pipeline_start_time: datetime) -> tuple[bool, st
     return (True, "", [])
 
 
+def read_last_close(ticker: str) -> float | None:
+    """
+    Read the last `Close` value from data/{ticker}.csv.
+
+    Returns the float price on success, None on any failure. Used by the
+    STALE_SKIP and STALE_MARKET_DATA_SKIP branches in get_signals() to
+    record a last-known price in signal_log.csv even when the ticker is
+    being skipped due to stale data.
+    """
+    import pandas as pd
+    from config import DATA_DIR
+    csv_path = os.path.join(DATA_DIR, f"{ticker}.csv")
+    try:
+        df = pd.read_csv(csv_path)
+        return float(df["Close"].iloc[-1])
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Signal generation (reuses predictor.py logic, returns data instead of printing)
 # ---------------------------------------------------------------------------
@@ -363,6 +383,7 @@ def get_signals(sentiment_df=None) -> list[dict]:
     from predictor import (load_model, predict_ticker,
                            apply_earnings_veto, get_recent_earnings_surprise,
                            apply_sentiment_veto, is_ticker_stale)
+    from features import StaleMarketDataError
 
     model = load_model()
     today = date_cls.today()
@@ -383,16 +404,7 @@ def get_signals(sentiment_df=None) -> list[dict]:
                 # Read the last known close price from the CSV for logging.
                 # If this fails the CSV is unreadable — log as CSV_INVALID_SKIP
                 # and skip entirely rather than appending a stale entry.
-                import pandas as _pd
-                import os as _os
-                from config import DATA_DIR as _DATA_DIR
-                _last_price = None
-                try:
-                    _csv_path = _os.path.join(_DATA_DIR, f"{ticker}.csv")
-                    _df = _pd.read_csv(_csv_path)
-                    _last_price = float(_df["Close"].iloc[-1])
-                except Exception:
-                    pass
+                _last_price = read_last_close(ticker)
 
                 if _last_price is None:
                     from signal_logger import log_signal as _log_invalid
@@ -453,6 +465,24 @@ def get_signals(sentiment_df=None) -> list[dict]:
             r["note"]         = earn_note or sent_note
             r["veto_reason"]  = veto_reason
             results.append(r)
+        except StaleMarketDataError as exc:
+            last_price = read_last_close(ticker)
+            if last_price is None:
+                last_price = 0.0
+            print(f"  [STALE_MARKET_DATA_SKIP] {ticker} — {exc}")
+            results.append({
+                "ticker":        ticker,
+                "signal":        STALE_MARKET_DATA_SKIP,
+                "final_signal":  STALE_MARKET_DATA_SKIP,
+                "confidence":    0.0,
+                "current_price": last_price,
+                "sentiment":     0.0,
+                "note":          STALE_MARKET_DATA_SKIP,
+                "veto_reason":   None,
+                "shap_values":   {},
+                "days_old":      0,
+                "age_str":       "stale market data",
+            })
         except Exception as exc:
             print(f"  [SKIP] {ticker} — {exc}")
 
@@ -978,11 +1008,12 @@ def run() -> None:
 
     # Separate and log stale-data skips before the main execution pass
     from signal_logger import log_signal as _log_signal_early
-    stale_sigs = [s for s in signals if s["final_signal"] == "STALE_SKIP"]
-    signals    = [s for s in signals if s["final_signal"] != "STALE_SKIP"]
+    _STALE_FINAL_SIGNALS = ("STALE_SKIP", STALE_MARKET_DATA_SKIP)
+    stale_sigs = [s for s in signals if s["final_signal"] in _STALE_FINAL_SIGNALS]
+    signals    = [s for s in signals if s["final_signal"] not in _STALE_FINAL_SIGNALS]
     for r in stale_sigs:
-        print(f"  [STALE_SKIP] {r['ticker']} ({r['age_str']}) logged")
-        _log_signal_early(r["ticker"], "STALE_SKIP", r["current_price"], 0, 0.0, "STALE_SKIP")
+        print(f"  [{r['final_signal']}] {r['ticker']} ({r['age_str']}) logged")
+        _log_signal_early(r["ticker"], r["final_signal"], r["current_price"], 0, 0.0, r["final_signal"])
 
     # 5. Sort: SELLs first (confidence desc), then BUYs (confidence desc), then HOLDs
     sell_sigs = sorted(

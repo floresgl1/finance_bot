@@ -101,6 +101,7 @@ REBALANCER_TICKERS_SKIP = "REBALANCER_TICKERS_SKIP"
 # Market data freshness check (Layer 1 in live_trader.py)
 MAX_MARKET_DATA_AGE_HOURS = 24
 STALE_MARKET_DATA = "STALE_MARKET_DATA"
+STALE_MARKET_DATA_SKIP = "STALE_MARKET_DATA_SKIP"
 
 # Portfolio-level daily loss limit (Finding #3)
 PORTFOLIO_SNAPSHOT_PATH        = "portfolio_snapshot.json"
