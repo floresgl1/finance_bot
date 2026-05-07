@@ -70,5 +70,5 @@ jobs:
         run: |
           curl -H "Content-Type: application/json" \
                -X POST \
-               -d "{\"content\": \"Workflow Failure Detected\nRepository: ${{ github.repository }}\nBranch: ${{ github.ref_name }}\nFailed Jobs: 1\nFailed Jobs List: ${{ github.job }}\nWorkflow: ${{ github.workflow }}\nRun: ${{ github.run_number }} - $(date -u)\"}" \
+               -d "{\"content\": \"🚨 **MARKET DATA WORKFLOW FAILED**\nRepository: ${{ github.repository }}\nBranch: ${{ github.ref_name }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\nTimestamp: $(date -u)\"}" \
                "$DISCORD_WEBHOOK_URL"
