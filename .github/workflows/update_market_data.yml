@@ -63,6 +63,13 @@ jobs:
               sys.exit(1)
           EOF
 
+      - name: Trigger run_bot on PythonAnywhere
+        run: |
+          curl -s -o /dev/null -w "HTTP %{http_code}" \
+            -X POST \
+            -H "Authorization: token ${{ secrets.WEBHOOK_SECRET }}" \
+            https://floresgl907.pythonanywhere.com/webhook
+
       - name: Notify Discord on failure
         if: failure()
         env:

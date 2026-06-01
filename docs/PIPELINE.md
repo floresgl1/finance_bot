@@ -71,6 +71,48 @@ backtest.py so the results are directly comparable.
 **DESIGN DECISION:**
 Walk-forward validation is used instead of a static train/test split to prevent from data leakage during re training.
 
+## PRE-RUN VALIDATION
+
+### `pre_run_validation.py`
+Pre-flight check that fires between the GitHub Actions data refresh
+(12:00 UTC) and the live trader (15:00 UTC) so a missed or failed refresh
+is caught while there is still time to re-trigger it manually.
+
+- **Runs:** PythonAnywhere scheduled task, daily at 13:00 UTC.
+- **Purpose:** Validates that every market data CSV carries today's date
+  before `live_trader.py` runs at 15:00 UTC. Without this layer the only
+  signal of a stale refresh is `live_trader.check_market_data_freshness`
+  halting the pipeline 2+ hours later.
+- **Logic:** Reads `max(Date)` from each CSV in `data/*.csv` and
+  `data/market/*.csv` (paths built from `DATA_DIR` and `WATCHLIST`,
+  same construction as `check_market_data_freshness`) and compares it
+  against `date.today()`. Each CSV read is wrapped in try/except so a
+  single corrupt file does not abort the check; unreadable files are
+  reported as a separate "Failed to read" category in the alert.
+- **Weekend guard:** `date.today().weekday() >= 5` exits silently with
+  `[SKIP] Weekend — no market data expected.` so Saturday/Sunday runs
+  do not generate noise.
+- **On stale or unreadable data:** Sends a single Discord alert
+  (header `🚨 **PRE-RUN VALIDATION — STALE MARKET DATA**`) listing the
+  affected files, their last date, and the manual re-trigger link for
+  `update_market_data.yml`. Exits 1 so PythonAnywhere logs surface the
+  failure.
+- **On fresh data:** Console confirmation only
+  (`[OK] All market data CSVs current as of <date>.`). No Discord
+  message — the alert channel stays quiet on the happy path.
+- **Constants:** `DATA_DIR` and `WATCHLIST` from `config.py`.
+  `DISCORD_WEBHOOK_URL` is read from the environment via `os.getenv`;
+  if unset, the alert is skipped with a console warning.
+
+**Complementary GitHub Actions alert:** `update_market_data.yml` now
+includes an `if: failure()` step that POSTs a Discord notification
+(repository, branch, run-link URL, UTC timestamp) the moment the
+refresh job fails. Together the two mechanisms form an early-warning
+pair — the workflow's own failure step fires as soon as the refresh
+breaks, and `pre_run_validation.py` catches the silent-failure case
+where the workflow never ran at all (cron skip, GitHub outage,
+disabled workflow).
+
 ## EXECUTION
 
 ### `live_trader.py`
