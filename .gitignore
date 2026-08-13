@@ -5,5 +5,8 @@ __pycache__/
 .env
 myvenv/
 *.csv
-.claude/
+# Local Claude Code settings stay untracked, but agent definitions are
+# version-controlled — they encode pipeline invariants worth sharing.
+.claude/*
+!.claude/agents/
 data/last_run_date.txt
