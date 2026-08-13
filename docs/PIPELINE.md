@@ -280,6 +280,7 @@ and the PythonAnywhere scheduled task (15:00 UTC). This gives the upload pipelin
 6b. Rebalancer                    (skipped when halt_active; REBALANCER_SKIPPED_HALT logged)
     └─ build rebalancer_tickers
 6c. BUY + HOLD pass               (BUYs skipped when halt_active; BUY_SKIPPED_HALT logged)
+6d. Daily run guard write         (_write_run_guard — stamps UTC date; BEFORE the post, never after)
 7. Discord summary
 8. Portfolio snapshot write       (today's final equity → portfolio_snapshot.json, always)
 ```
@@ -492,6 +493,53 @@ Runs live_trader.py as a subprocess and sends a Discord alert if it exits
 with a non-zero return code.
 **DESIGN DECISION:**
  Running `live_trader.py` as a subprocess isolates the failure to only `live_trader.py`. `run_bot.py` is able to detect the failure and send a Discord alert.
+
+## DAILY RUN GUARD
+
+`data/last_run_date.txt` (path: `config.LAST_RUN_GUARD_PATH`) holds a single
+UTC date string. It exists so that the two daily triggers — the GitHub Actions
+webhook chain and the 15:00 UTC PythonAnywhere safety net — cannot both trade
+the same session.
+
+**The invariant:** the guard means *"the execution block ran to completion for
+this date, a later run may safely skip"*. It does **not** mean "the bot process
+exited cleanly", and it does **not** mean "the Discord summary posted".
+
+| | |
+|---|---|
+| **Written by** | `live_trader._write_run_guard()` only — step 6d |
+| **Read by** | `run_bot.main()` only — before launching the subprocess |
+| **Stamp** | `config.today_utc()`, UTC, matching `signal_logger` and the portfolio snapshot |
+| **Cleared by** | nothing; the date comparison makes it self-expiring |
+
+**Why live_trader.py owns the write.** `live_trader.py` exits 0 both when it
+trades and when it finds the market closed. `run_bot.py` sees only that exit
+code, so it cannot tell the two apart. When `run_bot.py` owned the write, the
+~13:00 UTC webhook run — which lands before the 13:30 UTC open and is a correct
+no-op — stamped the guard anyway, and the 15:00 UTC safety net then skipped
+every trading day. `live_trader.py` is the only module that knows whether the
+market was open and whether execution actually happened, so the write lives
+there rather than being encoded into an exit-code protocol across the process
+boundary.
+
+**Why the write precedes the Discord post.** The guard certifies trades, not
+notifications. Gating it on a successful post would let a Discord outage cause
+a real double-trade — the failure modes are backwards. A failed post is logged
+and never re-trades; a failed *guard write* raises a Discord alert (the
+unwritten guard is what allows the safety net to trade again) but is not fatal,
+since the orders are already placed.
+
+**Residual risk — accepted.** Recovery is a full re-run, not a resume. A crash
+in the narrow window between the last trade and the guard write leaves the
+guard unstamped, so the 15:00 UTC net re-runs and can over-weight a position.
+That exposure is bounded by `MAX_POSITION_PCT` headroom, not unbounded, and is
+accepted deliberately: silently losing the trading day is the worse outcome.
+
+**Known nondeterminism — parked.** If GitHub's queue ever delays the webhook
+past 13:30 UTC, that run trades and the 15:00 net correctly skips. No
+corruption, but *which* run trades becomes queue-dependent. Deciding whether to
+make the webhook run explicitly non-trading, or to accept "first open-market
+run wins", is a separate change.
 
 ### `upload_to_pythonanywhere.py`
 Uploads market reference CSVs and ticker OHLCV CSVs to PythonAnywhere via the Files API.

@@ -43,7 +43,7 @@ import json
 import subprocess
 import math
 import time
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -75,6 +75,8 @@ from config import (
     HALT_FLAG_PRESENT,
     BUY_SKIPPED_HALT,
     REBALANCER_SKIPPED_HALT,
+    LAST_RUN_GUARD_PATH,
+    today_utc,
 )
 
 # ---------------------------------------------------------------------------
@@ -166,7 +168,7 @@ def check_portfolio_loss_limits(api) -> tuple[bool, str]:
     """
     snapshot = _read_portfolio_snapshot()
     current_equity = float(api.get_account().equity)
-    today_str = date.today().isoformat()
+    today_str = today_utc()
 
     # Single-day check
     prev_date = _previous_session_date(snapshot, today_str)
@@ -228,6 +230,43 @@ def _check_halt_flag() -> tuple[bool, str]:
     except OSError as exc:
         print(f"  [HALT_FLAG] Warning: could not read {HALT_FLAG_PATH}: {exc}")
         return (True, "")
+
+
+# ---------------------------------------------------------------------------
+# Daily run guard
+# ---------------------------------------------------------------------------
+def _write_run_guard() -> None:
+    """
+    Stamp today's UTC date into LAST_RUN_GUARD_PATH.
+
+    The guard means "the execution block ran to completion for this date, it is
+    safe for a later run to skip" — it does NOT mean "the Discord summary was
+    posted". It is therefore written after the trade/rebalance block and before
+    the summary post: a Discord outage must never be able to cause a re-trade.
+
+    live_trader.py owns this file because it is the only module that knows
+    whether the market was open and whether execution actually happened. A
+    market-closed no-op exits long before this point and leaves the guard
+    untouched, so the later safety-net run still fires. run_bot.py only reads
+    it — it cannot distinguish "traded" from "closed" through an exit code.
+
+    A failed write is alerted, not fatal: the trades are already placed, so
+    aborting here would suppress the summary while changing nothing. The alert
+    matters because an unwritten guard lets the safety-net run trade again.
+    """
+    today = today_utc()
+    try:
+        os.makedirs(os.path.dirname(LAST_RUN_GUARD_PATH), exist_ok=True)
+        with open(LAST_RUN_GUARD_PATH, "w") as fh:
+            fh.write(today)
+        print(f"  Run guard stamped: {today}")
+    except OSError as exc:
+        print(f"  [RUN_GUARD] Warning: could not write {LAST_RUN_GUARD_PATH}: {exc}")
+        send_discord(
+            f"⚠️ **Run guard write failed** — trades for {today} are already placed, "
+            f"but the guard was not stamped (`{exc}`).\n"
+            f"The safety-net run may execute again today. Manual review required."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1327,6 +1366,11 @@ def run() -> None:
 
     print("-" * 60)
 
+    # 6d. Stamp the daily run guard — execution is complete for today, so a
+    #     later safety-net run must skip. Written before the Discord post so a
+    #     failed post can never cause a re-trade. See _write_run_guard().
+    _write_run_guard()
+
     # 7. Single post-execution Discord summary (after all trades complete)
     portfolio_value = get_equity(api)
     timestamp_end   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1334,7 +1378,7 @@ def run() -> None:
 
     # 8. Persist today's equity to the portfolio snapshot (always, even on halt).
     final_equity = get_equity(api)
-    today_str    = date.today().isoformat()
+    today_str    = today_utc()
     snapshot     = _read_portfolio_snapshot()
     snapshot[today_str] = final_equity
     _write_portfolio_snapshot(snapshot)

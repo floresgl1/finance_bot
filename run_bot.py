@@ -3,18 +3,24 @@ run_bot.py — Launcher wrapper for live_trader.py.
 
 Runs live_trader.py as a subprocess and sends a Discord alert if it exits
 with a non-zero return code.
+
+Daily run guard: this module READS LAST_RUN_GUARD_PATH to skip a duplicate
+run, but never writes it. live_trader.py owns the write, because only it
+knows whether the market was open and trades actually executed — a zero exit
+code means both "traded" and "market closed", so the write cannot live here.
 """
 
 import os
 import sys
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime
 
 from dotenv import load_dotenv
 load_dotenv()
 
+from config import LAST_RUN_GUARD_PATH, today_utc
+
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-LAST_RUN_FILE = os.path.join(os.path.dirname(__file__), "data", "last_run_date.txt")
 
 
 def send_discord(message: str) -> None:
@@ -33,13 +39,13 @@ def send_discord(message: str) -> None:
 
 
 def main() -> None:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = today_utc()
 
     try:
-        with open(LAST_RUN_FILE, "r") as f:
+        with open(LAST_RUN_GUARD_PATH, "r") as f:
             last_run = f.read().strip()
         if last_run == today:
-            print(f"[INFO] Bot already ran today ({today}), skipping.")
+            print(f"[INFO] Bot already traded today ({today}), skipping.")
             sys.exit(0)
     except (FileNotFoundError, OSError):
         pass
@@ -54,10 +60,6 @@ def main() -> None:
             f"Exit code: `{result.returncode}`"
         )
         sys.exit(result.returncode)
-
-    os.makedirs(os.path.dirname(LAST_RUN_FILE), exist_ok=True)
-    with open(LAST_RUN_FILE, "w") as f:
-        f.write(today)
 
 
 if __name__ == "__main__":

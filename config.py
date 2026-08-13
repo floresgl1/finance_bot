@@ -6,6 +6,9 @@ train/test split), feature thresholds, and labeling parameters (buy/sell
 return thresholds and forward-looking horizon).
 """
 
+import os
+from datetime import datetime, timezone
+
 # Tickers the bot will fetch data for, train on, and generate recommendations for
 WATCHLIST = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'JPM', 'XOM', 'JNJ',
              'META', 'NFLX', 'PYPL', 'INTC']
@@ -104,6 +107,26 @@ REBALANCER_TICKERS_SKIP = "REBALANCER_TICKERS_SKIP"
 MAX_MARKET_DATA_AGE_HOURS = 24
 STALE_MARKET_DATA = "STALE_MARKET_DATA"
 STALE_MARKET_DATA_SKIP = "STALE_MARKET_DATA_SKIP"
+
+# --- Daily run guard (owned by live_trader.py, read by run_bot.py) ---
+# Absolute path, anchored to this file's directory, so the guard resolves to the
+# same file no matter which working directory the PythonAnywhere task or the
+# run_bot.py subprocess is started from.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+LAST_RUN_GUARD_PATH = os.path.join(_REPO_ROOT, "data", "last_run_date.txt")
+
+
+def today_utc() -> str:
+    """
+    Today's date in UTC as an ISO 'YYYY-MM-DD' string.
+
+    Every date the bot persists is UTC-based — signal_logger rows, the run
+    guard, and the portfolio snapshot — so that a session running near local
+    midnight cannot stamp two different dates for the same trading day, and so
+    that stamps written on the server compare correctly against each other.
+    """
+    return datetime.now(timezone.utc).date().isoformat()
+
 
 # Portfolio-level daily loss limit (Finding #3)
 PORTFOLIO_SNAPSHOT_PATH        = "portfolio_snapshot.json"
