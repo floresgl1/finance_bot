@@ -125,9 +125,21 @@ def test_stray_header_rows_are_dropped(data_env):
 
 
 def test_rows_with_unparseable_prices_are_dropped(data_env):
-    rows = _price_rows(date.today())
-    rows.loc[5, "Close"] = "n/a"
-    rows.to_csv(data_env / "AAPL.csv", index=False)
+    """The bad value is injected into the CSV text rather than via
+    `rows.loc[...] = "n/a"`: newer pandas raises LossySetitemError on assigning
+    a string into a float64 column, and a corrupt cell arrives from a file in
+    production anyway.
+    """
+    path = data_env / "AAPL.csv"
+    _price_rows(date.today()).to_csv(path, index=False)
+
+    lines = path.read_text().splitlines()
+    header = lines[0].split(",")
+    close_idx = header.index("Close")
+    fields = lines[6].split(",")
+    fields[close_idx] = "n/a"
+    lines[6] = ",".join(fields)
+    path.write_text("\n".join(lines) + "\n")
 
     df = load_and_process("AAPL")
 
