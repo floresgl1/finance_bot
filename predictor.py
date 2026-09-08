@@ -10,7 +10,7 @@ Veto rules (thresholds are one-sided — only vetoes, no upgrades):
 
 import os
 import sys
-import io
+
 from datetime import date, timedelta
 
 import joblib
@@ -24,9 +24,19 @@ from sentiment import get_sentiment_all
 
 EARNINGS_DIR = os.path.join(os.path.dirname(__file__), "data", "earnings")
 
-# Ensure the terminal can render the star / warning emoji on Windows
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# Ensure the terminal can render the star / warning emoji on Windows.
+#
+# reconfigure() mutates the existing stream rather than replacing it. The
+# previous version assigned a fresh TextIOWrapper over sys.stdout.buffer at
+# import time, which leaked that wrapper into every importer and outlived this
+# module -- it broke pytest's output capture teardown ("I/O operation on closed
+# file"), making predictor.py untestable. Wrapped in a guard because a
+# redirected or already-closed stream may not support it.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
 
 # Veto thresholds: signals that conflict with sentiment this strongly are held
 VETO_BUY_THRESHOLD  = -0.2   # BUY vetoed when sentiment falls below this
@@ -48,7 +58,15 @@ def is_ticker_stale(ticker: str) -> tuple[bool, int]:
     """
     path = os.path.join(DATA_DIR, f"{ticker}.csv")
     if not os.path.exists(path):
-        return False, -1
+        # Stale, not fresh. Returning False here let a missing CSV fall through
+        # to predict_ticker(), where load_and_process() raised FileNotFoundError
+        # into the bare `except Exception` in live_trader.get_signals() -- which
+        # prints to console and writes NO row to signal_log.csv. The ticker
+        # vanished from the record while the run looked healthy, and the
+        # `days_old == -1` / "csv file missing" branch in get_signals() was
+        # unreachable. True routes it to that branch, which logs
+        # CSV_INVALID_SKIP as documented in PIPELINE.md.
+        return True, -1
     try:
         df       = pd.read_csv(path, parse_dates=["Date"])
         max_date = pd.to_datetime(df["Date"]).max().date()
