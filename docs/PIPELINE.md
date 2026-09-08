@@ -927,6 +927,7 @@ at it, so the live CSVs the next real training run reads are untouched. Writes
 | `--exposure` | Is the return deficit exposure or selection? Five allocation policies over one model per window. |
 | `--horizons` | Does the forward-return label window matter? Re-labels and re-benchmarks at 3/5/7/14/21 days. |
 | `--broad` | Modifier. Swaps the four regime windows for ten continuous ones. |
+| `--window START END` | Modifier. Runs one explicit window — use it to simulate the exact dates the live account traded. |
 
 **DESIGN DECISION:**
 Every `--exposure` arm is expressed as a rewrite of the signal frames and run
@@ -951,6 +952,36 @@ horizon or allocation policy tested fixes that. **Nothing in production was
 changed as a result** — there was nothing better to ship. The conclusion is now
 enforced by the `beats_buy_and_hold` promotion-gate check rather than left in a
 document.
+
+### KNOWN DEFECT — live position sizing contradicts itself
+
+Found 2026-09-08 while trying to make `backtest.py` simulate the live bot. Not
+fixed, because the two ways to resolve it produce materially different systems.
+
+| Path | Rule | Size |
+|---|---|---|
+| new position | `live_trader.get_position_size()` | conf 35–40 → 10%, 40–45 → 15%, 45+ → 20% |
+| add to position | `capital_allocator._get_allocation_tier()` | 3/5/7%, capped by headroom to `MAX_POSITION_PCT` = 8% |
+| trim | `rebalancer` | weight > 8.1% → sell down to 7.5%, max 25% of shares per run |
+
+A new position opens at **10–20%** of equity and is then governed by an **8%**
+cap. Every position the bot opens is over-weight on arrival, is trimmed back
+over roughly three sessions, and cannot be added to in the meantime. The signal
+log shows 47 `REBALANCER_SELL` against 17 `BUY`, and 31 `INVALID_HEADROOM`.
+
+Each trim pays slippage and a commission on stock the bot chose to buy days
+earlier. Two possible resolutions, and they are not equivalent:
+
+- **Raise `MAX_POSITION_PCT` toward 0.20.** Keeps the conviction sizing in
+  `get_position_size`, stops the churn, gives a concentrated 4–5 name book.
+- **Lower `get_position_size` toward 0.08.** Keeps the diversified twelve-name
+  book the account currently ends up with, stops the churn, removes the
+  conviction weighting.
+
+`backtest._simulate()` models neither path — it sizes at
+`Confidence × MAX_POSITION_PCT` and never adds to an existing position, which is
+why it simulates a 22%-invested book against the live bot's ~82%. See finding I
+in `docs/EDGE_INVESTIGATION_2026-09-08.md`.
 
 ### `compare_models.py`
 Compares test-set metrics between the current model and the backup model.

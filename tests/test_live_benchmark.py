@@ -476,3 +476,160 @@ def test_report_says_how_to_get_prices_when_there_are_none():
     report = format_report(result)
     assert "no prices available" in report
     assert "--fetch" in report
+
+
+# --- exposure reconstruction -----------------------------------------------
+#
+# Alpaca reports equity but not how much of it was at risk, and that split is
+# the whole question: trailing the basket because you hold half as much is a
+# different problem from picking badly. The reconstruction is only useful if it
+# refuses to answer when the ledger is broken -- a missing EXIT row leaves
+# shares on the book forever and inflates exposure with no visible symptom.
+
+from live_benchmark import (          # noqa: E402
+    MAX_PLAUSIBLE_EXPOSURE,
+    _decompose,
+    load_position_events,
+    reconstruct_exposure,
+)
+
+
+def _write_log(tmp_path, rows: list[dict]):
+    cols = ["date", "ticker", "row_type", "qty", "shares", "exit_timestamp"]
+    frame = pd.DataFrame(rows)
+    for col in cols:
+        if col not in frame:
+            frame[col] = None
+    path = tmp_path / "signal_log.csv"
+    frame[cols].to_csv(path, index=False)
+    return str(path)
+
+
+def test_entries_and_exits_become_signed_share_deltas(tmp_path):
+    path = _write_log(tmp_path, [
+        {"date": "2026-06-01", "ticker": "AAA", "row_type": "ENTRY", "qty": 10},
+        {"date": "2026-06-03", "ticker": "AAA", "row_type": "EXIT", "shares": 4},
+    ])
+
+    events = load_position_events(path)
+
+    assert events["delta"].tolist() == [10.0, -4.0]
+
+
+def test_exit_timestamp_wins_over_the_row_date(tmp_path):
+    """reconcile_stops backfills stop fills with Alpaca's filled_at, which can
+    land on a different day from the row it was written on."""
+    path = _write_log(tmp_path, [
+        {"date": "2026-06-10", "ticker": "AAA", "row_type": "EXIT", "shares": 5,
+         "exit_timestamp": "2026-06-04T14:31:00Z"},
+    ])
+
+    events = load_position_events(path)
+
+    assert events["when"].iloc[0] == pd.Timestamp("2026-06-04")
+
+
+def test_a_log_without_row_type_yields_nothing(tmp_path):
+    """Local log copies predate row_type being populated."""
+    path = tmp_path / "old.csv"
+    pd.DataFrame({"date": ["2026-06-01"], "ticker": ["AAA"]}).to_csv(path, index=False)
+
+    assert load_position_events(str(path)).empty
+
+
+def test_exposure_tracks_the_position_that_is_open(tmp_path):
+    equity = _curve([10_000.0] * 5)
+    closes = pd.DataFrame({"AAA": [100.0] * 5}, index=_dates(5))
+    path = _write_log(tmp_path, [
+        {"date": "2026-06-01", "ticker": "AAA", "row_type": "ENTRY", "qty": 50},
+        {"date": "2026-06-04", "ticker": "AAA", "row_type": "EXIT", "shares": 50},
+    ])
+
+    exposure, note = reconstruct_exposure(equity, closes, log_path=path)
+
+    assert note == ""
+    assert exposure.iloc[0] == pytest.approx(0.50)   # 50 x $100 / $10,000
+    assert exposure.iloc[-1] == pytest.approx(0.0)   # closed
+
+
+def test_a_missing_exit_row_is_refused_not_reported(tmp_path):
+    """Shares that never come off the book inflate exposure indefinitely. That
+    has to fail loudly, because the decomposition built on it looks fine."""
+    equity = _curve([10_000.0] * 3)
+    closes = pd.DataFrame({"AAA": [100.0] * 3}, index=_dates(3))
+    path = _write_log(tmp_path, [
+        {"date": "2026-06-01", "ticker": "AAA", "row_type": "ENTRY", "qty": 500},
+    ])
+
+    exposure, note = reconstruct_exposure(equity, closes, log_path=path)
+
+    assert exposure.empty
+    assert "missing EXIT rows" in note
+
+
+def test_extra_exit_rows_are_refused(tmp_path):
+    """A negative share balance means the log double-counted an exit."""
+    equity = _curve([10_000.0] * 3)
+    closes = pd.DataFrame({"AAA": [100.0] * 3}, index=_dates(3))
+    path = _write_log(tmp_path, [
+        {"date": "2026-06-01", "ticker": "AAA", "row_type": "EXIT", "shares": 10},
+    ])
+
+    exposure, note = reconstruct_exposure(equity, closes, log_path=path)
+
+    assert exposure.empty
+    assert "extra EXIT rows" in note
+
+
+def test_a_missing_log_says_so(tmp_path):
+    equity = _curve([10_000.0] * 3)
+    closes = pd.DataFrame({"AAA": [100.0] * 3}, index=_dates(3))
+
+    exposure, note = reconstruct_exposure(equity, closes,
+                                          log_path=str(tmp_path / "nope.csv"))
+
+    assert exposure.empty
+    assert "no ENTRY/EXIT rows" in note
+
+
+def test_plausibility_ceiling_allows_a_fully_invested_book():
+    """The bot can legitimately be ~100% invested; the ceiling exists to catch
+    a broken ledger, not to flag full investment."""
+    assert MAX_PLAUSIBLE_EXPOSURE > 1.0
+
+
+# --- decomposition ---------------------------------------------------------
+
+
+def test_decomposition_splits_the_gap(flat_closes):
+    """Holding a +20% basket at 50% exposure would return ~10%; an account that
+    made 14% picked well on top of holding less."""
+    result = compare(_curve([10_000.0] * 5), flat_closes,
+                     exposure=pd.Series([0.5] * 5, index=_dates(5)))
+    result["strategy"]["total_return"] = 14.0
+    basket = {"total_return": 20.0, "delta_pp": -6.0, "max_drawdown": -5.0}
+
+    out = _decompose(result, basket)
+
+    assert "50%" in out
+    assert "+10.00%" in out      # what holding at that exposure would give
+    assert "+4.00pp" in out      # selection and timing
+
+
+def test_decomposition_declines_without_an_exposure_series(flat_closes):
+    result = compare(_curve([10_000.0] * 5), flat_closes,
+                     exposure_note="no ENTRY/EXIT rows in signal_log.csv")
+    basket = {"total_return": 20.0, "delta_pp": -6.0, "max_drawdown": -5.0}
+
+    out = _decompose(result, basket)
+
+    assert "could not be measured" in out
+    assert "no ENTRY/EXIT rows" in out
+
+
+def test_report_carries_the_decomposition(flat_closes):
+    result = compare(_curve([10_000.0, 10_500.0, 11_000.0, 11_500.0, 12_000.0]),
+                     flat_closes,
+                     exposure=pd.Series([0.8] * 5, index=_dates(5)))
+
+    assert "Average exposure 80%" in format_report(result)

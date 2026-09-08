@@ -510,12 +510,102 @@ holding, and on a representative sample it loses by much more. Only F's
 attribution of *why* was wrong, and it is corrected above. Findings 1–4, B, C
 and D are classification measurements on a fixed test window and are unaffected.
 
+## I. The simulator was never simulating the live bot
+
+The live account's first six months came in at **−3.23pp against holding the
+basket** (`live_benchmark.py --days 365`, 2026-03-05 → 2026-09-04, 128 sessions,
++15.11% vs +18.34%, and a *shallower* drawdown of −5.58% vs −7.64%). The
+simulation said −24pp. A gap that size is not sampling noise.
+
+### First hypothesis: the sizing constants. Wrong.
+
+`backtest.py` declared its own `MAX_POSITION_PCT = 0.20` and
+`MAX_TOTAL_EXPOSURE = 0.80`, while the live path uses
+`config.MAX_POSITION_PCT = 0.08` and has **no portfolio-level exposure check at
+all** — `live_trader.py` and `capital_allocator.py` contain zero references to
+exposure, so twelve full positions reach ~96% invested.
+
+Both now come from `config.py`. It did not close the gap; it widened it.
+
+| Arm (10 broad windows) | Mean vs hold |
+|---|---|
+| shipped, live-matching caps (8% / no cap) | **−27.07pp** |
+| concentrated, the old hardcoded caps (20% / 80%) | −24.09pp |
+
+### The real mismatch is the sizing *rule*, not the caps
+
+Simulated over the **exact live window**, which is the only apples-to-apples
+comparison available:
+
+| | return | vs hold | max DD | avg exposure |
+|---|---|---|---|---|
+| **LIVE account** | **+15.11%** | **−3.23pp** | −5.58% | ~82% (implied) |
+| simulated, live-matching caps | +1.14% | −16.07pp | −3.59% | **22%** |
+| simulated, old caps | +6.36% | −10.85pp | −7.21% | 53% |
+| equal-weight hold | +17.21% | — | −7.64% | 100% |
+
+The account beat its own simulation by **14 percentage points on identical
+dates**. The exposure column says why: the simulator runs at 22% invested where
+the live bot runs near 82%.
+
+`backtest._simulate()` sizes a position at `Confidence × MAX_POSITION_PCT`
+(≈ 0.45 × 0.08 ≈ 3.6%) and then **never adds to it** — `if ticker in positions:
+continue`. Neither of those is what the bot does.
+
+### What the live bot actually does — and it is self-contradictory
+
+| Path | Rule | Size |
+|---|---|---|
+| new position | `live_trader.get_position_size()` | conf 35–40 → **10%**, 40–45 → **15%**, 45+ → **20%** |
+| add to position | `capital_allocator._get_allocation_tier()` | 3% / 5% / 7%, capped by headroom to `MAX_POSITION_PCT` = **8%** |
+| trim | `rebalancer` | weight > 8.1% → sell back to **7.5%**, max 25% of shares per run |
+
+**A new position opens at 10–20% of equity, and the cap that governs it
+afterwards is 8%.** Every position the bot opens is therefore immediately
+over-weight, gets trimmed back to 7.5% over roughly three sessions, and can
+never be added to in between.
+
+The signal log shows exactly this:
+
+| `actual_action` | count |
+|---|---|
+| `REBALANCER_SELL` | **47** |
+| `BUY` | 17 |
+| `INVALID_HEADROOM` | **31** |
+| `ADD_TO_POSITION` | 16 |
+
+Nearly three trims per position opened, and thirty-one add attempts refused
+because the position was already above its own cap. Each trim pays slippage and
+commission on stock the bot bought days earlier at its own initiative.
+
+Net effect: positions settle near 7.5%, twelve names reach ~90% invested, and
+the account tracks the basket closely — which is what the live numbers show, and
+what no version of the simulator reproduces.
+
+### What this means for findings A, E, F, G, H
+
+They measured a strategy that runs at 22–53% exposure and never scales into a
+position. The deployed system runs near 82% and churns through a trim cycle on
+every entry. **The −24pp figure describes something that has never traded.**
+
+Their *directions* may still hold — the live account is behind the basket too —
+but the magnitude is not transferable, and no return figure from this
+investigation should be quoted as describing the bot until `_simulate()` models
+`get_position_size()` and the rebalancer trim.
+
+The classification findings (1–4, B, C, D) are unaffected: they are measured on a
+fixed test window and never touch position sizing.
+
 ## Where this leaves things
 
-**The strategy does not beat buy-and-hold out of sample.** Not with better
-features, not with better labels, not at a different forward horizon, and not
-under any allocation policy tested — including a 200-day SMA filter with no
-model in it, which is the best of them and still loses.
+**The strategy does not beat buy-and-hold**, on every measurement taken: six
+simulated attempts to find an edge, and the live account itself at −3.23pp over
+its first six months.
+
+**But the magnitude is now in question.** Finding I shows `backtest._simulate()`
+has never modelled the live sizing rule, and the live account beat its own
+simulation by 14pp on identical dates. Treat −24pp as describing a strategy that
+was never deployed; treat −3.23pp as what the bot actually did.
 
 Measured over ten continuous windows spanning 2019–2026, the shipped
 configuration returns **−24.09pp against simply holding the watchlist, beating

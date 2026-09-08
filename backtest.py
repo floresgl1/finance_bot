@@ -12,13 +12,26 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from config import WATCHLIST, FEATURE_COLUMNS, CONFIDENCE_THRESHOLD, MODEL_DIR, MODEL_FILENAME
+from config import (
+    WATCHLIST,
+    FEATURE_COLUMNS,
+    CONFIDENCE_THRESHOLD,
+    MODEL_DIR,
+    MODEL_FILENAME,
+    MAX_POSITION_PCT,
+    MAX_TOTAL_EXPOSURE,
+)
 from features import load_and_process
 
 # --- Backtest settings ---
+#
+# MAX_POSITION_PCT and MAX_TOTAL_EXPOSURE come from config.py so this simulates
+# the book the live bot actually builds. They were previously redeclared here as
+# 0.20 / 0.80 -- a concentrated four-position strategy, where the live bot runs
+# up to twelve names at 8% with no portfolio-level cap. Every simulated return
+# figure produced before 2026-09-08 measured that other strategy, and the live
+# account beat its own simulation by roughly 20pp because of it.
 INITIAL_CAPITAL    = 10_000   # starting cash in USD
-MAX_POSITION_PCT   = 0.20     # max 20% of portfolio in any single stock
-MAX_TOTAL_EXPOSURE = 0.80     # max 80% of portfolio invested at once
 SLIPPAGE           = 0.001    # 0.1% price penalty applied on entry and exit
 COMMISSION         = 1.00     # flat fee per trade (entry or exit), in USD
 

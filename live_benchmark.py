@@ -40,6 +40,14 @@ silently produce no basket arm — the one number this module exists for. `--fet
 downloads the window from yfinance instead, and the report always names which
 source it used.
 
+**DESIGN DECISION:**
+Alpaca reports equity but not how much of it was at risk, and that split is the
+whole question: trailing the basket because you hold half as much is a different
+problem from picking badly. `reconstruct_exposure()` rebuilds the daily invested
+fraction from ENTRY/EXIT rows in signal_log.csv, and refuses to report a number
+when the ledger does not reconcile — a missing EXIT row leaves shares on the
+book forever and inflates exposure with no obvious symptom.
+
 Usage:
     python live_benchmark.py                  # console report, 90 days
     python live_benchmark.py --days 180
@@ -51,6 +59,7 @@ import argparse
 import os
 import sys
 
+import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -58,6 +67,7 @@ from dotenv import load_dotenv
 from backtest import COMMISSION, SLIPPAGE
 from config import WATCHLIST
 from features import DATA_DIR, MARKET_DATA_DIR
+from signal_logger import SIGNAL_LOG_PATH
 
 load_dotenv()
 
@@ -67,6 +77,12 @@ DEFAULT_LOOKBACK_DAYS = 90
 # rather than market action. An equal-weight basket of large caps does not move
 # 25% in a session; a deposit does.
 TRANSFER_MOVE_PCT = 25.0
+
+# The account cannot be more than fully invested -- there is no margin here. A
+# reconstructed exposure above this means the log is missing EXIT rows, which
+# leaves shares on the books forever, so the series is discarded rather than
+# reported. Some headroom above 1.0 is allowed for same-day marks and rounding.
+MAX_PLAUSIBLE_EXPOSURE = 1.25
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +217,98 @@ def hold_curve(closes: pd.DataFrame, dates: pd.DatetimeIndex,
 
 
 # ---------------------------------------------------------------------------
+# Exposure reconstruction
+# ---------------------------------------------------------------------------
+def load_position_events(log_path: str = SIGNAL_LOG_PATH) -> pd.DataFrame:
+    """Share deltas per ticker per day: +qty on an ENTRY, -shares on an EXIT.
+
+    Exits are dated from `exit_timestamp` where present and `date` otherwise.
+    reconcile_stops.py backfills stop fills with the Alpaca `filled_at` time in
+    exit_timestamp, and those can land on a different day from the row date.
+    """
+    if not os.path.exists(log_path):
+        return pd.DataFrame()
+
+    frame = pd.read_csv(log_path, dtype=str)
+    if "row_type" not in frame.columns:
+        return pd.DataFrame()
+
+    events = []
+
+    entries = frame[frame["row_type"].fillna("") == "ENTRY"].copy()
+    if not entries.empty:
+        entries["when"] = pd.to_datetime(entries["date"], errors="coerce")
+        entries["delta"] = pd.to_numeric(entries.get("qty"), errors="coerce")
+        events.append(entries[["when", "ticker", "delta"]])
+
+    exits = frame[frame["row_type"].fillna("") == "EXIT"].copy()
+    if not exits.empty:
+        when = pd.to_datetime(exits.get("exit_timestamp"), errors="coerce",
+                              format="mixed", utc=True)
+        when = when.dt.tz_localize(None) if hasattr(when, "dt") else when
+        fallback = pd.to_datetime(exits["date"], errors="coerce")
+        exits["when"] = when.fillna(fallback)
+        exits["delta"] = -pd.to_numeric(exits.get("shares"), errors="coerce")
+        events.append(exits[["when", "ticker", "delta"]])
+
+    if not events:
+        return pd.DataFrame()
+
+    out = pd.concat(events).dropna(subset=["when", "ticker", "delta"])
+    out["when"] = pd.DatetimeIndex(out["when"]).normalize()
+    return out.sort_values("when").reset_index(drop=True)
+
+
+def reconstruct_exposure(equity: pd.Series, closes: pd.DataFrame,
+                         log_path: str = SIGNAL_LOG_PATH) -> tuple[pd.Series, str]:
+    """Daily invested fraction of the account, rebuilt from the signal log.
+
+    Returns (series, reason). The series is empty whenever the reconstruction
+    cannot be trusted, and `reason` says why — reporting a decomposition built
+    on an incomplete ledger would be worse than reporting none, because the
+    error is invisible in the output.
+    """
+    if equity.empty:
+        return pd.Series(dtype=float), "no account equity"
+    if closes.empty:
+        return pd.Series(dtype=float), "no price history"
+
+    events = load_position_events(log_path)
+    if events.empty:
+        return pd.Series(dtype=float), (
+            f"no ENTRY/EXIT rows in {os.path.basename(log_path)}"
+        )
+
+    ledger = (events.pivot_table(index="when", columns="ticker", values="delta",
+                                 aggfunc="sum")
+              .reindex(equity.index.union(events["when"].unique()))
+              .fillna(0.0)
+              .cumsum()
+              .reindex(equity.index)
+              .ffill()
+              .fillna(0.0))
+
+    held = [t for t in ledger.columns if t in closes.columns]
+    if not held:
+        return pd.Series(dtype=float), "no traded ticker has price history"
+
+    prices = closes[held].reindex(equity.index).ffill()
+    invested = (ledger[held] * prices).sum(axis=1)
+    exposure = (invested / equity).replace([np.inf, -np.inf], np.nan).dropna()
+
+    if exposure.empty:
+        return pd.Series(dtype=float), "no overlapping sessions"
+    if (exposure < -0.01).any():
+        return pd.Series(dtype=float), "negative share balance - log has extra EXIT rows"
+    if exposure.max() > MAX_PLAUSIBLE_EXPOSURE:
+        return pd.Series(dtype=float), (
+            f"reconstructed exposure peaked at {exposure.max() * 100:.0f}% - "
+            f"the log is missing EXIT rows"
+        )
+    return exposure, ""
+
+
+# ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------
 def summarise_curve(curve: pd.Series) -> dict:
@@ -256,7 +364,9 @@ def detect_transfers(curve: pd.Series,
 
 def compare(equity: pd.Series, closes: pd.DataFrame,
             spy_closes: pd.DataFrame | None = None,
-            price_source: str = "local CSVs") -> dict:
+            price_source: str = "local CSVs",
+            exposure: pd.Series | None = None,
+            exposure_note: str = "") -> dict:
     """Put the account beside an equal-weight hold and an SPY hold.
 
     The hold arms are built on the account curve's own dates and starting
@@ -269,7 +379,11 @@ def compare(equity: pd.Series, closes: pd.DataFrame,
         "transfers": detect_transfers(equity),
         "n_basket_names": 0,
         "price_source": price_source,
+        "avg_exposure": None,
+        "exposure_note": exposure_note,
     }
+    if exposure is not None and not exposure.empty:
+        result["avg_exposure"] = float(exposure.mean() * 100)
     if equity.empty:
         return result
 
@@ -359,6 +473,7 @@ def _verdict(result: dict) -> str:
 
     delta = basket["delta_pp"]
     strategy = result["strategy"]
+    decomposition = _decompose(result, basket)
     if delta > 0:
         verdict = (f"  The account BEAT holding the basket by {delta:+.2f}pp "
                    f"over this window.")
@@ -376,8 +491,32 @@ def _verdict(result: dict) -> str:
 
     caveat = ("\n  One window is one sample. See "
               "docs/EDGE_INVESTIGATION_2026-09-08.md for\n  what this looked "
-              "like across four simulated regimes.")
-    return verdict + risk + caveat
+              "like across simulated regimes.")
+    return verdict + risk + decomposition + caveat
+
+
+def _decompose(result: dict, basket: dict) -> str:
+    """Split the gap to the basket into exposure and selection.
+
+    Crude by construction -- it compares against holding the basket at the
+    account's *average* exposure, which ignores when that exposure was carried.
+    It is still the difference between "we hold less" and "we pick badly", and
+    those call for opposite fixes.
+    """
+    avg = result.get("avg_exposure")
+    if avg is None:
+        note = result.get("exposure_note") or "not reconstructed"
+        return f"\n  Exposure could not be measured ({note}), so the gap is\n  not split into exposure vs selection."
+
+    strategy_return = result["strategy"]["total_return"]
+    expected = basket["total_return"] * avg / 100.0
+    selection = strategy_return - expected
+    return (
+        f"\n  Average exposure {avg:.0f}%. Holding the basket at that exposure\n"
+        f"  would have returned about {expected:+.2f}%; the account made "
+        f"{strategy_return:+.2f}%,\n"
+        f"  so selection and timing contributed {selection:+.2f}pp."
+    )
 
 
 def format_discord(result: dict) -> str:
@@ -450,6 +589,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "data/*.csv. Required on a CI runner, which has no price CSVs.",
     )
     parser.add_argument(
+        "--log", default=SIGNAL_LOG_PATH, metavar="PATH",
+        help="Signal log used to reconstruct daily exposure "
+             f"(default: {SIGNAL_LOG_PATH}).",
+    )
+    parser.add_argument(
         "--discord", action="store_true",
         help="Post a compact summary to the Discord webhook.",
     )
@@ -482,7 +626,9 @@ def main(argv: list[str] | None = None) -> int:
         spy = (load_closes(["SPY"], data_dir=MARKET_DATA_DIR)
                if os.path.exists(spy_path) else pd.DataFrame())
 
-    result = compare(equity, closes, spy, price_source=source)
+    exposure, note = reconstruct_exposure(equity, closes, log_path=args.log)
+    result = compare(equity, closes, spy, price_source=source,
+                     exposure=exposure, exposure_note=note)
     print(format_report(result))
 
     if args.discord:
