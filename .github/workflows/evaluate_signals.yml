@@ -276,6 +276,25 @@ jobs:
         run: python pnl_report.py --discord
 
       # ------------------------------------------------------------------
+      # Live performance vs buy-and-hold. Every other return figure in this
+      # project is simulated; this one is the account's own equity curve
+      # against holding the same basket over the same dates.
+      #
+      # Deliberately NOT gated on has_data: it reads Alpaca, not
+      # signal_log.csv, so it still answers the question on a week when the
+      # PythonAnywhere download failed.
+      #
+      # --fetch because nothing under data/ is tracked in git, so the runner
+      # has no price CSVs to build the basket arm from.
+      # ------------------------------------------------------------------
+      - name: Post live-vs-buy-and-hold to Discord
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python live_benchmark.py --days 180 --fetch --discord
+
+      # ------------------------------------------------------------------
       # Edge degradation monitor — runs in the same weekly slot as the
       # summary so we get one cadence for retrain-trigger decisions.
       # Reads the signal_log.csv already downloaded above; reads/writes

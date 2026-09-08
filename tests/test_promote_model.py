@@ -41,6 +41,7 @@ def _metrics(
     avg_return: float = 1.0,
     max_drawdown: float = -10.0,
     final_value: float = 10_500.0,
+    hold_return: float | None = 0.0,
 ) -> dict:
     return {
         "buy_f1": buy_f1,
@@ -54,23 +55,28 @@ def _metrics(
         "avg_return": avg_return,
         "max_drawdown": max_drawdown,
         "final_value": final_value,
+        "hold_return": hold_return,
     }
 
 
 def _winner(champion: dict) -> dict:
     """A challenger that clears every gate against `champion`."""
+    total_return = (
+        champion["total_return"]
+        + config.PROMOTION_MIN_RETURN_IMPROVEMENT_PCT
+        + 5.0
+    )
     return _metrics(
         buy_f1=champion["buy_f1"] + 0.05,
         buy_precision=config.PROMOTION_MIN_BUY_PRECISION + 0.10,
         buy_recall=config.PROMOTION_MIN_BUY_RECALL + 0.10,
         buy_support=config.PROMOTION_MIN_TEST_BUY_SUPPORT + 50,
-        total_return=(
-            champion["total_return"]
-            + config.PROMOTION_MIN_RETURN_IMPROVEMENT_PCT
-            + 5.0
-        ),
+        total_return=total_return,
         n_trades=config.PROMOTION_MIN_BACKTEST_TRADES + 25,
         max_drawdown=config.PROMOTION_MAX_DRAWDOWN_PCT + 15.0,
+        # Clear of the hold arm as well as the champion. Beating the incumbent
+        # is not sufficient on its own.
+        hold_return=total_return - 5.0,
     )
 
 
@@ -388,7 +394,7 @@ def test_every_check_runs_even_after_one_fails():
     champion = _metrics(buy_f1=0.90, total_return=40.0)
     challenger = _metrics(
         buy_f1=0.01, buy_precision=0.01, buy_recall=0.01, buy_support=1,
-        total_return=-20.0, n_trades=2, max_drawdown=-90.0,
+        total_return=-20.0, n_trades=2, max_drawdown=-90.0, hold_return=5.0,
     )
 
     decision = decide_promotion(champion, challenger)
@@ -401,8 +407,9 @@ def test_every_check_runs_even_after_one_fails():
         "backtest_trade_count",
         "challenger_max_drawdown",
         "beats_champion_return",
+        "beats_buy_and_hold",
     ]
-    assert len(_failed_check_names(decision)) == 6
+    assert len(_failed_check_names(decision)) == 7
 
 
 def test_summary_names_the_failed_checks():
@@ -533,7 +540,7 @@ def test_decision_file_records_a_promotion(tmp_path):
     assert payload["archived_to"] == "models/archive/x.joblib"
     assert payload["champion"]["buy_f1"] == 0.40
     assert payload["challenger"] == challenger
-    assert len(payload["checks"]) == 6
+    assert len(payload["checks"]) == 7
     assert "timestamp_utc" in payload
 
 
@@ -594,3 +601,145 @@ def test_decision_file_write_failure_is_not_fatal(tmp_path):
             decision, champion, challenger,
             dry_run=False, archived_to=None, path=str(tmp_path / "d.json"),
         )   # must not raise
+
+
+# --- beats_buy_and_hold ----------------------------------------------------
+#
+# Checks 1-5 are all relative to the champion or to absolute floors. None of
+# them can notice that both models lose to holding the basket, which is the
+# situation the edge investigation actually found
+# (docs/EDGE_INVESTIGATION_2026-09-08.md, findings A/E/F). Without this check
+# the gate would ratchet between models that are each worse than no model.
+
+
+def test_challenger_that_beats_the_champion_but_loses_to_holding_is_rejected():
+    """The case that motivated the check. Every other check passes."""
+    champion = _metrics(total_return=2.0, hold_return=20.0)
+    challenger = _winner(champion)
+    challenger["hold_return"] = challenger["total_return"] + 10.0
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is False
+    assert _failed_check_names(decision) == {"beats_buy_and_hold"}
+
+
+def test_challenger_exactly_matching_the_hold_arm_passes():
+    """PROMOTION_MIN_HOLD_DELTA_PCT defaults to 0.0, so matching is enough.
+    Pinned because tightening that constant should be a deliberate edit."""
+    assert config.PROMOTION_MIN_HOLD_DELTA_PCT == 0.0
+
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["hold_return"] = challenger["total_return"]
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is True
+
+
+def test_challenger_one_basis_point_below_the_hold_arm_is_rejected():
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["hold_return"] = challenger["total_return"] + 0.01
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is False
+    assert "beats_buy_and_hold" in _failed_check_names(decision)
+
+
+def test_a_missing_hold_benchmark_rejects_rather_than_passing_vacuously():
+    """Failure-biased: an absent benchmark is not a passed benchmark. Treating
+    None as 0.0 would let any profitable challenger through."""
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["hold_return"] = None
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is False
+    assert _failed_check_names(decision) == {"beats_buy_and_hold"}
+
+
+def test_missing_hold_benchmark_says_why_in_the_detail():
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["hold_return"] = None
+
+    decision = decide_promotion(champion, challenger)
+
+    detail = next(c["detail"] for c in decision["checks"]
+                  if c["name"] == "beats_buy_and_hold")
+    assert "cannot be compared" in detail
+
+
+def test_hold_check_applies_to_a_first_promotion_with_no_champion():
+    """No champion relaxes `beats_champion_return`, but not this one — the
+    first model to trade still has to be better than not trading."""
+    challenger = _winner(_metrics(total_return=0.0))
+    challenger["hold_return"] = challenger["total_return"] + 10.0
+
+    decision = decide_promotion(None, challenger)
+
+    assert decision["promote"] is False
+    assert _failed_check_names(decision) == {"beats_buy_and_hold"}
+
+
+def test_hold_delta_is_reported_in_percentage_points():
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["hold_return"] = challenger["total_return"] - 3.0
+
+    decision = decide_promotion(champion, challenger)
+
+    detail = next(c["detail"] for c in decision["checks"]
+                  if c["name"] == "beats_buy_and_hold")
+    assert "+3.00pp" in detail
+
+
+def test_report_shows_the_hold_arm():
+    """The benchmark is the reason a promotion can be rejected while the
+    challenger still beat the champion, so it has to be visible in Discord."""
+    champion = _metrics(total_return=2.0)
+    challenger = _winner(champion)
+    challenger["hold_return"] = 30.0
+    decision = decide_promotion(champion, challenger)
+
+    report = build_report(decision, champion, challenger,
+                          dry_run=False, archived_to=None)
+
+    assert "Buy-and-hold" in report
+    assert "+30.00%" in report
+
+
+def test_report_says_when_the_hold_arm_is_missing():
+    champion = _metrics(total_return=2.0)
+    challenger = _winner(champion)
+    challenger["hold_return"] = None
+    decision = decide_promotion(champion, challenger)
+
+    report = build_report(decision, champion, challenger,
+                          dry_run=False, archived_to=None)
+
+    assert "not measured" in report
+
+
+def test_extract_backtest_metrics_reads_the_hold_arm():
+    from promote_model import extract_backtest_metrics
+
+    metrics = extract_backtest_metrics(
+        {"total_return": 5.0, "n_trades": 20, "win_rate": 50.0,
+         "avg_return": 1.0, "max_drawdown": -5.0, "final_value": 10_500.0},
+        {"total_return": 12.5},
+    )
+
+    assert metrics["hold_return"] == 12.5
+
+
+def test_extract_backtest_metrics_reports_a_missing_hold_arm_as_none():
+    """Not 0.0 — see the failure-bias test above."""
+    from promote_model import extract_backtest_metrics
+
+    assert extract_backtest_metrics({"total_return": 5.0})["hold_return"] is None
+    assert extract_backtest_metrics({}, None)["hold_return"] is None

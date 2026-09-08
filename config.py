@@ -195,6 +195,19 @@ PROMOTION_MIN_RETURN_IMPROVEMENT_PCT = 1.0
 # positions rather than a strategy, and the gate refuses to decide on it.
 PROMOTION_MIN_BACKTEST_TRADES = 15
 
+# --- Head-to-head: against doing nothing ------------------------------------
+# Beating the champion is not enough. A champion that loses to holding the
+# basket can be beaten by a challenger that also loses to holding it, and the
+# gate would promote — ratcheting between models that are all worse than no
+# model at all. The edge investigation (docs/EDGE_INVESTIGATION_2026-09-08.md,
+# findings A/E/F) found exactly that situation: every configuration tested lost
+# to an equal-weight hold of the same watchlist over the same dates.
+#
+# Percentage points of total return the challenger must add over buy-and-hold
+# on the shared test split. 0.0 means "must at least match holding". Raise it to
+# demand a margin for the operational risk of running a bot at all.
+PROMOTION_MIN_HOLD_DELTA_PCT = 0.0
+
 # Reject a challenger whose simulated drawdown is worse than this, even if its
 # total return is higher. A model that earns more by risking ruin is not an
 # improvement.

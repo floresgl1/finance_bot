@@ -143,6 +143,7 @@ degenerate model that scores high precision by almost never firing.
 | `backtest_trade_count` | `PROMOTION_MIN_BACKTEST_TRADES` (15) | Return built on too few positions to be a strategy |
 | `challenger_max_drawdown` | `PROMOTION_MAX_DRAWDOWN_PCT` (-35%) | Earns more by risking ruin |
 | `beats_champion_return` | `PROMOTION_MIN_RETURN_IMPROVEMENT_PCT` (1.0pp) | Simulated return improvement below the margin, or worse |
+| `beats_buy_and_hold` | `PROMOTION_MIN_HOLD_DELTA_PCT` (0.0pp) | Loses to holding an equal-weight basket over the same dates |
 
 **DESIGN DECISION — the head-to-head is dollars, not BUY F1.**
 The gate originally compared BUY F1. F1 is a proxy for money and can move the
@@ -151,6 +152,26 @@ each made or lost, so a model can improve F1 while trading worse. Both models ar
 now run through `backtest.py` on the shared test split — net of the slippage and
 commission the simulator already applies — and compared on `total_return`.
 BUY F1 is still computed and reported for context but no longer gates.
+
+**DESIGN DECISION — beating the champion is not sufficient.**
+Checks 1-5 are all relative to the incumbent or to absolute floors, and none of
+them can notice that *both* models lose to simply holding the watchlist. That is
+not hypothetical: the edge investigation
+(`docs/EDGE_INVESTIGATION_2026-09-08.md`, findings A/E/F) found every
+configuration tested losing to an equal-weight hold over the same dates. Without
+`beats_buy_and_hold` the gate would ratchet between models that are each worse
+than running no model at all.
+
+`score_model()` therefore calls `backtest.run_benchmarks()` rather than
+`run_backtest()`, so the hold arm is simulated from the same frames over the
+same dates as the strategy — the comparison can never drift onto a differently
+dated basket. `hold_return` is `None` when no benchmark was produced, and the
+check **fails** on `None` rather than defaulting to 0.0, which would let any
+profitable challenger clear it.
+
+The threshold is 0.0pp: a challenger must at least *match* holding. Raise
+`PROMOTION_MIN_HOLD_DELTA_PCT` to demand a margin for the operational risk of
+running a bot at all.
 
 **DESIGN DECISION — simulated, not realized, P&L.**
 A challenger has never traded, so it has no realized P&L to compare. Both sides
@@ -161,9 +182,11 @@ gets there. The two answer different questions and are not interchangeable.
 `extract_backtest_metrics({})` collapses an empty result to values that fail
 every check, so a backtest that did not run can never promote by default.
 
-All four checks always run — the Discord report shows the full picture rather
+All seven checks always run — the Discord report shows the full picture rather
 than stopping at the first failure. When no champion exists on disk,
-`beats_champion` auto-passes and the floors alone decide.
+`beats_champion_return` auto-passes and the remaining checks decide.
+`beats_buy_and_hold` does **not** auto-pass in that case: the first model to
+trade still has to be better than not trading.
 
 #### `models/promotion_decision.json`
 
@@ -689,6 +712,49 @@ inspects its own data for `STOP_LOSS_FILL` rows and states which case it is
 looking at, rather than asserting coverage it cannot verify — without them,
 realized P&L is biased **upward** by however much the stopped-out positions lost.
 
+### `live_benchmark.py`
+Answers the one question every other return figure in this project only
+simulates: **did the real account beat holding the basket?**
+
+The strategy arm is Alpaca's own portfolio history. The benchmark arms are an
+equal-weight buy-and-hold of `WATCHLIST` and an SPY hold, both started on the
+account curve's first day, from the account's own starting equity, paying the
+same `SLIPPAGE` and `COMMISSION` that `backtest.py` applies.
+
+**DESIGN DECISION — the account, not the log.**
+The equity curve comes from `api.get_portfolio_history()`, not from
+reconstructing fills out of `signal_log.csv`. The log records what the bot
+decided and managed to write down; the account records what actually filled. A
+reconstruction would silently absorb missed fills, partial fills, stop-loss
+fills that never passed through `log_exit()`, and cash drag — precisely the
+errors this exists to catch. `pnl_report.py` attributes P&L *across the log*;
+this measures *the account*.
+
+**DESIGN DECISION — refuse a verdict rather than report a wrong one.**
+A deposit, withdrawal or paper-account reset looks exactly like a spectacular
+day, and Alpaca's portfolio history does not distinguish them from P&L.
+`detect_transfers()` flags single-day equity moves at or beyond
+`TRANSFER_MOVE_PCT` (25%), and the report then states the flagged dates and
+gives **no** verdict instead of a number it cannot stand behind.
+
+**DESIGN DECISION — the price source is stated, not inferred.**
+Nothing under `data/` is tracked in git, so a CI runner has no price CSVs and
+would silently produce an empty basket arm. `--fetch` downloads the window from
+yfinance instead, and the report always names which source it used. Alpaca's
+leading zero-equity padding rows (sessions before the account was funded) are
+dropped — one leading zero makes total return infinite.
+
+Usage:
+    python live_benchmark.py                  # console report, 90 days
+    python live_benchmark.py --days 180
+    python live_benchmark.py --fetch          # download prices (CI has no CSVs)
+    python live_benchmark.py --discord
+
+Runs in the **weekly** slot of `evaluate_signals.yml`. Unlike the other weekly
+steps it is *not* gated on the PythonAnywhere download, because it reads Alpaca
+rather than `signal_log.csv` and should still report on a week when that
+download failed.
+
 ### `reconcile_stops.py`
 
 Recovers stop-loss exits that never reached `signal_log.csv`.
@@ -859,6 +925,8 @@ at it, so the live CSVs the next real training run reads are untouched. Writes
 | `--label-scales` | Does a wider HOLD band make the labels more learnable? |
 | `--regimes` | Does the strategy beat buy-and-hold walk-forward, across bull and bear windows? |
 | `--exposure` | Is the return deficit exposure or selection? Five allocation policies over one model per window. |
+| `--horizons` | Does the forward-return label window matter? Re-labels and re-benchmarks at 3/5/7/14/21 days. |
+| `--broad` | Modifier. Swaps the four regime windows for ten continuous ones. |
 
 **DESIGN DECISION:**
 Every `--exposure` arm is expressed as a rewrite of the signal frames and run
@@ -868,11 +936,21 @@ be an artifact of the simulator. The regime arms use a 200-day SMA on SPY lagged
 one session — a timing rule that reads the close it trades on is the easiest way
 to manufacture an edge that is not there.
 
-Findings are written up in `docs/EDGE_INVESTIGATION_2026-09-08.md`. In short: the
-strategy does not beat buy-and-hold out of sample, the model changes that improve
-its classification metrics make returns worse, and sizing up doubles the
-shortfall. **Nothing in production was changed as a result** — there was nothing
-better to ship.
+**DESIGN DECISION — two window sets, and only one of them may be averaged.**
+`REGIME_WINDOWS` (4) is deliberately regime-spanning and therefore deliberately
+unrepresentative: half of it is major drawdowns, which hands a large bonus to any
+strategy that holds less stock. It answers "is this defensive?". `BROAD_WINDOWS`
+(10, via `--broad`) covers 2019–2026 continuously so bear periods appear in
+roughly the proportion they occurred, and it is the set to quote a mean from.
+Finding H exists because a conclusion was drawn from a mean over the regime set.
+
+Findings are written up in `docs/EDGE_INVESTIGATION_2026-09-08.md`. In short: over
+ten continuous windows the strategy returns **−24pp against simply holding the
+watchlist, beating it in 1 window of 10**. No feature set, label width, label
+horizon or allocation policy tested fixes that. **Nothing in production was
+changed as a result** — there was nothing better to ship. The conclusion is now
+enforced by the `beats_buy_and_hold` promotion-gate check rather than left in a
+document.
 
 ### `compare_models.py`
 Compares test-set metrics between the current model and the backup model.
