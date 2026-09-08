@@ -1,0 +1,47 @@
+name: Tests
+
+# Runs the pytest suite on every push and pull request to main.
+#
+# Why this exists: the suite was previously never executed by CI, and had
+# silently rotted into a collection failure (two declared-but-uninstalled
+# dependencies) that no one noticed because nothing ran it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # Installs the full production dependency set, not a test-only subset,
+      # so an import that would break the live pipeline breaks CI first.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # Guards against the specific failure this workflow was created for:
+      # a module that imports cleanly for the author but not from a bare
+      # checkout. Collect-only fails loudly on any import error.
+      - name: Verify test collection
+        run: python -m pytest tests/ --collect-only -q
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short
