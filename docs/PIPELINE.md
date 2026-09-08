@@ -829,6 +829,51 @@ Supports walk-forward split evaluation: the same simulation can be run on the
 training, validation, test, or full date ranges so performance on each period
 can be compared side-by-side.
 
+`--benchmark <split>` adds an equal-weight buy-and-hold arm and an SPY
+buy-and-hold arm over the same dates, with the same slippage and commission,
+through a shared `_summarise()`.
+
+**DESIGN DECISION:**
+Without a hold arm a positive backtest return says nothing — a rising market
+makes almost any long-biased strategy look profitable. The `train` and `full`
+splits print an IN-SAMPLE banner, because the model was fitted on those dates
+and their returns are memorisation, not performance.
+
+Usage:
+    python backtest.py                      # strategy only
+    python backtest.py --benchmark test     # strategy vs the hold arms
+
+### `edge_probe.py`
+Investigation tool, not part of the daily pipeline. Answers "does the model have
+edge at all?" — by scoring it against trivial baselines, and the strategy
+against buy-and-hold.
+
+Downloads 10y of history into `data/edge_probe/` and points `features.DATA_DIR`
+at it, so the live CSVs the next real training run reads are untouched. Writes
+`data/edge_probe_results.json`.
+
+| Mode | Question it answers |
+|------|---------------------|
+| (default) | Does more training history help? Test window held fixed while the lookback varies. |
+| `--features` | Which features carry signal? SHAP ranking, then retrain on the top K only. |
+| `--label-scales` | Does a wider HOLD band make the labels more learnable? |
+| `--regimes` | Does the strategy beat buy-and-hold walk-forward, across bull and bear windows? |
+| `--exposure` | Is the return deficit exposure or selection? Five allocation policies over one model per window. |
+
+**DESIGN DECISION:**
+Every `--exposure` arm is expressed as a rewrite of the signal frames and run
+through the same `backtest._simulate`, so slippage, commission, drawdown and
+accounting are identical across arms. A difference between arms therefore cannot
+be an artifact of the simulator. The regime arms use a 200-day SMA on SPY lagged
+one session — a timing rule that reads the close it trades on is the easiest way
+to manufacture an edge that is not there.
+
+Findings are written up in `docs/EDGE_INVESTIGATION_2026-09-08.md`. In short: the
+strategy does not beat buy-and-hold out of sample, the model changes that improve
+its classification metrics make returns worse, and sizing up doubles the
+shortfall. **Nothing in production was changed as a result** — there was nothing
+better to ship.
+
 ### `compare_models.py`
 Compares test-set metrics between the current model and the backup model.
 

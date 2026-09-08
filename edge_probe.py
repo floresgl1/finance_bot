@@ -35,6 +35,7 @@ Usage:
     python edge_probe.py --features               # SHAP ranking + top-K retrain
     python edge_probe.py --label-scales 1 1.5 2 3 # HOLD band width sweep
     python edge_probe.py --regimes                # RETURN vs buy-and-hold (decisive)
+    python edge_probe.py --exposure               # sizing + regime-filter arms
     python edge_probe.py --test-start 2026-05-20
     python edge_probe.py --lookbacks 1 3 5 10
     python edge_probe.py --refresh                # re-download the history
@@ -43,6 +44,7 @@ See docs/EDGE_INVESTIGATION_2026-09-08.md for what each mode found.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -421,34 +423,9 @@ def run_regime_benchmark(cols: list[str], scale: float,
 
     for name, (start_s, end_s) in windows.items():
         start, end = pd.Timestamp(start_s), pd.Timestamp(end_s)
-        train_mask = (combined.index >= start - pd.DateOffset(years=lookback_years)) & \
-                     (combined.index < start)
-        X_train, y_train = combined[train_mask][cols], combined[train_mask]["Signal"]
-        if len(X_train) < 500:
-            print(f"  {name}: only {len(X_train)} training rows, skipping")
-            continue
-
-        encoder = LabelEncoder()
-        model = XGBClassifier(**XGB_PARAMS, random_state=42)
-        model.fit(X_train, encoder.fit_transform(y_train))
-        classes = np.array(encoder.classes_)
-
-        ticker_data = {}
-        for ticker, df in per_ticker.items():
-            win = df[(df.index >= start) & (df.index <= end)]
-            if win.empty:
-                continue
-            proba = model.predict_proba(win[cols].values)
-            top_idx = np.argmax(proba, axis=1)
-            top_prob = proba[np.arange(len(proba)), top_idx]
-            signals = classes[top_idx].copy()
-            signals[top_prob < CONFIDENCE_THRESHOLD] = "HOLD"
-            out = win[["Close"]].copy()
-            out["Signal"] = signals
-            out["Confidence"] = top_prob
-            ticker_data[ticker] = out
-
-        if not ticker_data:
+        ticker_data = _window_signals(per_ticker, combined, cols, start, end,
+                                      lookback_years, label=name)
+        if ticker_data is None:
             continue
 
         dates = sorted(set().union(*[set(d.index) for d in ticker_data.values()]))
@@ -471,6 +448,251 @@ def run_regime_benchmark(cols: list[str], scale: float,
               f"{strat['n_trades']:>7} trades")
 
     return results
+
+
+def _window_signals(per_ticker: dict, combined: pd.DataFrame, cols: list[str],
+                    start: pd.Timestamp, end: pd.Timestamp,
+                    lookback_years: int, label: str = "") -> dict | None:
+    """Train on the `lookback_years` before `start`; emit signals inside the window.
+
+    Shared by the regime benchmark and the exposure probe so both score the same
+    model. The exposure probe then rewrites these frames rather than retraining,
+    which is what keeps its comparison about allocation policy and nothing else.
+    """
+    train_mask = (combined.index >= start - pd.DateOffset(years=lookback_years)) & \
+                 (combined.index < start)
+    X_train, y_train = combined[train_mask][cols], combined[train_mask]["Signal"]
+    if len(X_train) < 500:
+        print(f"  {label}: only {len(X_train)} training rows, skipping")
+        return None
+
+    encoder = LabelEncoder()
+    model = XGBClassifier(**XGB_PARAMS, random_state=42)
+    model.fit(X_train, encoder.fit_transform(y_train))
+    classes = np.array(encoder.classes_)
+
+    ticker_data = {}
+    for ticker, df in per_ticker.items():
+        win = df[(df.index >= start) & (df.index <= end)]
+        if win.empty:
+            continue
+        proba = model.predict_proba(win[cols].values)
+        top_idx = np.argmax(proba, axis=1)
+        top_prob = proba[np.arange(len(proba)), top_idx]
+        signals = classes[top_idx].copy()
+        signals[top_prob < CONFIDENCE_THRESHOLD] = "HOLD"
+        out = win[["Close"]].copy()
+        out["Signal"] = signals
+        out["Confidence"] = top_prob
+        ticker_data[ticker] = out
+
+    return ticker_data or None
+
+
+# ---------------------------------------------------------------------------
+# Exposure and regime-filter probe
+# ---------------------------------------------------------------------------
+#
+# `--regimes` established that the strategy loses to buy-and-hold out of sample,
+# and that improving the classifier made that worse. Two explanations were left
+# open, and this mode separates them:
+#
+#   (a) the deficit is EXPOSURE. Confidence-scaled sizing keeps the book near
+#       50% invested, so it structurally lags a 100%-invested basket. If that is
+#       the whole story, sizing up should close the gap.
+#   (b) the deficit is SELECTION. The names it picks underperform the basket, in
+#       which case sizing up makes the loss larger, not smaller.
+#
+# The regime arms add the control that matters: a 200-day SMA filter on SPY is a
+# one-line rule with no model in it. If "regime filter only" matches or beats
+# "regime + model", the model contributes nothing the filter does not.
+
+REGIME_SMA_WINDOW = 200
+
+# Equal-weight-ish full investment for the regime arms: every name, no cash buffer.
+_EQ_POSITION_PCT = 1.0 / max(len(WATCHLIST), 1)
+
+# label -> (policy, MAX_POSITION_PCT, MAX_TOTAL_EXPOSURE)
+EXPOSURE_ARMS = {
+    "shipped":             ("shipped",           0.20, 0.80),
+    "full-size buys":      ("full_size",         0.20, 0.80),
+    "full-size, 100% cap": ("full_size",         0.25, 1.00),
+    "regime filter only":  ("regime_only",       _EQ_POSITION_PCT, 1.00),
+    "regime + model":      ("regime_plus_model", _EQ_POSITION_PCT, 1.00),
+}
+
+
+def _spy_regime() -> pd.Series:
+    """Boolean 'risk-on' series: SPY above its 200-day simple moving average.
+
+    Lagged one session, so each day is allocated from the previous close. A
+    market-timing rule that reads the same close it trades on is the easiest way
+    to manufacture an edge that does not exist, so this one does not.
+    """
+    path = os.path.join(PROBE_MARKET_DIR, "SPY.csv")
+    spy = pd.read_csv(path)
+    spy["Date"] = pd.to_datetime(spy["Date"], errors="coerce", utc=True)
+    spy = spy.dropna(subset=["Date"]).set_index("Date")
+    spy.index = spy.index.tz_localize(None)
+    close = pd.to_numeric(spy["Close"], errors="coerce").dropna().sort_index()
+    sma = close.rolling(REGIME_SMA_WINDOW).mean()
+    # `fill_value` rather than a later fillna: shifting into NaN would promote
+    # the mask to object dtype, which pandas 3 no longer silently downcasts.
+    return (close > sma).shift(1, fill_value=False).astype(bool)
+
+
+def _apply_policy(ticker_data: dict, policy: str, risk_on: pd.Series) -> dict:
+    """Rewrite signal frames so each policy is expressible as different signals.
+
+    **DESIGN DECISION:**
+    Every arm runs through the same `backtest._simulate`, so slippage,
+    commission, drawdown and accounting are identical across them. Only which
+    rows say BUY, and how large each BUY is, changes. That rules out the
+    simulator itself as an explanation for any difference between arms.
+    """
+    out = {}
+    for ticker, df in ticker_data.items():
+        frame = df.copy()
+        if policy == "shipped":
+            pass
+        elif policy == "full_size":
+            # Confidence scales the position, so conf 1.0 means a full-size buy.
+            frame.loc[frame["Signal"] == "BUY", "Confidence"] = 1.0
+        elif policy in ("regime_only", "regime_plus_model"):
+            # Dates SPY has no row for fail safe to risk-off, i.e. to cash.
+            on = risk_on.reindex(frame.index, fill_value=False).astype(bool).to_numpy()
+            if policy == "regime_only":
+                frame["Signal"] = np.where(on, "BUY", "HOLD")
+                frame["Confidence"] = 1.0
+            else:
+                # Risk-on: hold the basket. Risk-off: defer to the model, which
+                # is the one condition it appeared to handle well.
+                frame["Signal"] = np.where(on, "BUY", frame["Signal"].to_numpy())
+                frame["Confidence"] = np.where(on, 1.0,
+                                               frame["Confidence"].to_numpy())
+        else:
+            raise ValueError(f"unknown policy: {policy!r}")
+        out[ticker] = frame
+    return out
+
+
+@contextlib.contextmanager
+def _sizing(max_position_pct: float, max_total_exposure: float):
+    """Temporarily override backtest.py's sizing caps, then restore them."""
+    import backtest as bt
+
+    previous = (bt.MAX_POSITION_PCT, bt.MAX_TOTAL_EXPOSURE)
+    bt.MAX_POSITION_PCT = max_position_pct
+    bt.MAX_TOTAL_EXPOSURE = max_total_exposure
+    try:
+        yield
+    finally:
+        bt.MAX_POSITION_PCT, bt.MAX_TOTAL_EXPOSURE = previous
+
+
+def run_exposure_probe(cols: list[str], scale: float,
+                       windows: dict | None = None,
+                       lookback_years: int = 3) -> dict:
+    """Walk-forward comparison of allocation policies over the regime windows."""
+    import backtest as bt
+
+    windows = windows or REGIME_WINDOWS
+    per_ticker = _build_per_ticker(scale)
+    combined = pd.concat(per_ticker.values()).sort_index()
+    risk_on = _spy_regime()
+    results = {}
+
+    for name, (start_s, end_s) in windows.items():
+        start, end = pd.Timestamp(start_s), pd.Timestamp(end_s)
+        base = _window_signals(per_ticker, combined, cols, start, end,
+                               lookback_years, label=name)
+        if base is None:
+            continue
+
+        dates = sorted(set().union(*[set(d.index) for d in base.values()]))
+        hold = bt._summarise(*bt._simulate_buy_and_hold(dates, base), dates, name)
+        on_pct = 100.0 * float(risk_on.reindex(dates, fill_value=False).mean())
+
+        print(f"\n  {name}  ({start.date()} to {end.date()})   "
+              f"hold {hold['total_return']:+.2f}%   risk-on {on_pct:.0f}% of days")
+        print(f"  {'arm':<22}{'return':>10}{'vs hold':>11}{'max DD':>10}"
+              f"{'exp':>7}{'trades':>8}")
+        print("  " + "-" * 68)
+
+        arms = {}
+        for label, (policy, max_pos, max_total) in EXPOSURE_ARMS.items():
+            ticker_data = _apply_policy(base, policy, risk_on)
+            with _sizing(max_pos, max_total):
+                stats = bt._summarise(*bt._simulate(dates, ticker_data), dates, name)
+            delta = stats["total_return"] - hold["total_return"]
+            arms[label] = {
+                "policy": policy,
+                "max_position_pct": max_pos,
+                "max_total_exposure": max_total,
+                "total_return": stats["total_return"],
+                "delta_pp": delta,
+                "max_drawdown": stats["max_drawdown"],
+                "avg_exposure": stats["avg_exposure"],
+                "n_trades": stats["n_trades"],
+            }
+            print(f"  {label:<22}{stats['total_return']:>9.2f}%{delta:>+10.2f}pp"
+                  f"{stats['max_drawdown']:>9.2f}%{stats['avg_exposure']:>6.0f}%"
+                  f"{stats['n_trades']:>8}")
+
+        results[name] = {
+            "window": f"{start.date()} to {end.date()}",
+            "hold_return": hold["total_return"],
+            "hold_max_drawdown": hold["max_drawdown"],
+            "risk_on_pct_of_days": on_pct,
+            "arms": arms,
+        }
+
+    return results
+
+
+def summarise_exposure(results: dict) -> str:
+    """Aggregate the arms across windows and say what the spread means."""
+    if not results:
+        return "\n  No windows produced results."
+
+    lines = ["", "  " + "=" * 68,
+             f"  {'arm':<22}{'windows beating hold':>22}{'mean vs hold':>16}",
+             "  " + "-" * 68]
+    means = {}
+    for label in EXPOSURE_ARMS:
+        deltas = [w["arms"][label]["delta_pp"] for w in results.values()
+                  if label in w["arms"]]
+        if not deltas:
+            continue
+        means[label] = float(np.mean(deltas))
+        wins = sum(1 for d in deltas if d > 0)
+        lines.append(f"  {label:<22}{f'{wins}/{len(deltas)}':>22}"
+                     f"{means[label]:>+15.2f}pp")
+    lines.append("  " + "=" * 68)
+
+    shipped = means.get("shipped")
+    full = means.get("full-size, 100% cap")
+    if shipped is not None and full is not None:
+        if full > shipped:
+            lines.append(f"  Sizing up helps ({shipped:+.2f}pp -> {full:+.2f}pp): part of")
+            lines.append("  the deficit was exposure, not selection.")
+        else:
+            lines.append(f"  Sizing up makes it WORSE ({shipped:+.2f}pp -> {full:+.2f}pp).")
+            lines.append("  The deficit is selection, not exposure -- more of these picks")
+            lines.append("  is more of the problem.")
+
+    only = means.get("regime filter only")
+    plus = means.get("regime + model")
+    if only is not None and plus is not None:
+        lines.append("")
+        if only >= plus:
+            lines.append(f"  A 200-day SMA filter with NO model ({only:+.2f}pp) matches or")
+            lines.append(f"  beats the same filter with the model layered on ({plus:+.2f}pp).")
+            lines.append("  The model adds nothing the filter does not already do.")
+        else:
+            lines.append(f"  The model adds {plus - only:+.2f}pp on top of the regime filter")
+            lines.append(f"  ({only:+.2f}pp -> {plus:+.2f}pp). Worth pursuing as an overlay.")
+    return "\n".join(lines)
 
 
 def _build_per_ticker(scale: float) -> dict:
@@ -516,6 +738,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Walk-forward RETURN benchmark vs buy-and-hold across bull and bear "
              "windows. This is the measurement that decides whether the strategy "
              "is worth running; classification metrics are a proxy for it.",
+    )
+    parser.add_argument(
+        "--exposure", action="store_true",
+        help="Compare allocation policies over the same regime windows: "
+             "confidence-scaled sizing (shipped) vs full-size buys vs a 200-day "
+             "SMA regime filter with and without the model. Separates an "
+             "exposure deficit from a selection deficit.",
     )
     parser.add_argument(
         "--features", action="store_true",
@@ -630,6 +859,18 @@ def main(argv: list[str] | None = None) -> int:
                   f"mean delta {np.mean(deltas):+.2f}pp")
         print()
         print("  A strategy with real edge beats holding across regimes, not in one.")
+    elif args.exposure:
+        print("\n=== Exposure and regime-filter probe (walk-forward) ===")
+        print("  All arms share one model per window and one simulator;")
+        print("  only the allocation policy differs.")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "exposure",
+            "config": "shipped (20 feat, 1.0x labels)",
+            "sma_window": REGIME_SMA_WINDOW,
+            "windows": run_exposure_probe(FEATURE_COLUMNS, 1.0),
+        }
+        print(summarise_exposure(results["windows"]))
     elif args.features:
         print("\n=== Feature probe (SHAP ranking + top-K retrain) ===")
         results = run_feature_probe(test_start)
