@@ -9,10 +9,31 @@ XGBoost requires integer class labels, so a LabelEncoder is fitted on the
 training labels and saved alongside the model in a single bundle:
     {"model": XGBClassifier, "encoder": LabelEncoder}
 predictor.py uses the encoder to decode predictions back to BUY/SELL/HOLD.
+
+Usage:
+    python trainer.py                       # interactive: prompts before
+                                            # touching config.py, overwrites
+                                            # the live model (with a backup)
+
+    python trainer.py --headless \
+        --output models/XG_Boost_candidate.joblib
+                                            # unattended: never prompts, never
+                                            # writes config.py, and leaves the
+                                            # live model untouched
+
+**DESIGN DECISION:**
+`--output` exists so a challenger can be trained without displacing the live
+champion. Before it, training always overwrote the production model and the
+comparison happened afterwards — a worse model was already trading by the time
+anyone looked. promote_model.py depends on being able to build a candidate
+off to the side and decide separately.
 """
 
+import argparse
 import os
 import re
+import shutil
+import sys
 import joblib
 import numpy as np
 import pandas as pd
@@ -144,8 +165,39 @@ def _print_confusion(cm: np.ndarray, labels: list[str]) -> None:
         print(f"act {actual_label:<4}  {cells}")
 
 
-def train() -> None:
-    """Build the dataset, train XGBoost with a LabelEncoder, and save the bundle."""
+def train(
+    *,
+    output_path: str | None = None,
+    headless: bool = False,
+    update_config: bool | None = None,
+    threshold: float | None = None,
+) -> dict:
+    """Build the dataset, train XGBoost with a LabelEncoder, and save the bundle.
+
+    Parameters
+    ----------
+    output_path
+        Where to write the model bundle. None writes to the live model path
+        (MODEL_DIR/MODEL_FILENAME) and backs the incumbent up first. Any other
+        value writes there and leaves the live model completely untouched — no
+        backup is taken because nothing was displaced.
+    headless
+        Never read from stdin. Required for CI and scheduled runs.
+    update_config
+        True writes the tuned threshold to config.py, False skips it, None asks
+        interactively. In headless mode None means skip: rewriting the source of
+        truth for the live bot is not a safe unattended default.
+    threshold
+        Skip validation tuning and use this value instead.
+
+    Returns
+    -------
+    dict with the tuned threshold, the path written, split sizes, and the
+    held-out test metrics — the inputs promote_model.py needs to decide.
+    """
+    if headless and update_config is None:
+        update_config = False
+
     print("=== Loading data ===")
     X, y = build_dataset()
 
@@ -175,14 +227,25 @@ def train() -> None:
     model.fit(X_train, y_train_enc)
     print("  Training complete.")
 
-    # --- Tune confidence threshold on validation set ---
-    print("\n=== Tuning confidence threshold on validation set ===")
-    best_threshold = tune_threshold(model, X_val, y_val, le)
-    print(f"\n  Best threshold: {best_threshold}  (maximises BUY F1 on validation)")
+    # --- Confidence threshold: tuned on validation, or supplied ---
+    if threshold is not None:
+        best_threshold = threshold
+        print(f"\n=== Using supplied confidence threshold: {best_threshold} ===")
+    else:
+        print("\n=== Tuning confidence threshold on validation set ===")
+        best_threshold = tune_threshold(model, X_val, y_val, le)
+        print(f"\n  Best threshold: {best_threshold}  (maximises BUY F1 on validation)")
 
-    # Persist the best threshold back to config.py so all modules use it
-    answer = input(f"\n  Update config.py with CONFIDENCE_THRESHOLD = {best_threshold}? [y/N] ").strip().lower()
-    if answer == "y":
+    # Persist the best threshold back to config.py so all modules use it.
+    # config.py is read by the live bot, so an unattended run never edits it
+    # without being told to explicitly.
+    if update_config is None:
+        answer = input(
+            f"\n  Update config.py with CONFIDENCE_THRESHOLD = {best_threshold}? [y/N] "
+        ).strip().lower()
+        update_config = answer == "y"
+
+    if update_config:
         update_config_threshold(best_threshold)
         print(f"  config.py updated: CONFIDENCE_THRESHOLD = {best_threshold}")
     else:
@@ -203,20 +266,102 @@ def train() -> None:
     print(classification_report(y_test, y_pred_thresh, target_names=labels, zero_division=0))
     _print_confusion(confusion_matrix(y_test, y_pred_thresh, labels=labels), labels)
 
+    test_report = classification_report(
+        y_test, y_pred_thresh,
+        labels=labels, target_names=labels,
+        output_dict=True, zero_division=0,
+    )
+
     # --- Save model bundle ---
     os.makedirs(MODEL_DIR, exist_ok=True)
-    model_path = os.path.join(MODEL_DIR, MODEL_FILENAME)
 
-    # Back up existing model before overwriting
-    if os.path.exists(model_path):
-        backup_path = os.path.join(MODEL_DIR, "XG_Boost_backup.joblib")
-        import shutil
-        shutil.copy2(model_path, backup_path)
-        print(f"\nExisting model backed up to {backup_path}")
+    if output_path is None:
+        # Live path: back the incumbent up before overwriting it.
+        model_path = os.path.join(MODEL_DIR, MODEL_FILENAME)
+        if os.path.exists(model_path):
+            backup_path = os.path.join(MODEL_DIR, "XG_Boost_backup.joblib")
+            shutil.copy2(model_path, backup_path)
+            print(f"\nExisting model backed up to {backup_path}")
+    else:
+        # Candidate path: nothing is displaced, so nothing is backed up.
+        model_path = output_path
+        parent = os.path.dirname(os.path.abspath(model_path))
+        os.makedirs(parent, exist_ok=True)
+        print(f"\nWriting candidate model — live model left untouched.")
 
     joblib.dump({"model": model, "encoder": le}, model_path)
     print(f"Model bundle saved to {model_path}")
 
+    return {
+        "threshold":   best_threshold,
+        "model_path":  model_path,
+        "n_train":     len(X_train),
+        "n_val":       len(X_val),
+        "n_test":      len(X_test),
+        "n_forced":    n_forced,
+        "test_report": test_report,
+        "config_updated": bool(update_config),
+    }
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train the XGBoost signal model.",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Never prompt. Implies --no-update-config unless --update-config is given.",
+    )
+    parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Write the model bundle here instead of the live model path. "
+            "The live model is left untouched."
+        ),
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Skip validation tuning and use this confidence threshold.",
+    )
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--update-config",
+        dest="update_config",
+        action="store_true",
+        default=None,
+        help="Write the tuned CONFIDENCE_THRESHOLD back to config.py.",
+    )
+    group.add_argument(
+        "--no-update-config",
+        dest="update_config",
+        action="store_false",
+        help="Leave config.py alone.",
+    )
+
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+
+    if args.threshold is not None and not (0.0 < args.threshold < 1.0):
+        print(f"[FATAL] --threshold must be between 0 and 1, got {args.threshold}")
+        return 1
+
+    train(
+        output_path=args.output,
+        headless=args.headless,
+        update_config=args.update_config,
+        threshold=args.threshold,
+    )
+    return 0
+
 
 if __name__ == "__main__":
-    train()
+    sys.exit(main())

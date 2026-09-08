@@ -1,0 +1,178 @@
+name: Retrain and Promote Model
+
+# Trains a challenger model and promotes it only if it beats the live champion
+# on a shared held-out test set. See promote_model.py for the gate itself.
+#
+# Why scheduled: the live model previously went 5+ months without a retrain
+# because retraining was a manual decision informed by edge_monitor.py alerts,
+# and that decision was never made. A monthly cadence makes "no promotion" an
+# explicit, logged outcome rather than an absence of action.
+#
+# Why monthly rather than weekly: the gate compares on the most recent 10% of
+# the dataset. Running it faster than that slice meaningfully changes just
+# re-decides on near-identical data and adds model churn.
+#
+# Neither data/ nor models/ is version-controlled, so this workflow rebuilds
+# the dataset from yfinance and pulls the live champion from PythonAnywhere.
+on:
+  schedule:
+    - cron: '0 6 1 * *'   # 06:00 UTC on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Evaluate and report only — never swap the model'
+        type: boolean
+        default: false
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ------------------------------------------------------------------
+      # Rebuild the training dataset from source. features.py reads only
+      # CSVs, so the dataset is fully determined by these two collectors.
+      # ------------------------------------------------------------------
+      - name: Collect ticker OHLCV data
+        run: python data_collector.py
+
+      - name: Collect market reference data
+        run: python market_data_collector.py
+
+      # ------------------------------------------------------------------
+      # Pull the live champion. A 404 is not fatal: promote_model.py treats
+      # a missing champion as a first promotion and decides on the absolute
+      # floors alone.
+      # ------------------------------------------------------------------
+      - name: Download champion model from PythonAnywhere
+        env:
+          PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+        run: |
+          python - <<'PYEOF'
+          import os
+          import sys
+
+          import requests
+
+          from config import MODEL_DIR, MODEL_FILENAME
+
+          token    = os.environ["PYTHONANYWHERE_TOKEN"]
+          username = os.environ["PYTHONANYWHERE_USERNAME"]
+          remote   = f"/home/{username}/finance_bot/{MODEL_DIR}{MODEL_FILENAME}"
+          local    = os.path.join(MODEL_DIR, MODEL_FILENAME)
+
+          os.makedirs(MODEL_DIR, exist_ok=True)
+
+          url  = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{remote}"
+          resp = requests.get(url, headers={"Authorization": f"Token {token}"}, timeout=60)
+
+          if resp.status_code == 404:
+              print("[INFO] No champion on PythonAnywhere — this will be a first promotion.")
+              sys.exit(0)
+
+          resp.raise_for_status()
+          with open(local, "wb") as fh:
+              fh.write(resp.content)
+          print(f"[OK] Downloaded champion ({len(resp.content):,} bytes) -> {local}")
+          PYEOF
+
+      # ------------------------------------------------------------------
+      # Train the challenger, score both models on one shared test split,
+      # and swap only on a pass. Exit 0 covers both PROMOTED and REJECTED —
+      # a rejection is a successful run, not a failure.
+      # ------------------------------------------------------------------
+      - name: Run promotion gate
+        id: gate
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python promote_model.py ${{ inputs.dry_run && '--dry-run' || '' }}
+          python - <<'PYEOF' >> "$GITHUB_OUTPUT"
+          import json
+          from config import PROMOTION_DECISION_PATH
+
+          with open(PROMOTION_DECISION_PATH) as fh:
+              decision = json.load(fh)
+
+          print(f"promoted={str(decision['promoted']).lower()}")
+          print(f"summary={decision['summary']}")
+          PYEOF
+
+      # ------------------------------------------------------------------
+      # A promotion is only real once PythonAnywhere has the new file —
+      # that is where live_trader.py loads the model from.
+      # ------------------------------------------------------------------
+      - name: Upload promoted model to PythonAnywhere
+        if: steps.gate.outputs.promoted == 'true' && !inputs.dry_run
+        env:
+          PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+        run: |
+          python - <<'PYEOF'
+          import os
+          import sys
+
+          import requests
+
+          from config import MODEL_DIR, MODEL_FILENAME
+
+          token    = os.environ["PYTHONANYWHERE_TOKEN"]
+          username = os.environ["PYTHONANYWHERE_USERNAME"]
+          local    = os.path.join(MODEL_DIR, MODEL_FILENAME)
+          remote   = f"/home/{username}/finance_bot/{MODEL_DIR}{MODEL_FILENAME}"
+          url      = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{remote}"
+
+          with open(local, "rb") as fh:
+              resp = requests.post(
+                  url,
+                  headers={"Authorization": f"Token {token}"},
+                  files={"content": fh},
+                  timeout=120,
+              )
+
+          if resp.status_code in (200, 201):
+              print(f"[OK] Promoted model uploaded -> {remote}")
+          else:
+              print(f"[ERROR] HTTP {resp.status_code}: {resp.text.strip()}")
+              sys.exit(1)
+          PYEOF
+
+      # ------------------------------------------------------------------
+      # Keep the superseded champion as a build artifact so a bad promotion
+      # can be rolled back even though models/ is gitignored.
+      # ------------------------------------------------------------------
+      - name: Upload archived champion as an artifact
+        if: steps.gate.outputs.promoted == 'true' && !inputs.dry_run
+        uses: actions/upload-artifact@v4
+        with:
+          name: superseded-champion-${{ github.run_id }}
+          path: models/archive/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d "{\"content\": \"🚨 **RETRAIN WORKFLOW FAILED** — the promotion gate did not reach a decision. The live model is unchanged.\nRepository: ${{ github.repository }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\nTimestamp: $(date -u)\"}" \
+               "$DISCORD_WEBHOOK_URL"

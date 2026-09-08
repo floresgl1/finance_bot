@@ -167,6 +167,39 @@ EDGE_STALENESS_DAYS     = 10          # if most recent WIN/LOSS evaluation older
 EDGE_WINDOW_SIZE        = 30          # rolling window over last N evaluated BUYs
 EDGE_MONITOR_STATE_PATH = "data/edge_monitor_state.json"
 
+# --- Model promotion gate (promote_model.py) --------------------------------
+# A retrained "challenger" never replaces the live "champion" on the strength of
+# being newer. It must beat the champion on the same held-out test set, by a
+# margin, and clear absolute floors. Every threshold below is a reason to REJECT;
+# the gate defaults to keeping the incumbent whenever a check cannot be made.
+
+CANDIDATE_MODEL_FILENAME = "XG_Boost_candidate.joblib"
+MODEL_ARCHIVE_DIR        = os.path.join(MODEL_DIR, "archive")
+
+# Challenger must beat champion BUY F1 by at least this much. A margin rather
+# than a tie-break: retraining costs a model of known live behaviour, so a
+# statistically indistinguishable improvement is not worth the swap.
+PROMOTION_MIN_BUY_F1_IMPROVEMENT = 0.01
+
+# Absolute floors the challenger must clear regardless of how poor the champion
+# looks. Guards against promoting a bad model simply because the incumbent
+# decayed further.
+PROMOTION_MIN_BUY_PRECISION = 0.35
+PROMOTION_MIN_BUY_RECALL    = 0.10
+
+# Minimum number of true BUY rows in the test set. Below this the comparison is
+# noise and the gate refuses to decide rather than guessing.
+PROMOTION_MIN_TEST_BUY_SUPPORT = 30
+
+# Retention for models/archive/. Superseded champions are kept so a bad
+# promotion can be rolled back by hand.
+MODEL_ARCHIVE_RETAIN = 10
+
+# Where promote_model.py records what it decided. The candidate file is
+# consumed on both outcomes (moved on promotion, deleted on rejection), so CI
+# cannot infer the result from the filesystem and reads this instead.
+PROMOTION_DECISION_PATH = os.path.join(MODEL_DIR, "promotion_decision.json")
+
 # Technical indicator columns used as model input features.
 # Must stay in sync with the columns produced by features.add_features().
 FEATURE_COLUMNS = [
