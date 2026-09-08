@@ -21,10 +21,13 @@ from edge_probe import (
     EXPOSURE_ARMS,
     REGIME_SMA_WINDOW,
     _apply_policy,
+    _label_window,
+    _relabel,
     _sizing,
     _spy_regime,
     _window_signals,
     summarise_exposure,
+    summarise_horizons,
 )
 
 
@@ -361,3 +364,188 @@ def test_summary_is_ascii_only():
     results = _exposure_results([-3.7, 1.0], [-7.2, -7.2], [-3.6, -3.6], [-5.0, -5.0])
 
     summarise_exposure(results).encode("ascii")   # must not raise
+
+
+# --- label horizon ---------------------------------------------------------
+#
+# labels._WINDOW drives three things at once: the SPY forward return, the stock
+# forward return, and how many unlabelable tail rows get dropped. They have to
+# move together or the label compares returns over mismatched windows.
+
+
+def test_label_window_sets_and_restores_the_module_constant():
+    import labels
+
+    before = labels._WINDOW
+
+    with _label_window(21) as active:
+        assert active == 21
+        assert labels._WINDOW == 21
+
+    assert labels._WINDOW == before
+
+
+def test_label_window_restores_after_an_exception():
+    """A horizon that blows up must not leave its window behind for the next
+    one -- that would silently mislabel every later horizon."""
+    import labels
+
+    before = labels._WINDOW
+
+    with pytest.raises(RuntimeError):
+        with _label_window(14):
+            raise RuntimeError("build failed")
+
+    assert labels._WINDOW == before
+
+
+def test_label_window_of_none_is_a_no_op():
+    import labels
+
+    with _label_window(None) as active:
+        assert active == labels._WINDOW == 7
+
+
+def _labelled_frame(n: int = 40, end: float = 140.0) -> pd.DataFrame:
+    """A frame shaped like add_labels() output, with a steady climb.
+
+    `end` sets how steep the climb is, which is what decides whether a given
+    threshold is crossed. The default clears even a widened band; the scale
+    test below uses a gentler slope so widening can actually bite.
+    """
+    idx = pd.bdate_range(start="2024-01-01", periods=n)
+    return pd.DataFrame(
+        {"Close": np.linspace(100.0, end, n),
+         "spy_return_7d": [0.0] * n,
+         "threshold": [0.01] * n,
+         "Signal": ["HOLD"] * n},
+        index=idx,
+    )
+
+
+def test_relabel_defaults_to_the_active_label_window():
+    """The spy_return column holds a forward return over whatever window
+    produced it; a hardcoded 7 would compare mismatched horizons."""
+    frame = _labelled_frame()
+
+    with _label_window(21):
+        long_window = _relabel(frame, 1.0)
+    short_window = _relabel(frame, 1.0, window=3)
+
+    assert not long_window["Signal"].equals(short_window["Signal"])
+
+
+def test_relabel_honours_an_explicit_window():
+    frame = _labelled_frame()
+
+    explicit = _relabel(frame, 1.0, window=21)
+    with _label_window(21):
+        implicit = _relabel(frame, 1.0)
+
+    pd.testing.assert_series_equal(explicit["Signal"], implicit["Signal"])
+
+
+def test_a_wider_threshold_scale_produces_more_holds():
+    # A ~2.5% forward return over the window: above the 1% band, below 5x it.
+    frame = _labelled_frame(end=114.0)
+
+    narrow = _relabel(frame, 1.0, window=7)
+    wide = _relabel(frame, 5.0, window=7)
+
+    assert (wide["Signal"] == "HOLD").sum() > (narrow["Signal"] == "HOLD").sum()
+
+
+# --- summarise_horizons ----------------------------------------------------
+
+
+def _horizon_results(rows: dict) -> dict:
+    """rows: {horizon_days: (mean_delta_pp, windows_beating_hold)}"""
+    return {
+        f"horizon_{days}": {
+            "horizon_days": days,
+            "mean_delta_pp": mean,
+            "windows_beating_hold": wins,
+            "n_windows": 4,
+        }
+        for days, (mean, wins) in rows.items()
+    }
+
+
+def test_horizon_summary_reports_nothing_to_summarise():
+    assert "No horizon" in summarise_horizons({})
+
+
+def test_horizon_summary_says_when_no_window_beats_holding():
+    """The expected outcome given findings A, E and F, and the one most likely
+    to be glossed over."""
+    out = summarise_horizons(_horizon_results({3: (-5.0, 1), 7: (-3.7, 1)}))
+
+    assert "No horizon beats holding" in out
+
+
+def test_horizon_summary_flags_a_better_window_than_the_shipped_one():
+    out = summarise_horizons(_horizon_results({7: (-3.7, 1), 21: (2.5, 3)}))
+
+    assert "21-day labels beat holding" in out
+    assert "walk-forward confirmation" in out
+
+
+def test_horizon_summary_credits_the_shipped_window_when_it_wins():
+    out = summarise_horizons(_horizon_results({7: (1.5, 3), 21: (-2.0, 1)}))
+
+    assert "shipped 7-day horizon is the best" in out
+
+
+def test_horizon_summary_orders_best_first():
+    out = summarise_horizons(_horizon_results({3: (-8.0, 0), 7: (-1.0, 2), 14: (-4.0, 1)}))
+
+    body = out.split("-" * 68)[1]
+    assert body.index("7 days") < body.index("14 days") < body.index("3 days")
+
+
+def test_horizon_summary_is_ascii_only():
+    out = summarise_horizons(_horizon_results({3: (-8.0, 0), 7: (-1.0, 2)}))
+
+    out.encode("ascii")
+
+
+# --- window sets -----------------------------------------------------------
+#
+# REGIME_WINDOWS is half drawdowns by construction, which flatters any strategy
+# that holds less stock. BROAD_WINDOWS is the control, so its shape matters:
+# a gap or an overlap would quietly reintroduce the same weighting problem.
+
+
+def test_broad_windows_are_chronological():
+    from edge_probe import BROAD_WINDOWS
+
+    for name, (start, end) in BROAD_WINDOWS.items():
+        assert pd.Timestamp(start) < pd.Timestamp(end), name
+
+
+def test_broad_windows_do_not_overlap():
+    from edge_probe import BROAD_WINDOWS
+
+    spans = sorted((pd.Timestamp(s), pd.Timestamp(e))
+                   for s, e in BROAD_WINDOWS.values())
+    for (_, prev_end), (next_start, _) in zip(spans, spans[1:]):
+        assert prev_end < next_start
+
+
+def test_broad_windows_leave_room_for_the_training_lookback():
+    """Each window trains on the three years before it, and the probe history
+    is ten years. A window starting too early silently trains on less."""
+    from edge_probe import BROAD_WINDOWS
+
+    earliest = min(pd.Timestamp(s) for s, _ in BROAD_WINDOWS.values())
+    assert earliest >= pd.Timestamp("2019-09-01")
+
+
+def test_broad_windows_are_mostly_not_drawdowns():
+    """The point of the set: bear periods in roughly the proportion they
+    occurred, rather than two out of four."""
+    from edge_probe import BROAD_WINDOWS
+
+    drawdowns = {"covid crash 2020", "bear 2022"}
+    assert len(BROAD_WINDOWS) >= 8
+    assert len(drawdowns) / len(BROAD_WINDOWS) < 0.3

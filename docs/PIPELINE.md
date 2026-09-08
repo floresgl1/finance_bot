@@ -925,6 +925,8 @@ at it, so the live CSVs the next real training run reads are untouched. Writes
 | `--label-scales` | Does a wider HOLD band make the labels more learnable? |
 | `--regimes` | Does the strategy beat buy-and-hold walk-forward, across bull and bear windows? |
 | `--exposure` | Is the return deficit exposure or selection? Five allocation policies over one model per window. |
+| `--horizons` | Does the forward-return label window matter? Re-labels and re-benchmarks at 3/5/7/14/21 days. |
+| `--broad` | Modifier. Swaps the four regime windows for ten continuous ones. |
 
 **DESIGN DECISION:**
 Every `--exposure` arm is expressed as a rewrite of the signal frames and run
@@ -934,11 +936,21 @@ be an artifact of the simulator. The regime arms use a 200-day SMA on SPY lagged
 one session — a timing rule that reads the close it trades on is the easiest way
 to manufacture an edge that is not there.
 
-Findings are written up in `docs/EDGE_INVESTIGATION_2026-09-08.md`. In short: the
-strategy does not beat buy-and-hold out of sample, the model changes that improve
-its classification metrics make returns worse, and sizing up doubles the
-shortfall. **Nothing in production was changed as a result** — there was nothing
-better to ship.
+**DESIGN DECISION — two window sets, and only one of them may be averaged.**
+`REGIME_WINDOWS` (4) is deliberately regime-spanning and therefore deliberately
+unrepresentative: half of it is major drawdowns, which hands a large bonus to any
+strategy that holds less stock. It answers "is this defensive?". `BROAD_WINDOWS`
+(10, via `--broad`) covers 2019–2026 continuously so bear periods appear in
+roughly the proportion they occurred, and it is the set to quote a mean from.
+Finding H exists because a conclusion was drawn from a mean over the regime set.
+
+Findings are written up in `docs/EDGE_INVESTIGATION_2026-09-08.md`. In short: over
+ten continuous windows the strategy returns **−24pp against simply holding the
+watchlist, beating it in 1 window of 10**. No feature set, label width, label
+horizon or allocation policy tested fixes that. **Nothing in production was
+changed as a result** — there was nothing better to ship. The conclusion is now
+enforced by the `beats_buy_and_hold` promotion-gate check rather than left in a
+document.
 
 ### `compare_models.py`
 Compares test-set metrics between the current model and the backup model.

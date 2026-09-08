@@ -36,6 +36,8 @@ Usage:
     python edge_probe.py --label-scales 1 1.5 2 3 # HOLD band width sweep
     python edge_probe.py --regimes                # RETURN vs buy-and-hold (decisive)
     python edge_probe.py --exposure               # sizing + regime-filter arms
+    python edge_probe.py --horizons 3 7 14 21     # forward-return label window
+    python edge_probe.py --horizons 3 7 21 --broad  # over 10 windows, not 4
     python edge_probe.py --test-start 2026-05-20
     python edge_probe.py --lookbacks 1 3 5 10
     python edge_probe.py --refresh                # re-download the history
@@ -143,17 +145,25 @@ def build_probe_dataset(threshold_scale: float = 1.0) -> tuple[pd.DataFrame, pd.
     return combined[FEATURE_COLUMNS], combined["Signal"]
 
 
-def _relabel(df: pd.DataFrame, scale: float) -> pd.DataFrame:
+def _relabel(df: pd.DataFrame, scale: float, window: int | None = None) -> pd.DataFrame:
     """Re-derive Signal from a scaled threshold.
 
     add_labels() leaves `threshold` and the inputs on the frame, so the
     relative return it compared against can be recovered rather than
     recomputed -- which keeps this consistent with labels.py by construction
     instead of by a duplicated formula that could drift.
+
+    `window` defaults to labels._WINDOW rather than a literal 7: the
+    `spy_return_7d` column holds a forward return over whatever window produced
+    it, and comparing a 7-day stock return against a 14-day SPY return would be
+    silently wrong.
     """
+    import labels as labels_mod
+
+    window = labels_mod._WINDOW if window is None else window
     df = df.copy()
-    stock_return_7d = df["Close"].pct_change(7).shift(-7)
-    relative = stock_return_7d - df["spy_return_7d"]
+    stock_return = df["Close"].pct_change(window).shift(-window)
+    relative = stock_return - df["spy_return_7d"]
     scaled = df["threshold"] * scale
 
     df["Signal"] = np.select(
@@ -399,10 +409,37 @@ REGIME_WINDOWS = {
     "recent 2026":      ("2026-05-29", "2026-09-08"),
 }
 
+# REGIME_WINDOWS is deliberately regime-spanning, which makes it deliberately
+# unrepresentative: two of its four windows are major drawdowns. That is the
+# right sample for asking "is this defensive?" and the WRONG sample for a mean,
+# because it hands a large bonus to any strategy that simply holds less stock.
+# Finding F showed exactly that trap.
+#
+# BROAD_WINDOWS covers the same decade continuously, so bear periods appear in
+# roughly the proportion they actually occurred. A result that survives both
+# window sets is about the strategy; one that only survives REGIME_WINDOWS is
+# about exposure.
+#
+# Nothing starts before late 2019: each window trains on the three years before
+# it, and the probe history only reaches back ten years.
+BROAD_WINDOWS = {
+    "late 2019 bull":      ("2019-09-01", "2019-12-31"),
+    "covid crash 2020":    ("2020-02-15", "2020-04-30"),
+    "covid recovery 2020": ("2020-05-01", "2020-12-31"),
+    "bull 2021":           ("2021-01-01", "2021-12-31"),
+    "bear 2022":           ("2022-01-01", "2022-10-31"),
+    "recovery 2023":       ("2023-01-01", "2023-12-31"),
+    "bull 2024":           ("2024-01-01", "2024-12-31"),
+    "choppy 2025":         ("2025-01-01", "2025-11-06"),
+    "rally 2025-26":       ("2025-11-07", "2026-05-28"),
+    "recent 2026":         ("2026-05-29", "2026-09-08"),
+}
+
 
 def run_regime_benchmark(cols: list[str], scale: float,
                          windows: dict | None = None,
-                         lookback_years: int = 3) -> dict:
+                         lookback_years: int = 3,
+                         per_ticker: dict | None = None) -> dict:
     """Walk-forward return benchmark against buy-and-hold, across regimes.
 
     Per window: train on the `lookback_years` immediately before it, generate
@@ -417,7 +454,8 @@ def run_regime_benchmark(cols: list[str], scale: float,
     import backtest as bt
 
     windows = windows or REGIME_WINDOWS
-    per_ticker = _build_per_ticker(scale)
+    if per_ticker is None:
+        per_ticker = _build_per_ticker(scale)
     combined = pd.concat(per_ticker.values()).sort_index()
     results = {}
 
@@ -695,7 +733,29 @@ def summarise_exposure(results: dict) -> str:
     return "\n".join(lines)
 
 
-def _build_per_ticker(scale: float) -> dict:
+@contextlib.contextmanager
+def _label_window(window: int | None):
+    """Temporarily change the forward-return horizon labels.py labels on.
+
+    labels._WINDOW drives three things at once -- the SPY forward return, the
+    stock forward return, and how many unlabelable tail rows get dropped -- so
+    patching the module constant is the only way to move all three together.
+    """
+    import labels as labels_mod
+
+    if window is None:
+        yield labels_mod._WINDOW
+        return
+
+    previous = labels_mod._WINDOW
+    labels_mod._WINDOW = window
+    try:
+        yield window
+    finally:
+        labels_mod._WINDOW = previous
+
+
+def _build_per_ticker(scale: float, window: int | None = None) -> dict:
     """Per-ticker featured+labelled frames from the probe data."""
     import features
     import labels as labels_mod
@@ -707,13 +767,105 @@ def _build_per_ticker(scale: float) -> dict:
     labels_mod._VIX_PATH = os.path.join(PROBE_MARKET_DIR, "^VIX.csv")
 
     out = {}
-    for ticker in WATCHLIST:
-        try:
-            df = labels_mod.add_labels(features.load_and_process(ticker))
-            out[ticker] = _relabel(df, scale) if scale != 1.0 else df
-        except Exception as exc:
-            print(f"  {ticker}: FAILED {exc}")
+    with _label_window(window):
+        for ticker in WATCHLIST:
+            try:
+                df = labels_mod.add_labels(features.load_and_process(ticker))
+                out[ticker] = _relabel(df, scale) if scale != 1.0 else df
+            except Exception as exc:
+                print(f"  {ticker}: FAILED {exc}")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Label horizon probe
+# ---------------------------------------------------------------------------
+#
+# The 7-day forward return in labels.py was chosen once and never tested. It
+# decides what the word "signal" means here more than any feature does: too
+# short and the label is mostly microstructure noise, too long and the model is
+# asked to forecast something no daily technical indicator carries.
+#
+# **DESIGN DECISION:**
+# Measured on RETURNS, not on classification metrics. Finding E showed a
+# configuration with a clearly better classification edge producing worse
+# returns, so a horizon sweep scored on accuracy would repeat that mistake.
+
+DEFAULT_HORIZONS = [3, 5, 7, 14, 21]
+
+
+def run_horizon_probe(horizons: list[int], cols: list[str] | None = None,
+                      windows: dict | None = None,
+                      lookback_years: int = 3) -> dict:
+    """Re-label at each forward horizon and re-run the walk-forward benchmark."""
+    cols = cols or FEATURE_COLUMNS
+    results = {}
+
+    for horizon in horizons:
+        per_ticker = _build_per_ticker(1.0, window=horizon)
+        if not per_ticker:
+            print(f"  horizon {horizon}d: no tickers built, skipping")
+            continue
+
+        signals = pd.concat([df["Signal"] for df in per_ticker.values()])
+        dist = signals.value_counts(normalize=True) * 100
+
+        print(f"\n  horizon {horizon}d  "
+              f"(BUY {dist.get('BUY', 0):.1f}%  "
+              f"HOLD {dist.get('HOLD', 0):.1f}%  "
+              f"SELL {dist.get('SELL', 0):.1f}%)")
+        print(f"  {'window':<20}{'strategy':>10}{'hold':>11}{'delta':>11}")
+
+        per_window = run_regime_benchmark(
+            cols, 1.0, windows=windows,
+            lookback_years=lookback_years, per_ticker=per_ticker,
+        )
+        if not per_window:
+            continue
+
+        deltas = [r["delta_pp"] for r in per_window.values()]
+        results[f"horizon_{horizon}"] = {
+            "horizon_days": horizon,
+            "distribution_pct": {k: float(v) for k, v in dist.items()},
+            "windows": per_window,
+            "mean_delta_pp": float(np.mean(deltas)),
+            "windows_beating_hold": sum(1 for d in deltas if d > 0),
+            "n_windows": len(deltas),
+        }
+
+    return results
+
+
+def summarise_horizons(results: dict) -> str:
+    """Rank the horizons and say whether any of them clears buy-and-hold."""
+    if not results:
+        return "\n  No horizon produced results."
+
+    lines = ["", "  " + "=" * 68,
+             f"  {'label horizon':<20}{'windows beating hold':>24}{'mean vs hold':>16}",
+             "  " + "-" * 68]
+    for res in sorted(results.values(), key=lambda r: -r["mean_delta_pp"]):
+        wins = f"{res['windows_beating_hold']}/{res['n_windows']}"
+        lines.append(f"  {str(res['horizon_days']) + ' days':<20}{wins:>24}"
+                     f"{res['mean_delta_pp']:>+15.2f}pp")
+    lines.append("  " + "=" * 68)
+
+    best = max(results.values(), key=lambda r: r["mean_delta_pp"])
+    shipped = results.get("horizon_7")
+
+    if best["mean_delta_pp"] <= 0:
+        lines.append("  No horizon beats holding the basket. The label window was not")
+        lines.append("  the binding constraint either.")
+    elif shipped and best["horizon_days"] != shipped["horizon_days"]:
+        lines.append(f"  {best['horizon_days']}-day labels beat holding "
+                     f"({best['mean_delta_pp']:+.2f}pp) where the shipped 7-day "
+                     f"labels do not")
+        lines.append(f"  ({shipped['mean_delta_pp']:+.2f}pp). Worth a walk-forward "
+                     f"confirmation before acting on it.")
+    else:
+        lines.append(f"  The shipped 7-day horizon is the best of those tested "
+                     f"({best['mean_delta_pp']:+.2f}pp).")
+    return "\n".join(lines)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -745,6 +897,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "confidence-scaled sizing (shipped) vs full-size buys vs a 200-day "
              "SMA regime filter with and without the model. Separates an "
              "exposure deficit from a selection deficit.",
+    )
+    parser.add_argument(
+        "--horizons", type=int, nargs="+", default=None, metavar="DAYS",
+        help="Re-label at each forward-return horizon and re-run the "
+             "walk-forward return benchmark. The 7-day window in labels.py was "
+             "never tested. Example: --horizons 3 5 7 14 21",
+    )
+    parser.add_argument(
+        "--broad", action="store_true",
+        help="Use BROAD_WINDOWS (10 continuous windows) instead of the four "
+             "regime windows. REGIME_WINDOWS is half drawdowns by design, which "
+             "flatters any strategy that holds less stock; this is the control.",
     )
     parser.add_argument(
         "--features", action="store_true",
@@ -833,8 +997,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"=== Downloading {PROBE_HISTORY} history into {PROBE_DIR} ===")
     download_history(refresh=args.refresh)
 
+    window_set = BROAD_WINDOWS if args.broad else REGIME_WINDOWS
+    window_label = "broad (10 windows)" if args.broad else "regime (4 windows)"
+
     if args.regimes:
-        print("\n=== Regime benchmark: strategy vs buy-and-hold (walk-forward) ===")
+        print(f"\n=== Regime benchmark: strategy vs buy-and-hold "
+              f"(walk-forward, {window_label}) ===")
         configs = {
             "shipped (20 feat, 1.0x labels)": (FEATURE_COLUMNS, 1.0),
             "top-5 feat + 1.5x labels":       (TOP5_FEATURES, 1.5),
@@ -842,12 +1010,14 @@ def main(argv: list[str] | None = None) -> int:
         results = {
             "generated_utc": datetime.now(timezone.utc).isoformat(),
             "mode": "regimes",
+            "window_set": window_label,
             "configs": {},
         }
         for label, (cols, scale) in configs.items():
             print(f"\n  {label}")
             print(f"  {'window':<20}{'strategy':>10}{'hold':>11}{'delta':>11}")
-            results["configs"][label] = run_regime_benchmark(cols, scale)
+            results["configs"][label] = run_regime_benchmark(
+                cols, scale, windows=window_set)
 
         print()
         for label, res in results["configs"].items():
@@ -868,9 +1038,23 @@ def main(argv: list[str] | None = None) -> int:
             "mode": "exposure",
             "config": "shipped (20 feat, 1.0x labels)",
             "sma_window": REGIME_SMA_WINDOW,
-            "windows": run_exposure_probe(FEATURE_COLUMNS, 1.0),
+            "window_set": window_label,
+            "windows": run_exposure_probe(FEATURE_COLUMNS, 1.0,
+                                          windows=window_set),
         }
         print(summarise_exposure(results["windows"]))
+    elif args.horizons:
+        print(f"\n=== Label horizon probe (walk-forward returns, "
+              f"{window_label}) ===")
+        print("  Scored on returns, not accuracy - finding E showed those "
+              "disagree.")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "horizons",
+            "window_set": window_label,
+            "horizons": run_horizon_probe(args.horizons, windows=window_set),
+        }
+        print(summarise_horizons(results["horizons"]))
     elif args.features:
         print("\n=== Feature probe (SHAP ranking + top-K retrain) ===")
         results = run_feature_probe(test_start)

@@ -386,17 +386,147 @@ It does not repeat. In 2022 it gave **no** drawdown protection whatsoever
 (−34.50% against −34.29% for holding) while losing an extra 4.41pp. A defensive
 property that appears in one crash and vanishes in the next is not a property.
 
+## G. The label horizon — the last untested assumption
+
+`python edge_probe.py --horizons 3 5 7 14 21`
+
+`labels._WINDOW = 7` was chosen once and never questioned. It decides what the
+word "signal" means here more than any feature does: too short and the label is
+mostly microstructure noise, too long and the model is asked to forecast
+something no daily technical indicator carries.
+
+Scored on **returns**, not accuracy — finding E showed those two disagree, so a
+horizon sweep judged on classification would repeat that mistake. Each horizon
+re-labels the whole dataset (`labels._WINDOW` drives the SPY forward return, the
+stock forward return, and the tail-row drop together) and re-runs the same
+walk-forward benchmark.
+
+### On the four regime windows, this looked like the answer
+
+| Horizon | BUY / HOLD / SELL | Windows beating hold | Mean vs hold |
+|---|---|---|---|
+| 3 days | 28 / 46 / 26 | 2/4 | **+5.29pp** |
+| 21 days | 45 / 17 / 39 | 3/4 | +3.11pp |
+| 5 days | 33 / 36 / 31 | 3/4 | +1.27pp |
+| 14 days | 42 / 20 / 38 | 1/4 | +0.89pp |
+| **7 days (shipped)** | 37 / 30 / 34 | 1/4 | **−3.71pp** |
+
+Four of five horizons beat buy-and-hold, and the shipped one was the worst of
+them. That was the first positive result in the entire investigation.
+
+It is also wrong.
+
+## H. The window set was the bug
+
+The four windows in `REGIME_WINDOWS` were chosen to span regimes — COVID, the
+2022 bear, a rally, and recent data. That is the right sample for asking *"is
+this defensive?"* and the **wrong sample for a mean**, because two of the four
+are major drawdowns. Any strategy that simply holds less stock collects a large
+bonus. Finding F identified that trap and then walked straight into it.
+
+`BROAD_WINDOWS` covers the same decade continuously in ten windows, so bear
+periods appear roughly in the proportion they actually occurred. Nothing starts
+before late 2019, because each window trains on the three years before it and
+the probe history reaches back ten.
+
+### G, re-run on ten windows
+
+| Horizon | Windows beating hold | Mean vs hold | Mean exposure |
+|---|---|---|---|
+| 14 days | 2/10 | −14.23pp | 51% |
+| 21 days | 3/10 | −16.81pp | 56% |
+| **7 days (shipped)** | 1/10 | −24.09pp | 46% |
+| 3 days | 2/10 | **−24.37pp** | 19% |
+| 5 days | 3/10 | −25.35pp | 35% |
+
+**Every horizon loses, by 14 to 25 percentage points, and the ranking inverts.**
+The 3-day horizon goes from best (+5.29pp) to nearly worst (−24.37pp).
+
+The mechanism is visible in the exposure column. 3-day labels run at 12–23%
+invested. In a sample that is half crashes, holding almost nothing is a winning
+strategy. In a sample that looks like the actual decade, it means returning
+−2.13% while the basket made +69.66% (COVID recovery) and +5.58% while the
+basket made +75.20% (2023).
+
+| 3-day labels | strategy | hold | delta | exposure |
+|---|---|---|---|---|
+| covid crash 2020 | +15.01% | −5.52% | **+20.52pp** | 41% |
+| bear 2022 | −7.47% | −29.00% | **+21.53pp** | 23% |
+| covid recovery 2020 | −2.13% | +69.66% | −71.79pp | 15% |
+| recovery 2023 | +5.58% | +75.20% | −69.63pp | 14% |
+| bull 2024 | −13.11% | +43.33% | −56.44pp | 20% |
+
+The two wins are the two crashes. Everything else is a catastrophe.
+
+### E, revised
+
+The shipped configuration measured over ten windows instead of four:
+
+| | Windows beating hold | Mean vs hold |
+|---|---|---|
+| Finding E (4 regime windows) | 1/4 | −3.71pp |
+| **Corrected (10 broad windows)** | **1/10** | **−24.09pp** |
+
+The conclusion does not change. Its magnitude gets six times worse. The −3.71pp
+figure was itself flattered by the bear-weighted sample.
+
+### F, corrected — the deficit is BOTH, not selection alone
+
+`python edge_probe.py --exposure --broad`
+
+| Arm | 4 regime windows | 10 broad windows | Mean exposure |
+|---|---|---|---|
+| shipped | −3.71pp | −24.09pp | 46% |
+| full-size buys | −7.18pp | −20.10pp | 74% |
+| full-size, 100% cap | −7.25pp | **−17.87pp** | 87% |
+| regime filter only | −3.66pp | **−9.08pp** | 80% |
+| regime + model | −5.07pp | −10.77pp | 80% |
+
+**Finding F's headline was wrong.** On four bear-weighted windows, sizing up
+made things worse and the conclusion was "the deficit is selection, not
+exposure." On ten representative windows, sizing up *helps* — −24.09pp to
+−17.87pp.
+
+The honest version: the ~24pp shortfall is roughly **6pp of exposure and 18pp of
+selection**. Running at 46% invested through a decade where the basket returned
++69%, +75% and +43% in single windows is a structural drag, and correcting it
+recovers a quarter of the gap. The other three quarters are the picks. Sizing up
+is not a fix — it turns a large loss into a slightly smaller large loss.
+
+What *does* survive both window sets: **the 200-day SMA filter with no model in
+it is the best arm in the table, and adding the model makes it worse.** −9.08pp
+vs −10.77pp here, −3.66pp vs −5.07pp there. Consistent, and still losing to
+holding.
+
+Its −9.08pp is also mostly inaction: it ties buy-and-hold exactly in the four
+windows where SPY never left risk-on, wins the 2022 bear, and loses badly
+whenever it whipsaws (−43.51pp in the 2023 recovery, out of the market for it).
+
+### What this costs the earlier findings
+
+Findings A, E and F were all computed on the four-window set. Their *directions*
+all survive the correction — every one of them said the strategy loses to
+holding, and on a representative sample it loses by much more. Only F's
+attribution of *why* was wrong, and it is corrected above. Findings 1–4, B, C
+and D are classification measurements on a fixed test window and are unaffected.
+
 ## Where this leaves things
 
-**The strategy does not beat buy-and-hold out of sample. The model changes that
-improve its classification metrics do not fix that, and neither does changing
-how the capital is allocated.** Every configuration and every allocation policy
-tested loses to holding on average across four regime windows — including a
-200-day SMA filter with no model in it, which is the best of them.
+**The strategy does not beat buy-and-hold out of sample.** Not with better
+features, not with better labels, not at a different forward horizon, and not
+under any allocation policy tested — including a 200-day SMA filter with no
+model in it, which is the best of them and still loses.
 
-Finding F is the one that closes the question. If the shortfall had been
-exposure, sizing up would have fixed it; instead sizing up doubled it. The picks
-are the problem, and no allocation rule repairs a negative selection edge.
+Measured over ten continuous windows spanning 2019–2026, the shipped
+configuration returns **−24.09pp against simply holding the watchlist, beating
+it in 1 window out of 10.** About 6pp of that is exposure — running at 46%
+invested through a decade of large up years — and the remaining ~18pp is
+selection. Sizing up recovers the first part and leaves the second.
+
+Finding H is the one to remember methodologically: the four-window sample used
+for findings A, E and F was half drawdowns by construction, and it flattered
+every result computed on it, including the ones that were already negative. The
+directions all survived; one attribution did not.
 
 Nothing was changed in production as a result. `FEATURE_COLUMNS` still contains
 all 20 features including `BB_middle`, and the labels are unchanged — because
@@ -414,38 +544,54 @@ promoting.
   which expects 20 columns. It is a coordinated retrain-and-promote, not a
   free deletion — worth folding into the next promotion that happens for
   other reasons, not worth triggering one.
-- **Do not raise position sizes or `MAX_TOTAL_EXPOSURE`.** Finding F: sizing up
-  doubles the shortfall. The current ~50% exposure is limiting the damage, not
-  causing it.
-- **Do not add a 200-day SMA regime filter.** Finding F: on its own it still
-  loses to holding, and the model *subtracts* value when layered on top of it.
+- **Do not change the label horizon.** Finding G/H: every horizon from 3 to 21
+  days loses by 14–25pp on a representative sample. The 3-day horizon that
+  looked best on four windows is nearly the worst on ten.
+- **Do not raise position sizes or `MAX_TOTAL_EXPOSURE` expecting a fix.**
+  Finding F as corrected: sizing up recovers about 6pp of a 24pp gap. It turns a
+  large loss into a slightly smaller large loss, at materially higher drawdown.
+- **Do not add a 200-day SMA regime filter.** Findings F and H: it is the best
+  arm tested and still loses to holding, and the model *subtracts* value when
+  layered on top of it — consistently, on both window sets.
+- **Do not report a mean over `REGIME_WINDOWS`.** Use `--broad`. The regime set
+  exists to answer "is this defensive?", and it overweights drawdowns 2:4.
 
 ### Tried and refuted
 
-The two leads this section used to recommend have now been run, in finding F,
-and both are dead:
+Every lead this section has recommended has now been run, and all of them are
+dead:
 
-1. ~~**Exposure and sizing.**~~ Tested. Sizing up doubles the shortfall
-   (−3.71pp → −7.25pp). The deficit is selection, not exposure.
-2. ~~**A regime filter.**~~ Tested. A 200-day SMA filter still loses to holding
-   (−3.66pp), and the model makes it *worse* when layered on top (−5.07pp).
+1. ~~**More training history.**~~ Finding 1: more data makes it slightly worse.
+2. ~~**Better features (top-5 by SHAP).**~~ Findings C and E: better
+   classification, worse returns.
+3. ~~**A wider HOLD band (1.5x labels).**~~ Findings B and E: same.
+4. ~~**Exposure and sizing.**~~ Findings F and H: recovers ~6pp of a 24pp gap.
+5. ~~**A regime filter.**~~ Findings F and H: the best arm tested, still losing,
+   and made worse by adding the model.
+6. ~~**A different label horizon.**~~ Findings G and H: every horizon from 3 to
+   21 days loses by 14–25pp.
 
 ### What is left
 
-1. **A different label horizon.** Everything here uses a 7-day forward return.
-   That choice has never been tested, and it determines what "signal" means
-   more than any feature does. It is the last untested assumption in the setup —
-   though findings A, E and F have lowered the prior on any of this working.
-2. **Accept the result.** A 12-ticker daily-bar long-only strategy on standard
-   technical indicators is a crowded, well-arbitraged space. "No durable edge"
-   is the expected outcome, not a bug — and the pipeline around it (risk
-   controls, monitoring, P&L attribution, the promotion gate) is sound
-   engineering regardless of whether this particular signal works.
+**Accept the result.** A 12-ticker daily-bar long-only strategy on standard
+technical indicators is a crowded, well-arbitraged space. "No durable edge" is
+the expected outcome, not a bug.
 
-   This is now the recommended reading. Three independent lines of evidence —
-   the returns benchmark (A, E), the classification-improvement test (E), and
-   the allocation-policy sweep (F) — all point the same way, and the last of
-   them showed a rule with no model in it beating the model.
+Six independent attempts to find one have now failed, and the most informative
+of them found that a rule with no model in it beats the model. The pipeline
+around the signal — risk controls, monitoring, P&L attribution, a promotion gate
+that correctly refuses to ship a worse model, 499 tests — is sound engineering
+regardless of whether this particular signal pays.
+
+If the project continues as a learning exercise rather than a strategy, the
+interesting next chapter is a different question, not a better answer to this
+one: a more predictable target (realised volatility rather than direction), a
+different asset class or timeframe, or continued investment in the execution and
+monitoring machinery, which is the part that works.
+
+The promotion gate now encodes this: `beats_buy_and_hold` (added 2026-09-08)
+rejects any challenger that loses to holding the basket, so the conclusion here
+cannot be quietly forgotten by a future retrain.
 
 ## Recommended next steps (original, from the first pass)
 
@@ -481,7 +627,13 @@ python edge_probe.py --features                 # SHAP ranking + top-K retrain
 python edge_probe.py --label-scales 1 1.5 2 3   # HOLD band width
 python edge_probe.py --regimes                  # returns vs hold  (finding E)
 python edge_probe.py --exposure                 # allocation policy (finding F)
+python edge_probe.py --horizons 3 5 7 14 21     # label window     (finding G)
+python edge_probe.py --horizons 3 7 21 --broad  # ten windows, not four (finding H)
+python edge_probe.py --exposure --broad         # F, corrected
 ```
+
+**Use `--broad` for any figure quoted as a mean.** `REGIME_WINDOWS` is half
+drawdowns by construction; `BROAD_WINDOWS` covers the decade continuously.
 
 Writes `data/edge_probe_results.json`. Downloads into `data/edge_probe/` rather
 than `data/`, so the live CSVs the next real training run reads are untouched.
