@@ -71,6 +71,121 @@ backtest.py so the results are directly comparable.
 **DESIGN DECISION:**
 Walk-forward validation is used instead of a static train/test split to prevent from data leakage during re training.
 
+## MODEL RETRAINING & PROMOTION
+
+Closes the loop the monitoring stack left open. `edge_monitor.py` detects that
+the live model's edge has decayed, but nothing retrained the model and nothing
+decided whether a retrained model was actually better. The live model went from
+2026-03-23 to 2026-09-08 without a retrain because that decision was manual and
+was never made.
+
+### `trainer.py` — headless mode
+
+`trainer.py` gained a CLI so it can run unattended:
+
+| Flag | Effect |
+|------|--------|
+| `--headless` | Never reads stdin. Implies `--no-update-config`. |
+| `--output PATH` | Writes the bundle to PATH; **the live model is left untouched**. |
+| `--threshold FLOAT` | Skips validation tuning and uses this value. |
+| `--update-config` / `--no-update-config` | Explicitly control whether `CONFIDENCE_THRESHOLD` is written back to `config.py`. |
+
+`train()` now returns a dict (threshold, path written, split sizes, held-out
+test report) instead of `None`.
+
+**DESIGN DECISION:**
+`--output` exists because training previously always overwrote the production
+model — backing the old one up, then comparing afterwards via
+`compare_models.py`. That ordering meant a worse model was already trading by
+the time anyone looked at the comparison. A challenger is now built off to the
+side and the swap is a separate, gated decision.
+
+**DESIGN DECISION:**
+In headless mode `config.py` is never rewritten unless `--update-config` is
+passed explicitly. `config.py` is the source of truth the live bot reads; an
+unattended job editing it is not a safe default.
+
+### `promote_model.py` — the champion/challenger gate
+
+```
+1. Train challenger  →  models/XG_Boost_candidate.joblib   (champion untouched)
+2. Rebuild dataset, take the same chronological 70/20/10 split as trainer.py
+3. Score champion AND challenger on that one shared held-out test set
+4. decide_promotion()  →  promote / reject
+5. On promote only: archive champion → models/archive/, move candidate into place
+6. Write models/promotion_decision.json, post the decision to Discord
+```
+
+**DESIGN DECISION:**
+The gate is failure-biased — every ambiguous case keeps the incumbent. A model
+already trading has known live behaviour; a challenger has only test-set
+numbers. Ties, thin test sets, and an unreadable champion all resolve to
+REJECT. Promotion is the exception that must be argued for.
+
+**DESIGN DECISION:**
+Both models are scored inside `promote_model.py` on one freshly built split
+rather than trusting metrics reported by whatever produced each model. A
+comparison is only meaningful if both sides saw byte-identical test data.
+
+**DESIGN DECISION:**
+The gate judges the **BUY class**, not overall accuracy. HOLD dominates the
+label distribution, so accuracy would happily promote a model that quietly
+stopped buying. `PROMOTION_MIN_BUY_RECALL` exists specifically to reject the
+degenerate model that scores high precision by almost never firing.
+
+#### Gate checks (all must pass)
+
+| Check | Constant | Rejects |
+|-------|----------|---------|
+| `test_buy_support` | `PROMOTION_MIN_TEST_BUY_SUPPORT` (30) | Test set too thin to tell signal from noise |
+| `challenger_buy_precision` | `PROMOTION_MIN_BUY_PRECISION` (0.35) | Challenger below the absolute floor |
+| `challenger_buy_recall` | `PROMOTION_MIN_BUY_RECALL` (0.10) | Model that scores well by refusing to buy |
+| `beats_champion` | `PROMOTION_MIN_BUY_F1_IMPROVEMENT` (0.01) | Improvement smaller than the margin, or worse |
+
+All four checks always run — the Discord report shows the full picture rather
+than stopping at the first failure. When no champion exists on disk,
+`beats_champion` auto-passes and the floors alone decide.
+
+#### `models/promotion_decision.json`
+
+```json
+{ "timestamp_utc", "promoted", "dry_run", "summary",
+  "checks": [{"name", "passed", "detail"}],
+  "champion": {...} | null, "challenger": {...}, "archived_to": ... }
+```
+
+**DESIGN DECISION:**
+CI cannot infer the outcome from the filesystem — the candidate file is *moved*
+on promotion and *deleted* on rejection, so it is absent either way. The
+workflow reads this file instead.
+
+#### CLI
+
+```bash
+python promote_model.py              # train, evaluate, promote if better
+python promote_model.py --dry-run    # decide and report, change nothing
+python promote_model.py --skip-train --candidate models/XG_Boost_candidate.joblib
+```
+
+Exit code 0 means *a decision was reached* — *both* PROMOTED and REJECTED are
+successful runs. Exit 1 means the run could not decide (missing data,
+unreadable champion) and the live model is untouched.
+
+### `retrain.yml`
+
+- **Runs:** `0 6 1 * *` (06:00 UTC, 1st of each month) plus `workflow_dispatch`
+  with a `dry_run` input.
+- **Why monthly:** the gate compares on the most recent 10% of the dataset.
+  Running faster than that slice meaningfully changes just re-decides on
+  near-identical data and adds model churn.
+- Neither `data/` nor `models/` is version-controlled, so the workflow rebuilds
+  the dataset from yfinance (`data_collector.py` + `market_data_collector.py`)
+  and pulls the live champion from PythonAnywhere. A 404 on the champion is not
+  fatal — it becomes a first promotion.
+- On promotion it uploads the new model back to PythonAnywhere (where
+  `live_trader.py` loads it from) and keeps the superseded champion as a
+  90-day build artifact, since `models/archive/` is gitignored.
+
 ## PRE-RUN VALIDATION
 
 ### `pre_run_validation.py`
@@ -477,6 +592,66 @@ Stale rows (8+ days past evaluation_date with no outcome): marked SKIPPED.
 All rows are preserved — no deletions (append-only semantics).
 **DESIGN DECISION:** 
 `outcome_tracker.py` is ran on GitHub workflow due to yfinance heavy dependency and PA free tier restrictions.
+
+### `pnl_report.py`
+
+Realized P&L attribution over the EXIT rows in `signal_log.csv`.
+
+`signal_logger.py` had been writing `realized_pnl`, `exit_reason`, `exit_price`
+and `shares` on every EXIT row for months and **nothing read them**. Performance
+reporting was win rate plus portfolio-vs-SPY, which answers "did the account go
+up" but not "which behaviour made or lost the money".
+
+Reports:
+
+| Section | Answers |
+|---------|---------|
+| OVERALL | Total realized P&L, profit factor, expectancy per trade, avg win vs avg loss |
+| BY EXIT REASON | Is `REBALANCE_TRIM` giving back what `TAKE_PROFIT` earns? |
+| BY TICKER | Which names carry the book |
+| BY CONFIDENCE TIER | Does model confidence actually predict realized dollars? |
+
+Tables are ordered **worst total first** — the reason to open this report is to
+find the leak.
+
+**DESIGN DECISION:**
+Win rate is reported by trade count *and* beside the dollar figures, because
+they routinely disagree. A 60% win rate with an average loss twice the average
+win loses money, and `outcome_tracker.py`'s win rate cannot see that.
+
+**DESIGN DECISION:**
+Entry price is derived from the EXIT row itself
+(`exit_price - realized_pnl / shares`) rather than joined from the ENTRY row.
+`log_exit()` records Alpaca's `avg_entry_price` while the ENTRY row records the
+signal-time price; they differ by slippage. Deriving keeps the return percentage
+consistent with the dollar figure next to it.
+
+**DESIGN DECISION:**
+Unlinked exits (`entry_order_id == "UNLINKED"`, or pre-migration blanks) are
+bucketed as `unknown` confidence rather than dropped. They are still real money
+and must not vanish from the totals.
+
+> ⚠️ **KNOWN BLIND SPOT — stop-loss exits are absent from this data.**
+> Since standing stop-losses moved to Alpaca-side OTO orders, a stop fires
+> between bot sessions and never passes through `log_exit()`. Every
+> closed-by-stop position is therefore missing from every figure the report
+> produces, which biases realized P&L **upward**. The report prints this caveat
+> on every run rather than presenting a clean-looking total. Closing the gap
+> means reconciling filled stop orders back from the Alpaca orders API — a
+> separate change, not yet done.
+
+Console output is deliberately ASCII: these scripts are run locally on Windows,
+where a piped stdout defaults to cp1252 and cannot encode `⚠`/`—`. Emoji remain
+in the Discord payload, which travels as JSON rather than through the terminal.
+
+**Runs:** in the weekly slot of `evaluate_signals.yml` (Fridays), reading the
+`signal_log.csv` already downloaded for the weekly summary.
+
+```bash
+python pnl_report.py                      # console report
+python pnl_report.py --discord            # also post to Discord
+python pnl_report.py --since 2026-06-01   # window the report
+```
 
 ## CONFIG
 ### `config.py` 
