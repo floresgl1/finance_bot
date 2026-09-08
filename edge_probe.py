@@ -31,10 +31,14 @@ overwriting the live CSVs would silently change what the next real training run
 sees.
 
 Usage:
-    python edge_probe.py                          # default sweep
+    python edge_probe.py                          # lookback sweep + baselines
+    python edge_probe.py --features               # SHAP ranking + top-K retrain
+    python edge_probe.py --label-scales 1 1.5 2 3 # HOLD band width sweep
     python edge_probe.py --test-start 2026-05-20
     python edge_probe.py --lookbacks 1 3 5 10
     python edge_probe.py --refresh                # re-download the history
+
+See docs/EDGE_INVESTIGATION_2026-09-08.md for what each mode found.
 """
 
 import argparse
@@ -100,8 +104,13 @@ def download_history(refresh: bool = False) -> None:
         print(f"  [ticker] {ticker}: {len(df)} rows")
 
 
-def build_probe_dataset() -> tuple[pd.DataFrame, pd.Series]:
-    """Featured + labelled rows for every ticker, read from the probe directory."""
+def build_probe_dataset(threshold_scale: float = 1.0) -> tuple[pd.DataFrame, pd.Series]:
+    """Featured + labelled rows for every ticker, read from the probe directory.
+
+    `threshold_scale` multiplies the VIX-derived label thresholds. 1.0 is the
+    shipped labelling; higher values widen the HOLD band, producing fewer but
+    higher-conviction BUY/SELL labels.
+    """
     import features
     import labels as labels_mod
 
@@ -115,9 +124,9 @@ def build_probe_dataset() -> tuple[pd.DataFrame, pd.Series]:
     for ticker in WATCHLIST:
         try:
             df = labels_mod.add_labels(features.load_and_process(ticker))
+            if threshold_scale != 1.0:
+                df = _relabel(df, threshold_scale)
             frames.append(df)
-            print(f"  {ticker}: {len(df)} rows  "
-                  f"{df.index.min().date()} -> {df.index.max().date()}")
         except Exception as exc:
             print(f"  {ticker}: FAILED {exc}")
 
@@ -126,6 +135,29 @@ def build_probe_dataset() -> tuple[pd.DataFrame, pd.Series]:
 
     combined = pd.concat(frames).sort_index()
     return combined[FEATURE_COLUMNS], combined["Signal"]
+
+
+def _relabel(df: pd.DataFrame, scale: float) -> pd.DataFrame:
+    """Re-derive Signal from a scaled threshold.
+
+    add_labels() leaves `threshold` and the inputs on the frame, so the
+    relative return it compared against can be recovered rather than
+    recomputed -- which keeps this consistent with labels.py by construction
+    instead of by a duplicated formula that could drift.
+    """
+    df = df.copy()
+    stock_return_7d = df["Close"].pct_change(7).shift(-7)
+    relative = stock_return_7d - df["spy_return_7d"]
+    scaled = df["threshold"] * scale
+
+    df["Signal"] = np.select(
+        [relative >= scaled, relative <= -scaled],
+        ["BUY", "SELL"],
+        default="HOLD",
+    )
+    # The tail rows add_labels already dropped have no forward return; the
+    # scaled comparison leaves them HOLD, which matches that intent.
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +310,78 @@ def format_verdict(results: dict) -> str:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def run_feature_probe(test_start: pd.Timestamp, lookback_years: int = 3,
+                      top_k: list[int] | None = None) -> dict:
+    """Rank features by mean |SHAP|, then retrain on only the top K.
+
+    **DESIGN DECISION:**
+    SHAP alone answers "what does the model lean on", which is not the same as
+    "what carries signal" -- a model will happily lean on noise. The top-K
+    retrain is the decisive half: if 5 features match all 20, the other 15 are
+    adding variance, not information.
+    """
+    import shap
+
+    top_k = top_k or [3, 5, 10, 20]
+
+    X, y = build_probe_dataset()
+    test_mask = X.index >= test_start
+    X_test, y_test = X[test_mask], y[test_mask]
+    train_start = test_start - pd.DateOffset(years=lookback_years)
+    train_mask = (X.index >= train_start) & (X.index < test_start)
+    X_train, y_train = X[train_mask], y[train_mask]
+
+    encoder = LabelEncoder()
+    model = XGBClassifier(**XGB_PARAMS, random_state=42)
+    model.fit(X_train, encoder.fit_transform(y_train))
+
+    print(f"  Computing SHAP over {len(X_test)} test rows...")
+    explainer = shap.TreeExplainer(model)
+    values = explainer(X_test).values          # (rows, features, classes)
+    mean_abs = np.abs(values).mean(axis=(0, 2))   # average across rows + classes
+
+    ranking = sorted(
+        zip(FEATURE_COLUMNS, mean_abs), key=lambda kv: kv[1], reverse=True
+    )
+
+    print("\n  Feature ranking by mean |SHAP|:")
+    for i, (name, val) in enumerate(ranking, 1):
+        print(f"    {i:>2}. {name:<20} {val:.5f}")
+
+    baselines = compute_baselines(y_test)
+    majority_key = max(
+        (k for k in baselines if k.startswith("always_")),
+        key=lambda k: baselines[k]["accuracy"],
+    )
+    majority_acc = baselines[majority_key]["accuracy"]
+
+    print(f"\n  Retraining on top-K features "
+          f"({majority_key} baseline acc={majority_acc:.4f}):")
+    k_results = {}
+    for k in top_k:
+        cols = [name for name, _ in ranking[:k]]
+        enc_k = LabelEncoder()
+        model_k = XGBClassifier(**XGB_PARAMS, random_state=42)
+        model_k.fit(X_train[cols], enc_k.fit_transform(y_train))
+        pred = enc_k.inverse_transform(model_k.predict(X_test[cols]))
+        m = score(y_test, pred)
+        m["features"] = cols
+        m["accuracy_edge"] = m["accuracy"] - majority_acc
+        k_results[f"top_{k}"] = m
+        print(f"    top-{k:<3} acc={m['accuracy']:.4f}  macro_f1={m['macro_f1']:.4f}  "
+              f"edge={m['accuracy_edge']:>+.4f}")
+
+    return {
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": "feature_probe",
+        "test_rows": int(len(X_test)),
+        "shap_ranking": [{"feature": n, "mean_abs_shap": float(v)} for n, v in ranking],
+        "baselines": baselines,
+        "majority_baseline": majority_key,
+        "top_k": k_results,
+    }
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure the model against trivial baselines and sweep training history.",
@@ -295,7 +399,79 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--refresh", action="store_true",
         help="Re-download the probe history even if it is already cached.",
     )
+    parser.add_argument(
+        "--features", action="store_true",
+        help="Instead of the lookback sweep, rank features by mean |SHAP| and "
+             "retrain on only the top K to see how many actually carry signal.",
+    )
+    parser.add_argument(
+        "--label-scales", type=float, nargs="+", default=None, metavar="SCALE",
+        help="Instead of the lookback sweep, multiply the VIX label thresholds "
+             "by each scale and re-measure. Widening the HOLD band should raise "
+             "the baseline's difficulty; the question is whether the model's "
+             "edge over that baseline grows. Example: --label-scales 1 1.5 2 3",
+    )
     return parser.parse_args(argv)
+
+
+def run_label_sweep(scales: list[float], test_start: pd.Timestamp,
+                    lookback_years: int = 3) -> dict:
+    """Re-label at each threshold scale and measure model vs baselines.
+
+    The number that matters is the *edge* -- model minus always-majority -- not
+    the model's raw accuracy. A wider HOLD band makes HOLD the majority class
+    and mechanically changes both numbers; only the gap between them says
+    whether the labels got more learnable.
+    """
+    results = {}
+
+    for scale in scales:
+        X, y = build_probe_dataset(threshold_scale=scale)
+        test_mask = X.index >= test_start
+        X_test, y_test = X[test_mask], y[test_mask]
+
+        train_start = test_start - pd.DateOffset(years=lookback_years)
+        train_mask = (X.index >= train_start) & (X.index < test_start)
+        X_train, y_train = X[train_mask], y[train_mask]
+
+        if len(X_train) < 500 or X_test.empty:
+            print(f"  scale {scale}: insufficient rows, skipping")
+            continue
+
+        encoder = LabelEncoder()
+        model = XGBClassifier(**XGB_PARAMS, random_state=42)
+        model.fit(X_train, encoder.fit_transform(y_train))
+        pred = encoder.inverse_transform(model.predict(X_test))
+
+        model_m = score(y_test, pred)
+        baselines = compute_baselines(y_test)
+        majority_key = next(k for k in baselines if k.startswith("always_")
+                            and k != "always_HOLD") if any(
+                            k.startswith("always_") and k != "always_HOLD"
+                            for k in baselines) else "always_HOLD"
+        majority = baselines[majority_key]
+
+        dist = y_test.value_counts()
+        hold_pct = 100.0 * dist.get("HOLD", 0) / len(y_test)
+
+        results[f"scale_{scale}"] = {
+            "scale": scale,
+            "hold_pct": hold_pct,
+            "distribution": {k: int(v) for k, v in dist.items()},
+            "model": model_m,
+            "majority_baseline": majority_key,
+            "baseline": majority,
+            "accuracy_edge": model_m["accuracy"] - majority["accuracy"],
+            "macro_f1_edge": model_m["macro_f1"] - baselines["stratified_random"]["macro_f1"],
+        }
+
+        print(f"  scale {scale:<5} HOLD={hold_pct:>5.1f}%  "
+              f"model_acc={model_m['accuracy']:.4f}  "
+              f"{majority_key}={majority['accuracy']:.4f}  "
+              f"edge={results[f'scale_{scale}']['accuracy_edge']:>+.4f}  "
+              f"macro_f1_edge={results[f'scale_{scale}']['macro_f1_edge']:>+.4f}")
+
+    return results
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -310,12 +486,42 @@ def main(argv: list[str] | None = None) -> int:
     print(f"=== Downloading {PROBE_HISTORY} history into {PROBE_DIR} ===")
     download_history(refresh=args.refresh)
 
-    print("\n=== Building dataset ===")
-    X, y = build_probe_dataset()
-    print(f"\nTotal: {len(X)} rows, {X.index.min().date()} -> {X.index.max().date()}")
-
-    results = run_sweep(X, y, test_start, args.lookbacks)
-    print(format_verdict(results))
+    if args.features:
+        print("\n=== Feature probe (SHAP ranking + top-K retrain) ===")
+        results = run_feature_probe(test_start)
+        k_results = results["top_k"]
+        if k_results:
+            best_key = max(k_results, key=lambda k: k_results[k]["accuracy"])
+            best = k_results[best_key]
+            full = k_results.get(f"top_{len(FEATURE_COLUMNS)}")
+            print(f"\n  Best: {best_key} — acc={best['accuracy']:.4f} on "
+                  f"{len(best['features'])} features")
+            if full and best["accuracy"] >= full["accuracy"] and best_key != f"top_{len(FEATURE_COLUMNS)}":
+                print(f"  -> A subset matches or beats all {len(FEATURE_COLUMNS)} "
+                      f"features. The rest add variance, not information.")
+    elif args.label_scales:
+        print("\n=== Label threshold sweep (HOLD band width) ===")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "label_scales",
+            "test_start": str(test_start.date()),
+            "scales": run_label_sweep(args.label_scales, test_start),
+        }
+        scales = results["scales"]
+        if scales:
+            best = max(scales.values(), key=lambda r: r["accuracy_edge"])
+            print(f"\n  Widest edge over the majority baseline: "
+                  f"scale {best['scale']} ({best['accuracy_edge']:+.4f}) "
+                  f"at HOLD={best['hold_pct']:.1f}%")
+            if best["accuracy_edge"] <= 0.02:
+                print("  -> No label width produces a meaningful edge. The labels are")
+                print("     not the binding constraint; the features are.")
+    else:
+        print("\n=== Building dataset ===")
+        X, y = build_probe_dataset()
+        print(f"\nTotal: {len(X)} rows, {X.index.min().date()} -> {X.index.max().date()}")
+        results = run_sweep(X, y, test_start, args.lookbacks)
+        print(format_verdict(results))
 
     os.makedirs(os.path.dirname(RESULTS_PATH), exist_ok=True)
     with open(RESULTS_PATH, "w") as fh:
