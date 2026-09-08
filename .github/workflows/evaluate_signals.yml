@@ -93,6 +93,23 @@ jobs:
         run: python outcome_tracker.py
 
       # ------------------------------------------------------------------
+      # Recover stop-loss exits Alpaca filled outside a bot session. Standing
+      # OTO stops fire between runs and never reach log_exit(), so without
+      # this the losing tail is simply absent from realized P&L.
+      #
+      # Runs here, before the log is uploaded back to PythonAnywhere, so the
+      # recovered EXIT rows persist. Idempotent — keyed on Alpaca's filled_at,
+      # so a re-run writes nothing.
+      # ------------------------------------------------------------------
+      - name: Reconcile stop-loss fills
+        if: steps.download.outputs.has_data == 'true'
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python reconcile_stops.py --discord
+
+      # ------------------------------------------------------------------
       # POST the updated signal_log.csv back to PythonAnywhere so
       # live_trader.py always reads the latest evaluated log.
       # Skipped when has_data=false (nothing was changed).

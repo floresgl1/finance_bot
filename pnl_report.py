@@ -25,13 +25,13 @@ log_exit() records Alpaca's `avg_entry_price`, while the ENTRY row records the
 signal-time price; they differ by slippage. Deriving keeps the return
 percentage consistent with the dollar figure sitting next to it.
 
-KNOWN BLIND SPOT — stop-loss exits are not in this data.
-Since standing OTO stops moved to Alpaca's side, a stop fires between bot
-sessions and never passes through log_exit(). Every closed-by-stop position is
-therefore absent from the numbers below, which biases realized P&L *upward*.
-The report states this explicitly rather than presenting a clean-looking total.
-Closing that gap means reconciling filled stop orders back from the Alpaca
-orders API — a separate change.
+STOP-LOSS COVERAGE — depends on reconcile_stops.py having run.
+Standing OTO stops fire on Alpaca's side between bot sessions and never pass
+through log_exit(), so closed-by-stop positions do not reach this log on their
+own. reconcile_stops.py backfills them as STOP_LOSS_FILL rows. The report
+inspects the data for those rows and says which case it is looking at, rather
+than asserting coverage it cannot verify: without them, realized P&L is biased
+*upward* by however much the stopped-out positions lost.
 
 Usage:
     python pnl_report.py                      # console report
@@ -57,7 +57,16 @@ from signal_logger import SIGNAL_LOG_PATH
 # Exit reasons that reach log_exit(). Anything outside this set is surfaced
 # rather than silently bucketed, so a new exit path shows up in the report the
 # first time it fires.
-KNOWN_EXIT_REASONS = ("TAKE_PROFIT", "MODEL_SELL", "REBALANCE_TRIM")
+KNOWN_EXIT_REASONS = (
+    "TAKE_PROFIT",
+    "MODEL_SELL",
+    "REBALANCE_TRIM",
+    "STOP_LOSS_FILL",   # backfilled by reconcile_stops.py
+)
+
+# Written by reconcile_stops.py for stops Alpaca filled outside a bot session.
+# Their presence is what tells the report whether the stop-loss tail is covered.
+STOP_LOSS_FILL = "STOP_LOSS_FILL"
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +272,7 @@ def format_report(exits: pd.DataFrame, entries: pd.DataFrame, since: str | None 
         out.append("")
         out.append("  No closed trades found in the signal log.")
         out.append("")
-        out.append(_blind_spot_note())
+        out.append(_blind_spot_note(None))
         return "\n".join(out)
 
     window = f"{exits['date'].min().date()} to {exits['date'].max().date()}"
@@ -316,19 +325,39 @@ def format_report(exits: pd.DataFrame, entries: pd.DataFrame, since: str | None 
         out.extend(_table(by_tier, "confidence_tier"))
 
     out.append("")
-    out.append(_blind_spot_note())
+    out.append(_blind_spot_note(exits))
     return "\n".join(out)
 
 
-def _blind_spot_note() -> str:
-    # ASCII only: this is printed to the console, and Windows terminals default
-    # to cp1252, which cannot encode the warning sign. Emoji stay in the Discord
-    # payload, which is transported as JSON rather than printed.
+def _blind_spot_note(exits: pd.DataFrame | None = None) -> str:
+    """State whether the stop-loss tail is represented in these figures.
+
+    Standing stops fill on Alpaca's side between bot sessions and never pass
+    through log_exit(); reconcile_stops.py backfills them as STOP_LOSS_FILL
+    rows. Whether that has run is the difference between an honest total and
+    one biased upward, so the report says which it is looking at rather than
+    asserting either unconditionally.
+
+    ASCII only: printed to the console, and a piped Windows stdout defaults to
+    cp1252, which cannot encode a warning sign. Emoji stay in the Discord
+    payload, which travels as JSON.
+    """
+    recovered = 0
+    if exits is not None and not exits.empty and "exit_reason" in exits.columns:
+        recovered = int((exits["exit_reason"] == STOP_LOSS_FILL).sum())
+
+    if recovered:
+        return (
+            f"  [i] Stop-loss coverage: {recovered} STOP_LOSS_FILL row(s) reconciled\n"
+            f"      from Alpaca, so the losing tail is represented above. Any stop\n"
+            f"      filled since the last reconcile_stops.py run is still missing."
+        )
+
     return (
-        "  [!] BLIND SPOT: standing stop-loss orders fill on Alpaca's side between\n"
-        "      bot sessions and never pass through log_exit(), so stop-loss closes\n"
-        "      are absent from every figure above. Realized P&L is biased UPWARD by\n"
-        "      however much those positions lost."
+        "  [!] BLIND SPOT: no STOP_LOSS_FILL rows in this window. Standing stops\n"
+        "      fill on Alpaca's side between bot sessions and never pass through\n"
+        "      log_exit(), so stop-loss closes may be absent and realized P&L\n"
+        "      biased UPWARD. Run reconcile_stops.py to backfill them."
     )
 
 
@@ -362,7 +391,16 @@ def format_discord(exits: pd.DataFrame, entries: pd.DataFrame) -> str:
             )
 
     lines.append("")
-    lines.append("_Excludes stop-loss closes: standing Alpaca stops bypass log_exit()._")
+    recovered = int((exits["exit_reason"] == STOP_LOSS_FILL).sum())
+    if recovered:
+        lines.append(
+            f"_Includes {recovered} reconciled stop-loss exit(s)._"
+        )
+    else:
+        lines.append(
+            "_Excludes stop-loss closes: standing Alpaca stops bypass log_exit(). "
+            "Run reconcile_stops.py._"
+        )
     return "\n".join(lines)
 
 

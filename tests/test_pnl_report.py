@@ -328,14 +328,61 @@ def test_attach_confidence_with_no_entries(log):
 # --- report rendering ------------------------------------------------------
 
 
-def test_report_always_states_the_stop_loss_blind_spot(log):
+def test_report_warns_when_no_stop_losses_are_reconciled(log):
     """The omission biases P&L upward — it must never be silent."""
     _write_log(log, [_entry_row(), _exit_row()])
 
     report = format_report(load_exits(str(log)), load_entries(str(log)))
 
     assert "BLIND SPOT" in report
-    assert "stop-loss" in report
+    assert "reconcile_stops.py" in report
+
+
+def test_report_confirms_coverage_once_stops_are_reconciled(log):
+    """With STOP_LOSS_FILL rows present the losing tail IS represented, and
+    the report must stop claiming otherwise."""
+    _write_log(log, [
+        _entry_row(),
+        _exit_row(exit_reason="MODEL_SELL", realized_pnl=100.0),
+        _exit_row(entry_order_id="e2", exit_reason="STOP_LOSS_FILL",
+                  realized_pnl=-250.0),
+    ])
+
+    report = format_report(load_exits(str(log)), load_entries(str(log)))
+
+    assert "BLIND SPOT" not in report
+    assert "1 STOP_LOSS_FILL row(s) reconciled" in report
+
+
+def test_stop_loss_fill_is_a_recognised_exit_reason(log):
+    _write_log(log, [_exit_row(exit_reason="STOP_LOSS_FILL", realized_pnl=-250.0)])
+
+    report = format_report(load_exits(str(log)), load_entries(str(log)))
+
+    assert "unrecognised exit reason" not in report
+
+
+def test_reconciled_stops_are_included_in_the_totals(log):
+    """The recovered losses must actually move the headline number."""
+    _write_log(log, [
+        _exit_row(exit_reason="MODEL_SELL", realized_pnl=100.0),
+        _exit_row(entry_order_id="e2", exit_reason="STOP_LOSS_FILL",
+                  realized_pnl=-250.0),
+    ])
+
+    exits = load_exits(str(log))
+
+    assert compute_summary(exits)["total_pnl"] == -150.0
+
+
+def test_discord_summary_states_stop_coverage(log):
+    _write_log(log, [
+        _exit_row(exit_reason="STOP_LOSS_FILL", realized_pnl=-250.0),
+    ])
+
+    message = format_discord(load_exits(str(log)), load_entries(str(log)))
+
+    assert "Includes 1 reconciled stop-loss exit(s)" in message
 
 
 def test_empty_report_still_states_the_blind_spot(tmp_path):
