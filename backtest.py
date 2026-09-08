@@ -220,6 +220,301 @@ def _simulate(
 
 
 # ---------------------------------------------------------------------------
+# Buy-and-hold benchmark
+# ---------------------------------------------------------------------------
+#
+# The question the classification metrics cannot answer: does running this bot
+# beat simply holding? Without this arm, a positive backtest return says nothing
+# -- a rising market makes almost any long-biased strategy look profitable.
+#
+# Both arms share _summarise() below, so slippage, commission, drawdown and
+# return are computed identically. The only difference is which trades happen.
+
+def _simulate_buy_and_hold(
+    dates: list,
+    ticker_data: dict[str, pd.DataFrame],
+) -> tuple[list, list]:
+    """Equal-weight the watchlist on day one and hold to the end.
+
+    Uses the same SLIPPAGE and COMMISSION as the strategy: an unpriced
+    benchmark would flatter itself against a strategy that pays costs.
+    """
+    if not dates or not ticker_data:
+        return [], []
+
+    first_date = dates[0]
+    tradable = [
+        t for t, df in ticker_data.items()
+        if first_date in df.index and df.loc[first_date, "Close"] > 0
+    ]
+    if not tradable:
+        return [], []
+
+    cash = float(INITIAL_CAPITAL)
+    alloc_each = cash / len(tradable)
+    positions = {}
+
+    for ticker in tradable:
+        entry_price = ticker_data[ticker].loc[first_date, "Close"] * (1 + SLIPPAGE)
+        shares = (alloc_each - COMMISSION) / entry_price
+        if shares <= 0:
+            continue
+        cost = shares * entry_price + COMMISSION
+        cash -= cost
+        positions[ticker] = {"shares": shares, "entry_price": entry_price, "cost": cost}
+
+    equity_curve = []
+    for date in dates:
+        invested = sum(
+            pos["shares"] * ticker_data[t].loc[date, "Close"]
+            if date in ticker_data[t].index else pos["cost"]
+            for t, pos in positions.items()
+        )
+        equity_curve.append({
+            "date":            date,
+            "portfolio_value": cash + invested,
+            "cash":            cash,
+            "invested_value":  invested,
+            "open_positions":  len(positions),
+        })
+
+    # Liquidate on the final date, matching how the strategy closes out.
+    last_date = dates[-1]
+    trade_log = []
+    for ticker, pos in positions.items():
+        close_px = (ticker_data[ticker].loc[last_date, "Close"]
+                    if last_date in ticker_data[ticker].index else pos["entry_price"])
+        exit_price = close_px * (1 - SLIPPAGE)
+        proceeds = pos["shares"] * exit_price - COMMISSION
+        trade_log.append({
+            "ticker":       ticker,
+            "entry_price":  pos["entry_price"],
+            "exit_price":   exit_price,
+            "shares":       pos["shares"],
+            "cost":         pos["cost"],
+            "proceeds":     proceeds,
+            "trade_return": (proceeds - pos["cost"]) / pos["cost"],
+        })
+
+    return trade_log, equity_curve
+
+
+def _load_spy_close() -> pd.Series | None:
+    """SPY closes for the market-hold arm. None if unavailable."""
+    try:
+        from features import _load_market_close
+        return _load_market_close("SPY")
+    except Exception as exc:
+        print(f"  [BENCHMARK] Could not load SPY: {exc}")
+        return None
+
+
+def _simulate_market_hold(dates: list) -> tuple[list, list]:
+    """Hold SPY for the period — the actual do-nothing alternative."""
+    close = _load_spy_close()
+    if close is None or not dates:
+        return [], []
+
+    available = close.reindex(pd.DatetimeIndex(dates)).ffill().dropna()
+    if available.empty:
+        print("  [BENCHMARK] SPY has no overlap with the backtest dates.")
+        return [], []
+
+    entry_price = float(available.iloc[0]) * (1 + SLIPPAGE)
+    shares = (INITIAL_CAPITAL - COMMISSION) / entry_price
+    cost = shares * entry_price + COMMISSION
+    cash = INITIAL_CAPITAL - cost
+
+    equity_curve = [
+        {
+            "date":            date,
+            "portfolio_value": cash + shares * float(available.loc[date]),
+            "cash":            cash,
+            "invested_value":  shares * float(available.loc[date]),
+            "open_positions":  1,
+        }
+        for date in available.index
+    ]
+
+    exit_price = float(available.iloc[-1]) * (1 - SLIPPAGE)
+    proceeds = shares * exit_price - COMMISSION
+    trade_log = [{
+        "ticker":       "SPY",
+        "entry_price":  entry_price,
+        "exit_price":   exit_price,
+        "shares":       shares,
+        "cost":         cost,
+        "proceeds":     proceeds,
+        "trade_return": (proceeds - cost) / cost,
+    }]
+
+    return trade_log, equity_curve
+
+
+# ---------------------------------------------------------------------------
+# Shared statistics
+# ---------------------------------------------------------------------------
+def _summarise(trade_log: list, equity_curve: list, dates: list, split: str) -> dict:
+    """Turn a trade log and equity curve into summary statistics.
+
+    Shared by the strategy and both benchmark arms so the comparison cannot
+    drift: any change to how return or drawdown is computed applies to all of
+    them at once.
+    """
+    if not equity_curve:
+        return {
+            "split": split, "date_range": "N/A", "n_days": 0,
+            "final_value": float(INITIAL_CAPITAL), "total_return": 0.0,
+            "n_trades": 0, "win_rate": 0.0, "avg_return": 0.0,
+            "best_trade": 0.0, "worst_trade": 0.0, "max_drawdown": 0.0,
+            "avg_exposure": 0.0, "equity_df": pd.DataFrame(),
+        }
+
+    equity_df = pd.DataFrame(equity_curve).set_index("date")
+    final_value = float(equity_df["portfolio_value"].iloc[-1])
+    returns = [t["trade_return"] for t in trade_log]
+    n_trades = len(trade_log)
+
+    if n_trades > 0:
+        win_rate = len([r for r in returns if r > 0]) / n_trades * 100
+        avg_return = float(np.mean(returns)) * 100
+        best_trade = max(returns) * 100
+        worst_trade = min(returns) * 100
+    else:
+        win_rate = avg_return = best_trade = worst_trade = 0.0
+
+    pv = equity_df["portfolio_value"]
+    max_drawdown = float(((pv - pv.cummax()) / pv.cummax() * 100).min()) if len(pv) > 1 else 0.0
+
+    # Average capital actually at risk. Reported because a strategy capped at
+    # MAX_TOTAL_EXPOSURE is not comparable to a fully-invested benchmark
+    # without knowing how much of any gap is exposure rather than selection.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        exposure = (equity_df["invested_value"] / equity_df["portfolio_value"]).replace(
+            [np.inf, -np.inf], np.nan
+        )
+    avg_exposure = float(exposure.mean() * 100) if exposure.notna().any() else 0.0
+
+    date_range = (
+        f"{dates[0].strftime('%Y-%m-%d')} to {dates[-1].strftime('%Y-%m-%d')}"
+        if dates else "N/A"
+    )
+
+    return {
+        "split":        split,
+        "date_range":   date_range,
+        "n_days":       len(dates),
+        "final_value":  final_value,
+        "total_return": (final_value - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100,
+        "n_trades":     n_trades,
+        "win_rate":     win_rate,
+        "avg_return":   avg_return,
+        "best_trade":   best_trade,
+        "worst_trade":  worst_trade,
+        "max_drawdown": max_drawdown,
+        "avg_exposure": avg_exposure,
+        "equity_df":    equity_df,
+    }
+
+
+def run_benchmarks(
+    split: str = "test",
+    *,
+    model=None,
+    encoder=None,
+    ticker_data: dict | None = None,
+) -> dict:
+    """Run the strategy against buy-and-hold arms over the same dates.
+
+    Returns {"strategy": stats, "buy_and_hold": stats, "market_hold": stats}.
+    """
+    if ticker_data is None:
+        if model is None or encoder is None:
+            model, encoder = load_model()
+        ticker_data = load_all_tickers(model, encoder)
+    if not ticker_data:
+        return {}
+
+    all_dates = sorted(set().union(*[set(df.index) for df in ticker_data.values()]))
+    dates = _split_dates(all_dates)[split]
+    if not dates:
+        return {}
+
+    strat_trades, strat_equity = _simulate(dates, ticker_data)
+    bh_trades, bh_equity = _simulate_buy_and_hold(dates, ticker_data)
+    mkt_trades, mkt_equity = _simulate_market_hold(dates)
+
+    return {
+        "strategy":     _summarise(strat_trades, strat_equity, dates, split),
+        "buy_and_hold": _summarise(bh_trades, bh_equity, dates, split),
+        "market_hold":  _summarise(mkt_trades, mkt_equity, dates, split),
+    }
+
+
+def print_benchmark_comparison(results: dict) -> None:
+    """Print the strategy beside its benchmarks, and state the verdict."""
+    if not results:
+        print("  [BENCHMARK] No results to compare.")
+        return
+
+    strategy = results["strategy"]
+    rows = [
+        ("Model strategy", strategy),
+        ("Equal-weight hold", results["buy_and_hold"]),
+        ("SPY hold", results["market_hold"]),
+    ]
+
+    print("\n" + "=" * 82)
+    print(f"  BUY-AND-HOLD BENCHMARK - {strategy['split'].upper()}  ({strategy['date_range']})")
+    print("=" * 82)
+
+    # The train split is what the model was fitted on, and `full` is dominated
+    # by it. Both produce spectacular returns that measure memorisation, not
+    # edge -- reading them as performance is the single easiest way to conclude
+    # this strategy works when it does not.
+    if strategy["split"] in ("train", "full"):
+        print("  *** IN-SAMPLE - NOT EVIDENCE OF EDGE ***")
+        print("  The model was fitted on these dates, so the return below reflects")
+        print("  memorisation. Only the `test` split is fully out-of-sample.")
+        print("=" * 82)
+    print(f"  {'':<20}{'return':>10}{'final $':>13}{'max DD':>10}"
+          f"{'trades':>9}{'win %':>8}{'avg exp %':>11}")
+    print("  " + "-" * 78)
+    for label, s in rows:
+        if not s or not s["n_days"]:
+            print(f"  {label:<20}{'unavailable':>10}")
+            continue
+        print(f"  {label:<20}{s['total_return']:>9.2f}%{s['final_value']:>13,.2f}"
+              f"{s['max_drawdown']:>9.2f}%{s['n_trades']:>9}"
+              f"{s['win_rate']:>7.1f}%{s['avg_exposure']:>10.1f}%")
+    print("  " + "-" * 78)
+
+    # --- Verdict -----------------------------------------------------------
+    beat_any = False
+    for label, s in rows[1:]:
+        if not s or not s["n_days"]:
+            continue
+        delta = strategy["total_return"] - s["total_return"]
+        verdict = "BEATS" if delta > 0 else "LOSES TO"
+        print(f"  Strategy {verdict} {label.lower()} by {abs(delta):.2f}pp")
+        beat_any = beat_any or delta > 0
+
+    if not beat_any:
+        print()
+        print("  The strategy did not beat a passive alternative over this period.")
+        print("  Model tuning cannot fix that -- the edge has to come from")
+        print("  somewhere other than the current features and labels.")
+
+    if strategy.get("avg_exposure", 0) < 60:
+        print()
+        print(f"  NOTE: the strategy averaged {strategy['avg_exposure']:.1f}% invested "
+              f"against ~100% for the")
+        print("  hold arms, so part of any gap is lower market exposure rather than")
+        print("  worse selection.")
+    print("=" * 82)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -256,43 +551,7 @@ def run_backtest(
     dates     = _split_dates(all_dates)[split]
 
     trade_log, equity_curve = _simulate(dates, ticker_data)
-
-    equity_df   = pd.DataFrame(equity_curve).set_index("date")
-    final_value = float(equity_df["portfolio_value"].iloc[-1]) if equity_curve else INITIAL_CAPITAL
-    n_trades    = len(trade_log)
-    returns     = [t["trade_return"] for t in trade_log]
-
-    if n_trades > 0:
-        win_rate    = len([r for r in returns if r > 0]) / n_trades * 100
-        avg_return  = float(np.mean(returns)) * 100
-        best_trade  = max(returns) * 100
-        worst_trade = min(returns) * 100
-    else:
-        win_rate = avg_return = best_trade = worst_trade = 0.0
-
-    pv           = equity_df["portfolio_value"]
-    max_drawdown = float(((pv - pv.cummax()) / pv.cummax() * 100).min()) if len(pv) > 1 else 0.0
-    total_return = (final_value - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
-
-    date_range = (
-        f"{dates[0].strftime('%Y-%m-%d')} to{dates[-1].strftime('%Y-%m-%d')}"
-        if dates else "N/A"
-    )
-
-    return {
-        "split":        split,
-        "date_range":   date_range,
-        "n_days":       len(dates),
-        "final_value":  final_value,
-        "total_return": total_return,
-        "n_trades":     n_trades,
-        "win_rate":     win_rate,
-        "avg_return":   avg_return,
-        "best_trade":   best_trade,
-        "worst_trade":  worst_trade,
-        "max_drawdown": max_drawdown,
-        "equity_df":    equity_df,
-    }
+    return _summarise(trade_log, equity_curve, dates, split)
 
 
 def _print_summary(stats: dict, label: str = "") -> None:
@@ -318,9 +577,20 @@ def _print_summary(stats: dict, label: str = "") -> None:
 
 
 if __name__ == "__main__":
+    import sys
+
     print("=== Loading data and generating signals ===")
     _model, _encoder = load_model()
     _ticker_data     = load_all_tickers(_model, _encoder)
+
+    # `python backtest.py --benchmark [split]` answers the only question that
+    # gates the rest: does running this beat simply holding?
+    if "--benchmark" in sys.argv:
+        _args = [a for a in sys.argv[1:] if a != "--benchmark"]
+        _split = _args[0] if _args else "test"
+        _results = run_benchmarks(_split, ticker_data=_ticker_data)
+        print_benchmark_comparison(_results)
+        sys.exit(0)
 
     splits   = ["train", "validation", "test", "full"]
     all_stats = {}

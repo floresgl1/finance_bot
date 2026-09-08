@@ -71,6 +71,174 @@ backtest.py so the results are directly comparable.
 **DESIGN DECISION:**
 Walk-forward validation is used instead of a static train/test split to prevent from data leakage during re training.
 
+## MODEL RETRAINING & PROMOTION
+
+Closes the loop the monitoring stack left open. `edge_monitor.py` detects that
+the live model's edge has decayed, but nothing retrained the model and nothing
+decided whether a retrained model was actually better. The live model went from
+2026-03-23 to 2026-09-08 without a retrain because that decision was manual and
+was never made.
+
+### `trainer.py` — headless mode
+
+`trainer.py` gained a CLI so it can run unattended:
+
+| Flag | Effect |
+|------|--------|
+| `--headless` | Never reads stdin. Implies `--no-update-config`. |
+| `--output PATH` | Writes the bundle to PATH; **the live model is left untouched**. |
+| `--threshold FLOAT` | Skips validation tuning and uses this value. |
+| `--update-config` / `--no-update-config` | Explicitly control whether `CONFIDENCE_THRESHOLD` is written back to `config.py`. |
+
+`train()` now returns a dict (threshold, path written, split sizes, held-out
+test report) instead of `None`.
+
+**DESIGN DECISION:**
+`--output` exists because training previously always overwrote the production
+model — backing the old one up, then comparing afterwards via
+`compare_models.py`. That ordering meant a worse model was already trading by
+the time anyone looked at the comparison. A challenger is now built off to the
+side and the swap is a separate, gated decision.
+
+**DESIGN DECISION:**
+In headless mode `config.py` is never rewritten unless `--update-config` is
+passed explicitly. `config.py` is the source of truth the live bot reads; an
+unattended job editing it is not a safe default.
+
+### `promote_model.py` — the champion/challenger gate
+
+```
+1. Train challenger  →  models/XG_Boost_candidate.joblib   (champion untouched)
+2. Rebuild dataset, take the same chronological 70/20/10 split as trainer.py
+3. Score champion AND challenger on that one shared held-out test set
+4. decide_promotion()  →  promote / reject
+5. On promote only: archive champion → models/archive/, move candidate into place
+6. Write models/promotion_decision.json, post the decision to Discord
+```
+
+**DESIGN DECISION:**
+The gate is failure-biased — every ambiguous case keeps the incumbent. A model
+already trading has known live behaviour; a challenger has only test-set
+numbers. Ties, thin test sets, and an unreadable champion all resolve to
+REJECT. Promotion is the exception that must be argued for.
+
+**DESIGN DECISION:**
+Both models are scored inside `promote_model.py` on one freshly built split
+rather than trusting metrics reported by whatever produced each model. A
+comparison is only meaningful if both sides saw byte-identical test data.
+
+**DESIGN DECISION:**
+The gate judges the **BUY class**, not overall accuracy. HOLD dominates the
+label distribution, so accuracy would happily promote a model that quietly
+stopped buying. `PROMOTION_MIN_BUY_RECALL` exists specifically to reject the
+degenerate model that scores high precision by almost never firing.
+
+#### Gate checks (all must pass)
+
+| Check | Constant | Rejects |
+|-------|----------|---------|
+| `test_buy_support` | `PROMOTION_MIN_TEST_BUY_SUPPORT` (30) | Test set too thin to tell signal from noise |
+| `challenger_buy_precision` | `PROMOTION_MIN_BUY_PRECISION` (0.35) | Challenger below the absolute floor |
+| `challenger_buy_recall` | `PROMOTION_MIN_BUY_RECALL` (0.10) | Model that scores well by refusing to buy |
+| `backtest_trade_count` | `PROMOTION_MIN_BACKTEST_TRADES` (15) | Return built on too few positions to be a strategy |
+| `challenger_max_drawdown` | `PROMOTION_MAX_DRAWDOWN_PCT` (-35%) | Earns more by risking ruin |
+| `beats_champion_return` | `PROMOTION_MIN_RETURN_IMPROVEMENT_PCT` (1.0pp) | Simulated return improvement below the margin, or worse |
+
+**DESIGN DECISION — the head-to-head is dollars, not BUY F1.**
+The gate originally compared BUY F1. F1 is a proxy for money and can move the
+opposite way: it weights every BUY equally, whereas P&L weights them by how much
+each made or lost, so a model can improve F1 while trading worse. Both models are
+now run through `backtest.py` on the shared test split — net of the slippage and
+commission the simulator already applies — and compared on `total_return`.
+BUY F1 is still computed and reported for context but no longer gates.
+
+**DESIGN DECISION — simulated, not realized, P&L.**
+A challenger has never traded, so it has no realized P&L to compare. Both sides
+are therefore *simulated* over identical data. Realized P&L (`pnl_report.py`)
+measures the champion in production; the backtest measures a candidate before it
+gets there. The two answer different questions and are not interchangeable.
+
+`extract_backtest_metrics({})` collapses an empty result to values that fail
+every check, so a backtest that did not run can never promote by default.
+
+All four checks always run — the Discord report shows the full picture rather
+than stopping at the first failure. When no champion exists on disk,
+`beats_champion` auto-passes and the floors alone decide.
+
+#### `models/promotion_decision.json`
+
+```json
+{ "timestamp_utc", "promoted", "dry_run", "summary",
+  "checks": [{"name", "passed", "detail"}],
+  "champion": {...} | null, "challenger": {...}, "archived_to": ... }
+```
+
+**DESIGN DECISION:**
+CI cannot infer the outcome from the filesystem — the candidate file is *moved*
+on promotion and *deleted* on rejection, so it is absent either way. The
+workflow reads this file instead.
+
+#### CLI
+
+```bash
+python promote_model.py              # train, evaluate, promote if better
+python promote_model.py --dry-run    # decide and report, change nothing
+python promote_model.py --skip-train --candidate models/XG_Boost_candidate.joblib
+```
+
+Exit code 0 means *a decision was reached* — *both* PROMOTED and REJECTED are
+successful runs. Exit 1 means the run could not decide (missing data,
+unreadable champion) and the live model is untouched.
+
+### `retrain.yml`
+
+- **Runs:** `0 6 1 * *` (06:00 UTC, 1st of each month) plus `workflow_dispatch`
+  with a `dry_run` input.
+- **Why monthly:** the gate compares on the most recent 10% of the dataset.
+  Running faster than that slice meaningfully changes just re-decides on
+  near-identical data and adds model churn.
+- Neither `data/` nor `models/` is version-controlled, so the workflow rebuilds
+  the dataset from yfinance (`data_collector.py` + `market_data_collector.py`)
+  and pulls the live champion from PythonAnywhere. A 404 on the champion is not
+  fatal — it becomes a first promotion.
+- On promotion it uploads the new model back to PythonAnywhere (where
+  `live_trader.py` loads it from) and keeps the superseded champion as a
+  90-day build artifact, since `models/archive/` is gitignored.
+
+## BUG FIXES FOUND BY TEST COVERAGE
+
+Two defects surfaced while writing tests for `predictor.py`. Both are recorded
+here because each had been in place, silently, for months.
+
+### `is_ticker_stale` reported a missing CSV as fresh
+
+`predictor.is_ticker_stale()` returned `(False, -1)` when the ticker CSV did not
+exist — "not stale" — contradicting its own docstring ("`is_stale` — True when
+the CSV is missing…").
+
+Consequence: a missing CSV fell through to `predict_ticker()`, where
+`load_and_process()` raised `FileNotFoundError` into the bare `except Exception`
+in `live_trader.get_signals()`. That handler prints to console and writes **no
+row to signal_log.csv**, so the ticker vanished from the record while the run
+reported success — the exact silent-failure class the rest of this pipeline is
+built to catch. The `days_old == -1` / `"csv file missing"` branch in
+`get_signals()` was unreachable dead code.
+
+Fixed to return `(True, -1)`, which routes to that branch and logs
+`CSV_INVALID_SKIP` as this document already specified. Not a trading risk — the
+ticker was skipped either way — but an observability one.
+
+### `predictor.py` replaced `sys.stdout` at import time
+
+The module assigned a fresh `TextIOWrapper` over `sys.stdout.buffer` at import,
+to render emoji on Windows. That wrapper leaked into every importer and outlived
+the module, breaking pytest's capture teardown (`ValueError: I/O operation on
+closed file`) and making `predictor.py` — and anything importing it —
+untestable.
+
+Replaced with a guarded `sys.stdout.reconfigure(...)`, which mutates the stream
+in place instead of swapping the object.
+
 ## PRE-RUN VALIDATION
 
 ### `pre_run_validation.py`
@@ -478,6 +646,109 @@ All rows are preserved — no deletions (append-only semantics).
 **DESIGN DECISION:** 
 `outcome_tracker.py` is ran on GitHub workflow due to yfinance heavy dependency and PA free tier restrictions.
 
+### `pnl_report.py`
+
+Realized P&L attribution over the EXIT rows in `signal_log.csv`.
+
+`signal_logger.py` had been writing `realized_pnl`, `exit_reason`, `exit_price`
+and `shares` on every EXIT row for months and **nothing read them**. Performance
+reporting was win rate plus portfolio-vs-SPY, which answers "did the account go
+up" but not "which behaviour made or lost the money".
+
+Reports:
+
+| Section | Answers |
+|---------|---------|
+| OVERALL | Total realized P&L, profit factor, expectancy per trade, avg win vs avg loss |
+| BY EXIT REASON | Is `REBALANCE_TRIM` giving back what `TAKE_PROFIT` earns? |
+| BY TICKER | Which names carry the book |
+| BY CONFIDENCE TIER | Does model confidence actually predict realized dollars? |
+
+Tables are ordered **worst total first** — the reason to open this report is to
+find the leak.
+
+**DESIGN DECISION:**
+Win rate is reported by trade count *and* beside the dollar figures, because
+they routinely disagree. A 60% win rate with an average loss twice the average
+win loses money, and `outcome_tracker.py`'s win rate cannot see that.
+
+**DESIGN DECISION:**
+Entry price is derived from the EXIT row itself
+(`exit_price - realized_pnl / shares`) rather than joined from the ENTRY row.
+`log_exit()` records Alpaca's `avg_entry_price` while the ENTRY row records the
+signal-time price; they differ by slippage. Deriving keeps the return percentage
+consistent with the dollar figure next to it.
+
+**DESIGN DECISION:**
+Unlinked exits (`entry_order_id == "UNLINKED"`, or pre-migration blanks) are
+bucketed as `unknown` confidence rather than dropped. They are still real money
+and must not vanish from the totals.
+
+**Stop-loss coverage** depends on `reconcile_stops.py` having run. The report
+inspects its own data for `STOP_LOSS_FILL` rows and states which case it is
+looking at, rather than asserting coverage it cannot verify — without them,
+realized P&L is biased **upward** by however much the stopped-out positions lost.
+
+### `reconcile_stops.py`
+
+Recovers stop-loss exits that never reached `signal_log.csv`.
+
+Since stop-losses became standing Alpaca OTO child orders, they fire on Alpaca's
+side **between** bot sessions. The bot is not running when they fill, so
+`log_exit()` is never called and the position closes with no EXIT row. Every
+figure in `pnl_report.py` was missing its losing tail.
+
+This module queries Alpaca for filled stop orders and writes the missing EXIT
+rows with `exit_reason = "STOP_LOSS_FILL"`.
+
+**DESIGN DECISION:**
+Idempotency comes from the data, not a side-car state file. A reconciled row
+stores Alpaca's `filled_at` as its `exit_timestamp`, which is stable across runs,
+so `(ticker, exit_timestamp)` identifies a fill exactly and a re-run writes
+nothing. A state file (the `edge_monitor` pattern) would have to round-trip
+through PythonAnywhere and could drift out of sync with the log it describes —
+the log already round-trips.
+
+**DESIGN DECISION:**
+Entry price comes from `api.get_order(entry_order_id).filled_avg_price` — the
+actual fill of the original BUY — not the ENTRY row's signal-time `price`. The
+point of the module is to stop under-reporting losses; using the optimistic
+number would undercut it. If the order cannot be fetched the row is still
+written from the ENTRY row's price and counted as `degraded_entry_price`: a
+slightly imprecise loss is far closer to the truth than a missing one. If no
+entry price can be established at all the fill is **skipped and reported**,
+never fabricated.
+
+**DESIGN DECISION:**
+Linkage reuses `signal_logger.find_open_entry_order_id(ticker)`. Alpaca does not
+expose a parent id on an OTO child leg, and the open-ENTRY convention is what
+every other exit path already uses.
+
+`log_exit()` gained an optional `exit_timestamp` parameter to support this;
+it defaults to now, so every existing caller is unchanged.
+
+**Runs:** daily in `evaluate_signals.yml`, after `outcome_tracker.py` and
+**before** the log is uploaded back to PythonAnywhere, so recovered rows persist.
+
+```bash
+python reconcile_stops.py              # reconcile and write
+python reconcile_stops.py --dry-run    # report only
+python reconcile_stops.py --since 2026-06-01
+```
+
+Console output is deliberately ASCII: these scripts are run locally on Windows,
+where a piped stdout defaults to cp1252 and cannot encode `⚠`/`—`. Emoji remain
+in the Discord payload, which travels as JSON rather than through the terminal.
+
+**Runs:** in the weekly slot of `evaluate_signals.yml` (Fridays), reading the
+`signal_log.csv` already downloaded for the weekly summary.
+
+```bash
+python pnl_report.py                      # console report
+python pnl_report.py --discord            # also post to Discord
+python pnl_report.py --since 2026-06-01   # window the report
+```
+
 ## CONFIG
 ### `config.py` 
 Configuration for the stock analysis bot.
@@ -557,6 +828,51 @@ Simulates trading using historical model signals to evaluate strategy performanc
 Supports walk-forward split evaluation: the same simulation can be run on the
 training, validation, test, or full date ranges so performance on each period
 can be compared side-by-side.
+
+`--benchmark <split>` adds an equal-weight buy-and-hold arm and an SPY
+buy-and-hold arm over the same dates, with the same slippage and commission,
+through a shared `_summarise()`.
+
+**DESIGN DECISION:**
+Without a hold arm a positive backtest return says nothing — a rising market
+makes almost any long-biased strategy look profitable. The `train` and `full`
+splits print an IN-SAMPLE banner, because the model was fitted on those dates
+and their returns are memorisation, not performance.
+
+Usage:
+    python backtest.py                      # strategy only
+    python backtest.py --benchmark test     # strategy vs the hold arms
+
+### `edge_probe.py`
+Investigation tool, not part of the daily pipeline. Answers "does the model have
+edge at all?" — by scoring it against trivial baselines, and the strategy
+against buy-and-hold.
+
+Downloads 10y of history into `data/edge_probe/` and points `features.DATA_DIR`
+at it, so the live CSVs the next real training run reads are untouched. Writes
+`data/edge_probe_results.json`.
+
+| Mode | Question it answers |
+|------|---------------------|
+| (default) | Does more training history help? Test window held fixed while the lookback varies. |
+| `--features` | Which features carry signal? SHAP ranking, then retrain on the top K only. |
+| `--label-scales` | Does a wider HOLD band make the labels more learnable? |
+| `--regimes` | Does the strategy beat buy-and-hold walk-forward, across bull and bear windows? |
+| `--exposure` | Is the return deficit exposure or selection? Five allocation policies over one model per window. |
+
+**DESIGN DECISION:**
+Every `--exposure` arm is expressed as a rewrite of the signal frames and run
+through the same `backtest._simulate`, so slippage, commission, drawdown and
+accounting are identical across arms. A difference between arms therefore cannot
+be an artifact of the simulator. The regime arms use a 200-day SMA on SPY lagged
+one session — a timing rule that reads the close it trades on is the easiest way
+to manufacture an edge that is not there.
+
+Findings are written up in `docs/EDGE_INVESTIGATION_2026-09-08.md`. In short: the
+strategy does not beat buy-and-hold out of sample, the model changes that improve
+its classification metrics make returns worse, and sizing up doubles the
+shortfall. **Nothing in production was changed as a result** — there was nothing
+better to ship.
 
 ### `compare_models.py`
 Compares test-set metrics between the current model and the backup model.

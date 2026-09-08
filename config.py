@@ -167,6 +167,62 @@ EDGE_STALENESS_DAYS     = 10          # if most recent WIN/LOSS evaluation older
 EDGE_WINDOW_SIZE        = 30          # rolling window over last N evaluated BUYs
 EDGE_MONITOR_STATE_PATH = "data/edge_monitor_state.json"
 
+# --- Model promotion gate (promote_model.py) --------------------------------
+# A retrained "challenger" never replaces the live "champion" on the strength of
+# being newer. It must beat the champion on the same held-out test set, by a
+# margin, and clear absolute floors. Every threshold below is a reason to REJECT;
+# the gate defaults to keeping the incumbent whenever a check cannot be made.
+
+CANDIDATE_MODEL_FILENAME = "XG_Boost_candidate.joblib"
+MODEL_ARCHIVE_DIR        = os.path.join(MODEL_DIR, "archive")
+
+# --- Head-to-head: simulated dollars ---------------------------------------
+# The gate compares models by backtested total return on the shared test split,
+# not by BUY F1. F1 is a proxy for money and can move the opposite way: a model
+# can improve F1 while trading worse, because F1 weights every BUY equally
+# whereas P&L weights them by how much they made or lost. backtest.py already
+# applies slippage and commission, so the comparison is net of costs.
+#
+# A challenger cannot be judged on REALIZED P&L — it has never traded. Both
+# sides are therefore simulated over identical data. Realized P&L (pnl_report.py)
+# measures the champion in production; this measures a candidate before it gets
+# there.
+#
+# Percentage points of total return the challenger must add over the champion.
+PROMOTION_MIN_RETURN_IMPROVEMENT_PCT = 1.0
+
+# Below this many simulated trades the return figure is one or two lucky
+# positions rather than a strategy, and the gate refuses to decide on it.
+PROMOTION_MIN_BACKTEST_TRADES = 15
+
+# Reject a challenger whose simulated drawdown is worse than this, even if its
+# total return is higher. A model that earns more by risking ruin is not an
+# improvement.
+PROMOTION_MAX_DRAWDOWN_PCT = -35.0
+
+# BUY F1 is still recorded and reported for context, but no longer gates.
+# Retained so the constant's absence does not silently change old behaviour.
+PROMOTION_MIN_BUY_F1_IMPROVEMENT = 0.01
+
+# Absolute floors the challenger must clear regardless of how poor the champion
+# looks. Guards against promoting a bad model simply because the incumbent
+# decayed further.
+PROMOTION_MIN_BUY_PRECISION = 0.35
+PROMOTION_MIN_BUY_RECALL    = 0.10
+
+# Minimum number of true BUY rows in the test set. Below this the comparison is
+# noise and the gate refuses to decide rather than guessing.
+PROMOTION_MIN_TEST_BUY_SUPPORT = 30
+
+# Retention for models/archive/. Superseded champions are kept so a bad
+# promotion can be rolled back by hand.
+MODEL_ARCHIVE_RETAIN = 10
+
+# Where promote_model.py records what it decided. The candidate file is
+# consumed on both outcomes (moved on promotion, deleted on rejection), so CI
+# cannot infer the result from the filesystem and reads this instead.
+PROMOTION_DECISION_PATH = os.path.join(MODEL_DIR, "promotion_decision.json")
+
 # Technical indicator columns used as model input features.
 # Must stay in sync with the columns produced by features.add_features().
 FEATURE_COLUMNS = [

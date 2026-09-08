@@ -203,6 +203,7 @@ def log_exit(
     exit_reason: str,
     shares: int | float,
     today: date | None = None,
+    exit_timestamp: str | None = None,
 ) -> None:
     """
     Append one EXIT row to signal_log.csv.
@@ -219,8 +220,14 @@ def log_exit(
     entry_price    : avg entry price of the closed position
     exit_price     : price at which the position closed
     exit_reason    : "TAKE_PROFIT" | "MODEL_SELL" | "REBALANCE_TRIM"
+                     | "STOP_LOSS_FILL"
     shares         : number of shares closed
     today          : override today's date; defaults to datetime.now(timezone.utc).date()
+    exit_timestamp : override the exit timestamp; defaults to now. Set by
+                     reconcile_stops.py to Alpaca's `filled_at`, so a
+                     reconciled row carries the moment the stop actually
+                     fired rather than the moment it was discovered — which
+                     is also what makes re-running the reconciler idempotent.
 
     ENTRY-only columns (model_signal, price, qty, confidence,
     evaluation_date, actual_action, outcome_price, result,
@@ -231,7 +238,8 @@ def log_exit(
     if today is None:
         today = datetime.now(timezone.utc).date()
 
-    exit_timestamp = datetime.now().isoformat(timespec="seconds")
+    if exit_timestamp is None:
+        exit_timestamp = datetime.now().isoformat(timespec="seconds")
     realized_pnl = round((float(exit_price) - float(entry_price)) * float(shares), 4)
 
     row = {

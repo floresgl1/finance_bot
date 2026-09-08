@@ -1,14 +1,26 @@
+# --- Execution ---------------------------------------------------------
+# Declared explicitly: live_trader.py previously relied on a runtime
+# subprocess pip-install fallback if this import failed.
+alpaca-trade-api
+
+# --- Data / ML ---------------------------------------------------------
 yfinance
 pandas
 numpy
 scikit-learn
 ta
+xgboost
+shap
+
+# --- Sentiment (FinBERT) ----------------------------------------------
 transformers
 torch
-python-dotenv
-xgboost
-requests
-shap
+
+# --- Agent -------------------------------------------------------------
 tavily-python
-tenacity
 groq
+tenacity
+
+# --- Misc --------------------------------------------------------------
+python-dotenv
+requests

@@ -1,0 +1,6 @@
+# Development / CI dependencies.
+# Installs the full production set so tests exercise the same imports
+# production does, plus the test runner itself.
+-r requirements.txt
+
+pytest
