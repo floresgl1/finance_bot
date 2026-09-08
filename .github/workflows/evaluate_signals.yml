@@ -245,6 +245,20 @@ jobs:
         run: python outcome_tracker.py --weekly
 
       # ------------------------------------------------------------------
+      # Realized P&L attribution — reads the same signal_log.csv downloaded
+      # above, so no extra fetch. Runs beside the weekly summary because the
+      # two answer different questions: outcome_tracker reports win rate and
+      # portfolio-vs-SPY, this reports which exit reason actually made or
+      # lost the money. A high win rate with a negative expectancy is only
+      # visible here.
+      # ------------------------------------------------------------------
+      - name: Post realized P&L attribution to Discord
+        if: steps.download.outputs.has_data == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python pnl_report.py --discord
+
+      # ------------------------------------------------------------------
       # Edge degradation monitor — runs in the same weekly slot as the
       # summary so we get one cadence for retrain-trigger decisions.
       # Reads the signal_log.csv already downloaded above; reads/writes
