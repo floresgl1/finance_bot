@@ -13,7 +13,7 @@ Flow
        trainer.py uses; the last 10% is the shared held-out test set.
     3. Evaluate champion and challenger on that identical test set.
     4. Apply the gate (decide_promotion). Reject unless the challenger beats
-       the champion by a margin AND clears absolute floors.
+       the champion by a margin, beats buy-and-hold, AND clears absolute floors.
     5. Only on a pass: archive the champion, then swap the candidate in.
     6. Report the decision to Discord either way.
 
@@ -67,6 +67,7 @@ from config import (
     PROMOTION_MIN_RETURN_IMPROVEMENT_PCT,
     PROMOTION_MIN_BACKTEST_TRADES,
     PROMOTION_MAX_DRAWDOWN_PCT,
+    PROMOTION_MIN_HOLD_DELTA_PCT,
 )
 
 CHAMPION_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
@@ -94,13 +95,20 @@ def extract_gate_metrics(report: dict) -> dict:
     }
 
 
-def extract_backtest_metrics(stats: dict) -> dict:
+def extract_backtest_metrics(stats: dict, hold_stats: dict | None = None) -> dict:
     """Pull the simulated-trading metrics the gate decides on.
 
     An empty stats dict (backtest produced nothing) collapses to values that
     fail every check rather than passing vacuously — the gate must not promote
     on the strength of a simulation that did not run.
+
+    `hold_return` is None when no buy-and-hold arm was run. That is deliberately
+    not 0.0: a missing benchmark must fail the comparison, and a zero would let
+    any profitable challenger clear it.
     """
+    hold_return = (
+        float(hold_stats.get("total_return", 0.0)) if hold_stats else None
+    )
     if not stats:
         return {
             "total_return": 0.0,
@@ -109,6 +117,7 @@ def extract_backtest_metrics(stats: dict) -> dict:
             "avg_return":   0.0,
             "max_drawdown": -100.0,
             "final_value":  0.0,
+            "hold_return":  hold_return,
         }
     return {
         "total_return": float(stats.get("total_return", 0.0)),
@@ -117,6 +126,7 @@ def extract_backtest_metrics(stats: dict) -> dict:
         "avg_return":   float(stats.get("avg_return", 0.0)),
         "max_drawdown": float(stats.get("max_drawdown", -100.0)),
         "final_value":  float(stats.get("final_value", 0.0)),
+        "hold_return":  hold_return,
     }
 
 
@@ -128,23 +138,30 @@ def score_model(bundle: dict, X_test, y_test, threshold: float) -> dict:
     per model rather than juggling two parallel ones.
     """
     from compare_models import evaluate
-    from backtest import run_backtest, load_all_tickers
+    from backtest import run_benchmarks, load_all_tickers
 
     classification = extract_gate_metrics(
         evaluate(bundle, X_test, y_test, threshold)["report_thresh"]
     )
 
     # Signals are model-specific, so ticker_data must be regenerated per model.
-    # run_backtest applies the same split boundaries as trainer.py.
+    # run_benchmarks applies the same split boundaries as trainer.py, and
+    # simulates the equal-weight hold arm over the same dates from the same
+    # frames — so the gate never compares against a differently-dated basket.
     ticker_data = load_all_tickers(bundle["model"], bundle["encoder"])
-    stats = run_backtest(
+    results = run_benchmarks(
         split="test",
         model=bundle["model"],
         encoder=bundle["encoder"],
         ticker_data=ticker_data,
     )
 
-    return {**classification, **extract_backtest_metrics(stats)}
+    return {
+        **classification,
+        **extract_backtest_metrics(
+            results.get("strategy") or {}, results.get("buy_and_hold")
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -236,9 +253,34 @@ def decide_promotion(
             f"required {PROMOTION_MIN_RETURN_IMPROVEMENT_PCT:+.2f}pp)",
         )
 
+    # --- 6. Beat doing nothing ---------------------------------------------
+    # Independent of the champion. Two models can trade each other in circles
+    # while both lose to holding the basket, and checks 1-5 would promote on
+    # every lap.
+    hold_return = challenger.get("hold_return")
+    if hold_return is None:
+        beats_hold_ok = record(
+            "beats_buy_and_hold",
+            False,
+            "no buy-and-hold benchmark was produced - refusing to promote a "
+            "model that cannot be compared against doing nothing",
+        )
+    else:
+        required_vs_hold = hold_return + PROMOTION_MIN_HOLD_DELTA_PCT
+        hold_delta = challenger["total_return"] - hold_return
+        beats_hold_ok = record(
+            "beats_buy_and_hold",
+            challenger["total_return"] >= required_vs_hold,
+            f"backtest return {challenger['total_return']:+.2f}% vs "
+            f"equal-weight hold {hold_return:+.2f}% "
+            f"(delta {hold_delta:+.2f}pp, required "
+            f"{PROMOTION_MIN_HOLD_DELTA_PCT:+.2f}pp)",
+        )
+
     promote = (
         support_ok and precision_ok and recall_ok
         and trades_ok and drawdown_ok and improvement_ok
+        and beats_hold_ok
     )
 
     if promote:
@@ -371,6 +413,18 @@ def build_report(
     else:
         lines.append(_row("Champion  ", champion))
     lines.append(_row("Challenger", challenger))
+
+    # The benchmark is the reason a promotion can be rejected while the
+    # challenger still beats the champion, so it belongs in the report body
+    # rather than only inside a check line.
+    hold_return = challenger.get("hold_return")
+    if hold_return is None:
+        lines.append("Buy-and-hold — _not measured_")
+    else:
+        lines.append(
+            f"Buy-and-hold — **{hold_return:+.2f}%** over the same dates "
+            f"(challenger {challenger['total_return'] - hold_return:+.2f}pp)"
+        )
     lines.append("")
 
     for check in decision["checks"]:

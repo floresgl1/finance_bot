@@ -143,6 +143,7 @@ degenerate model that scores high precision by almost never firing.
 | `backtest_trade_count` | `PROMOTION_MIN_BACKTEST_TRADES` (15) | Return built on too few positions to be a strategy |
 | `challenger_max_drawdown` | `PROMOTION_MAX_DRAWDOWN_PCT` (-35%) | Earns more by risking ruin |
 | `beats_champion_return` | `PROMOTION_MIN_RETURN_IMPROVEMENT_PCT` (1.0pp) | Simulated return improvement below the margin, or worse |
+| `beats_buy_and_hold` | `PROMOTION_MIN_HOLD_DELTA_PCT` (0.0pp) | Loses to holding an equal-weight basket over the same dates |
 
 **DESIGN DECISION — the head-to-head is dollars, not BUY F1.**
 The gate originally compared BUY F1. F1 is a proxy for money and can move the
@@ -151,6 +152,26 @@ each made or lost, so a model can improve F1 while trading worse. Both models ar
 now run through `backtest.py` on the shared test split — net of the slippage and
 commission the simulator already applies — and compared on `total_return`.
 BUY F1 is still computed and reported for context but no longer gates.
+
+**DESIGN DECISION — beating the champion is not sufficient.**
+Checks 1-5 are all relative to the incumbent or to absolute floors, and none of
+them can notice that *both* models lose to simply holding the watchlist. That is
+not hypothetical: the edge investigation
+(`docs/EDGE_INVESTIGATION_2026-09-08.md`, findings A/E/F) found every
+configuration tested losing to an equal-weight hold over the same dates. Without
+`beats_buy_and_hold` the gate would ratchet between models that are each worse
+than running no model at all.
+
+`score_model()` therefore calls `backtest.run_benchmarks()` rather than
+`run_backtest()`, so the hold arm is simulated from the same frames over the
+same dates as the strategy — the comparison can never drift onto a differently
+dated basket. `hold_return` is `None` when no benchmark was produced, and the
+check **fails** on `None` rather than defaulting to 0.0, which would let any
+profitable challenger clear it.
+
+The threshold is 0.0pp: a challenger must at least *match* holding. Raise
+`PROMOTION_MIN_HOLD_DELTA_PCT` to demand a margin for the operational risk of
+running a bot at all.
 
 **DESIGN DECISION — simulated, not realized, P&L.**
 A challenger has never traded, so it has no realized P&L to compare. Both sides
@@ -161,9 +182,11 @@ gets there. The two answer different questions and are not interchangeable.
 `extract_backtest_metrics({})` collapses an empty result to values that fail
 every check, so a backtest that did not run can never promote by default.
 
-All four checks always run — the Discord report shows the full picture rather
+All seven checks always run — the Discord report shows the full picture rather
 than stopping at the first failure. When no champion exists on disk,
-`beats_champion` auto-passes and the floors alone decide.
+`beats_champion_return` auto-passes and the remaining checks decide.
+`beats_buy_and_hold` does **not** auto-pass in that case: the first model to
+trade still has to be better than not trading.
 
 #### `models/promotion_decision.json`
 
