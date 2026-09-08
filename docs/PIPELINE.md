@@ -712,6 +712,49 @@ inspects its own data for `STOP_LOSS_FILL` rows and states which case it is
 looking at, rather than asserting coverage it cannot verify — without them,
 realized P&L is biased **upward** by however much the stopped-out positions lost.
 
+### `live_benchmark.py`
+Answers the one question every other return figure in this project only
+simulates: **did the real account beat holding the basket?**
+
+The strategy arm is Alpaca's own portfolio history. The benchmark arms are an
+equal-weight buy-and-hold of `WATCHLIST` and an SPY hold, both started on the
+account curve's first day, from the account's own starting equity, paying the
+same `SLIPPAGE` and `COMMISSION` that `backtest.py` applies.
+
+**DESIGN DECISION — the account, not the log.**
+The equity curve comes from `api.get_portfolio_history()`, not from
+reconstructing fills out of `signal_log.csv`. The log records what the bot
+decided and managed to write down; the account records what actually filled. A
+reconstruction would silently absorb missed fills, partial fills, stop-loss
+fills that never passed through `log_exit()`, and cash drag — precisely the
+errors this exists to catch. `pnl_report.py` attributes P&L *across the log*;
+this measures *the account*.
+
+**DESIGN DECISION — refuse a verdict rather than report a wrong one.**
+A deposit, withdrawal or paper-account reset looks exactly like a spectacular
+day, and Alpaca's portfolio history does not distinguish them from P&L.
+`detect_transfers()` flags single-day equity moves at or beyond
+`TRANSFER_MOVE_PCT` (25%), and the report then states the flagged dates and
+gives **no** verdict instead of a number it cannot stand behind.
+
+**DESIGN DECISION — the price source is stated, not inferred.**
+Nothing under `data/` is tracked in git, so a CI runner has no price CSVs and
+would silently produce an empty basket arm. `--fetch` downloads the window from
+yfinance instead, and the report always names which source it used. Alpaca's
+leading zero-equity padding rows (sessions before the account was funded) are
+dropped — one leading zero makes total return infinite.
+
+Usage:
+    python live_benchmark.py                  # console report, 90 days
+    python live_benchmark.py --days 180
+    python live_benchmark.py --fetch          # download prices (CI has no CSVs)
+    python live_benchmark.py --discord
+
+Runs in the **weekly** slot of `evaluate_signals.yml`. Unlike the other weekly
+steps it is *not* gated on the PythonAnywhere download, because it reads Alpaca
+rather than `signal_log.csv` and should still report on a week when that
+download failed.
+
 ### `reconcile_stops.py`
 
 Recovers stop-loss exits that never reached `signal_log.csv`.
