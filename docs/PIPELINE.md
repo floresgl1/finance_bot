@@ -140,7 +140,26 @@ degenerate model that scores high precision by almost never firing.
 | `test_buy_support` | `PROMOTION_MIN_TEST_BUY_SUPPORT` (30) | Test set too thin to tell signal from noise |
 | `challenger_buy_precision` | `PROMOTION_MIN_BUY_PRECISION` (0.35) | Challenger below the absolute floor |
 | `challenger_buy_recall` | `PROMOTION_MIN_BUY_RECALL` (0.10) | Model that scores well by refusing to buy |
-| `beats_champion` | `PROMOTION_MIN_BUY_F1_IMPROVEMENT` (0.01) | Improvement smaller than the margin, or worse |
+| `backtest_trade_count` | `PROMOTION_MIN_BACKTEST_TRADES` (15) | Return built on too few positions to be a strategy |
+| `challenger_max_drawdown` | `PROMOTION_MAX_DRAWDOWN_PCT` (-35%) | Earns more by risking ruin |
+| `beats_champion_return` | `PROMOTION_MIN_RETURN_IMPROVEMENT_PCT` (1.0pp) | Simulated return improvement below the margin, or worse |
+
+**DESIGN DECISION — the head-to-head is dollars, not BUY F1.**
+The gate originally compared BUY F1. F1 is a proxy for money and can move the
+opposite way: it weights every BUY equally, whereas P&L weights them by how much
+each made or lost, so a model can improve F1 while trading worse. Both models are
+now run through `backtest.py` on the shared test split — net of the slippage and
+commission the simulator already applies — and compared on `total_return`.
+BUY F1 is still computed and reported for context but no longer gates.
+
+**DESIGN DECISION — simulated, not realized, P&L.**
+A challenger has never traded, so it has no realized P&L to compare. Both sides
+are therefore *simulated* over identical data. Realized P&L (`pnl_report.py`)
+measures the champion in production; the backtest measures a candidate before it
+gets there. The two answer different questions and are not interchangeable.
+
+`extract_backtest_metrics({})` collapses an empty result to values that fail
+every check, so a backtest that did not run can never promote by default.
 
 All four checks always run — the Discord report shows the full picture rather
 than stopping at the first failure. When no champion exists on disk,
@@ -185,6 +204,40 @@ unreadable champion) and the live model is untouched.
 - On promotion it uploads the new model back to PythonAnywhere (where
   `live_trader.py` loads it from) and keeps the superseded champion as a
   90-day build artifact, since `models/archive/` is gitignored.
+
+## BUG FIXES FOUND BY TEST COVERAGE
+
+Two defects surfaced while writing tests for `predictor.py`. Both are recorded
+here because each had been in place, silently, for months.
+
+### `is_ticker_stale` reported a missing CSV as fresh
+
+`predictor.is_ticker_stale()` returned `(False, -1)` when the ticker CSV did not
+exist — "not stale" — contradicting its own docstring ("`is_stale` — True when
+the CSV is missing…").
+
+Consequence: a missing CSV fell through to `predict_ticker()`, where
+`load_and_process()` raised `FileNotFoundError` into the bare `except Exception`
+in `live_trader.get_signals()`. That handler prints to console and writes **no
+row to signal_log.csv**, so the ticker vanished from the record while the run
+reported success — the exact silent-failure class the rest of this pipeline is
+built to catch. The `days_old == -1` / `"csv file missing"` branch in
+`get_signals()` was unreachable dead code.
+
+Fixed to return `(True, -1)`, which routes to that branch and logs
+`CSV_INVALID_SKIP` as this document already specified. Not a trading risk — the
+ticker was skipped either way — but an observability one.
+
+### `predictor.py` replaced `sys.stdout` at import time
+
+The module assigned a fresh `TextIOWrapper` over `sys.stdout.buffer` at import,
+to render emoji on Windows. That wrapper leaked into every importer and outlived
+the module, breaking pytest's capture teardown (`ValueError: I/O operation on
+closed file`) and making `predictor.py` — and anything importing it —
+untestable.
+
+Replaced with a guarded `sys.stdout.reconfigure(...)`, which mutates the stream
+in place instead of swapping the object.
 
 ## PRE-RUN VALIDATION
 
@@ -631,14 +684,57 @@ Unlinked exits (`entry_order_id == "UNLINKED"`, or pre-migration blanks) are
 bucketed as `unknown` confidence rather than dropped. They are still real money
 and must not vanish from the totals.
 
-> ⚠️ **KNOWN BLIND SPOT — stop-loss exits are absent from this data.**
-> Since standing stop-losses moved to Alpaca-side OTO orders, a stop fires
-> between bot sessions and never passes through `log_exit()`. Every
-> closed-by-stop position is therefore missing from every figure the report
-> produces, which biases realized P&L **upward**. The report prints this caveat
-> on every run rather than presenting a clean-looking total. Closing the gap
-> means reconciling filled stop orders back from the Alpaca orders API — a
-> separate change, not yet done.
+**Stop-loss coverage** depends on `reconcile_stops.py` having run. The report
+inspects its own data for `STOP_LOSS_FILL` rows and states which case it is
+looking at, rather than asserting coverage it cannot verify — without them,
+realized P&L is biased **upward** by however much the stopped-out positions lost.
+
+### `reconcile_stops.py`
+
+Recovers stop-loss exits that never reached `signal_log.csv`.
+
+Since stop-losses became standing Alpaca OTO child orders, they fire on Alpaca's
+side **between** bot sessions. The bot is not running when they fill, so
+`log_exit()` is never called and the position closes with no EXIT row. Every
+figure in `pnl_report.py` was missing its losing tail.
+
+This module queries Alpaca for filled stop orders and writes the missing EXIT
+rows with `exit_reason = "STOP_LOSS_FILL"`.
+
+**DESIGN DECISION:**
+Idempotency comes from the data, not a side-car state file. A reconciled row
+stores Alpaca's `filled_at` as its `exit_timestamp`, which is stable across runs,
+so `(ticker, exit_timestamp)` identifies a fill exactly and a re-run writes
+nothing. A state file (the `edge_monitor` pattern) would have to round-trip
+through PythonAnywhere and could drift out of sync with the log it describes —
+the log already round-trips.
+
+**DESIGN DECISION:**
+Entry price comes from `api.get_order(entry_order_id).filled_avg_price` — the
+actual fill of the original BUY — not the ENTRY row's signal-time `price`. The
+point of the module is to stop under-reporting losses; using the optimistic
+number would undercut it. If the order cannot be fetched the row is still
+written from the ENTRY row's price and counted as `degraded_entry_price`: a
+slightly imprecise loss is far closer to the truth than a missing one. If no
+entry price can be established at all the fill is **skipped and reported**,
+never fabricated.
+
+**DESIGN DECISION:**
+Linkage reuses `signal_logger.find_open_entry_order_id(ticker)`. Alpaca does not
+expose a parent id on an OTO child leg, and the open-ENTRY convention is what
+every other exit path already uses.
+
+`log_exit()` gained an optional `exit_timestamp` parameter to support this;
+it defaults to now, so every existing caller is unchanged.
+
+**Runs:** daily in `evaluate_signals.yml`, after `outcome_tracker.py` and
+**before** the log is uploaded back to PythonAnywhere, so recovered rows persist.
+
+```bash
+python reconcile_stops.py              # reconcile and write
+python reconcile_stops.py --dry-run    # report only
+python reconcile_stops.py --since 2026-06-01
+```
 
 Console output is deliberately ASCII: these scripts are run locally on Windows,
 where a piped stdout defaults to cp1252 and cannot encode `⚠`/`—`. Emoji remain
