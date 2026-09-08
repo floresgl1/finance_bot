@@ -35,6 +35,12 @@ def _metrics(
     buy_recall: float = 0.50,
     buy_support: int = 100,
     accuracy: float = 0.60,
+    total_return: float = 5.0,
+    n_trades: int = 40,
+    bt_win_rate: float = 50.0,
+    avg_return: float = 1.0,
+    max_drawdown: float = -10.0,
+    final_value: float = 10_500.0,
 ) -> dict:
     return {
         "buy_f1": buy_f1,
@@ -42,16 +48,29 @@ def _metrics(
         "buy_recall": buy_recall,
         "buy_support": buy_support,
         "accuracy": accuracy,
+        "total_return": total_return,
+        "n_trades": n_trades,
+        "bt_win_rate": bt_win_rate,
+        "avg_return": avg_return,
+        "max_drawdown": max_drawdown,
+        "final_value": final_value,
     }
 
 
 def _winner(champion: dict) -> dict:
     """A challenger that clears every gate against `champion`."""
     return _metrics(
-        buy_f1=champion["buy_f1"] + config.PROMOTION_MIN_BUY_F1_IMPROVEMENT + 0.05,
+        buy_f1=champion["buy_f1"] + 0.05,
         buy_precision=config.PROMOTION_MIN_BUY_PRECISION + 0.10,
         buy_recall=config.PROMOTION_MIN_BUY_RECALL + 0.10,
         buy_support=config.PROMOTION_MIN_TEST_BUY_SUPPORT + 50,
+        total_return=(
+            champion["total_return"]
+            + config.PROMOTION_MIN_RETURN_IMPROVEMENT_PCT
+            + 5.0
+        ),
+        n_trades=config.PROMOTION_MIN_BACKTEST_TRADES + 25,
+        max_drawdown=config.PROMOTION_MAX_DRAWDOWN_PCT + 15.0,
     )
 
 
@@ -109,21 +128,23 @@ def test_clearly_better_challenger_is_promoted():
 
 def test_marginally_better_challenger_is_rejected():
     """Beating the champion by less than the margin is not enough."""
-    champion = _metrics(buy_f1=0.40)
+    champion = _metrics(total_return=5.0)
     challenger = _winner(champion)
-    challenger["buy_f1"] = 0.40 + config.PROMOTION_MIN_BUY_F1_IMPROVEMENT - 0.001
+    challenger["total_return"] = (
+        5.0 + config.PROMOTION_MIN_RETURN_IMPROVEMENT_PCT - 0.01
+    )
 
     decision = decide_promotion(champion, challenger)
 
     assert decision["promote"] is False
-    assert "beats_champion" in _failed_check_names(decision)
+    assert "beats_champion_return" in _failed_check_names(decision)
 
 
 def test_challenger_exactly_at_the_margin_is_promoted():
     """The comparison is `>=`, so hitting the margin exactly must pass."""
-    champion = _metrics(buy_f1=0.40)
+    champion = _metrics(total_return=5.0)
     challenger = _winner(champion)
-    challenger["buy_f1"] = 0.40 + config.PROMOTION_MIN_BUY_F1_IMPROVEMENT
+    challenger["total_return"] = 5.0 + config.PROMOTION_MIN_RETURN_IMPROVEMENT_PCT
 
     decision = decide_promotion(champion, challenger)
 
@@ -136,18 +157,104 @@ def test_identical_model_is_rejected():
     decision = decide_promotion(champion, dict(champion))
 
     assert decision["promote"] is False
-    assert "beats_champion" in _failed_check_names(decision)
+    assert "beats_champion_return" in _failed_check_names(decision)
 
 
 def test_worse_challenger_is_rejected():
-    champion = _metrics(buy_f1=0.60)
+    champion = _metrics(total_return=12.0)
     challenger = _winner(champion)
-    challenger["buy_f1"] = 0.30
+    challenger["total_return"] = -4.0
 
     decision = decide_promotion(champion, challenger)
 
     assert decision["promote"] is False
-    assert "beats_champion" in _failed_check_names(decision)
+    assert "beats_champion_return" in _failed_check_names(decision)
+
+
+def test_better_f1_does_not_promote_a_worse_earner():
+    """The whole point of moving the gate off F1: the two can disagree, and
+    dollars win."""
+    champion = _metrics(buy_f1=0.30, total_return=15.0)
+    challenger = _winner(champion)
+    challenger["buy_f1"] = 0.95          # far better classifier
+    challenger["total_return"] = 2.0     # far worse trader
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is False
+    assert "beats_champion_return" in _failed_check_names(decision)
+
+
+def test_worse_f1_can_still_promote_a_better_earner():
+    """The converse — F1 no longer has a veto."""
+    champion = _metrics(buy_f1=0.60, total_return=2.0)
+    challenger = _winner(champion)
+    challenger["buy_f1"] = 0.35
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is True
+
+
+# --- backtest sample size --------------------------------------------------
+
+
+def test_too_few_simulated_trades_blocks_promotion():
+    """A return built on three positions is luck, not a strategy."""
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["n_trades"] = config.PROMOTION_MIN_BACKTEST_TRADES - 1
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is False
+    assert "backtest_trade_count" in _failed_check_names(decision)
+
+
+def test_trade_count_exactly_at_minimum_passes():
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["n_trades"] = config.PROMOTION_MIN_BACKTEST_TRADES
+
+    assert decide_promotion(champion, challenger)["promote"] is True
+
+
+def test_a_backtest_that_did_not_run_cannot_promote():
+    """extract_backtest_metrics collapses empty stats to failing values."""
+    from promote_model import extract_backtest_metrics
+
+    empty = extract_backtest_metrics({})
+    challenger = {**_winner(_metrics()), **empty}
+
+    decision = decide_promotion(_metrics(total_return=1.0), challenger)
+
+    assert decision["promote"] is False
+
+
+# --- drawdown floor --------------------------------------------------------
+
+
+def test_catastrophic_drawdown_blocks_a_higher_return():
+    """Earning more by risking ruin is not an improvement."""
+    champion = _metrics(total_return=5.0, max_drawdown=-8.0)
+    challenger = _winner(champion)
+    challenger["total_return"] = 50.0
+    challenger["max_drawdown"] = config.PROMOTION_MAX_DRAWDOWN_PCT - 0.1
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is False
+    assert "challenger_max_drawdown" in _failed_check_names(decision)
+    # It genuinely did earn more — risk is what stopped it.
+    assert "beats_champion_return" not in _failed_check_names(decision)
+
+
+def test_drawdown_exactly_at_floor_passes():
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["max_drawdown"] = config.PROMOTION_MAX_DRAWDOWN_PCT
+
+    assert decide_promotion(champion, challenger)["promote"] is True
 
 
 # --- absolute floors -------------------------------------------------------
@@ -164,7 +271,7 @@ def test_low_precision_challenger_rejected_even_when_it_beats_a_worse_champion()
     assert decision["promote"] is False
     assert "challenger_buy_precision" in _failed_check_names(decision)
     # It genuinely did beat the champion — the floor is what stopped it.
-    assert "beats_champion" not in _failed_check_names(decision)
+    assert "beats_champion_return" not in _failed_check_names(decision)
 
 
 def test_precision_exactly_at_floor_passes():
@@ -257,7 +364,7 @@ def test_first_promotion_with_no_champion_passes_on_floors_alone():
     assert decision["promote"] is True
     assert "no champion" in dict(
         (c["name"], c["detail"]) for c in decision["checks"]
-    )["beats_champion"]
+    )["beats_champion_return"]
 
 
 def test_first_promotion_still_enforces_the_floors():
@@ -278,9 +385,10 @@ def test_first_promotion_still_enforces_the_floors():
 
 def test_every_check_runs_even_after_one_fails():
     """The Discord report shows the full picture, not just the first failure."""
-    champion = _metrics(buy_f1=0.90)
+    champion = _metrics(buy_f1=0.90, total_return=40.0)
     challenger = _metrics(
-        buy_f1=0.01, buy_precision=0.01, buy_recall=0.01, buy_support=1
+        buy_f1=0.01, buy_precision=0.01, buy_recall=0.01, buy_support=1,
+        total_return=-20.0, n_trades=2, max_drawdown=-90.0,
     )
 
     decision = decide_promotion(champion, challenger)
@@ -290,9 +398,11 @@ def test_every_check_runs_even_after_one_fails():
         "test_buy_support",
         "challenger_buy_precision",
         "challenger_buy_recall",
-        "beats_champion",
+        "backtest_trade_count",
+        "challenger_max_drawdown",
+        "beats_champion_return",
     ]
-    assert len(_failed_check_names(decision)) == 4
+    assert len(_failed_check_names(decision)) == 6
 
 
 def test_summary_names_the_failed_checks():
@@ -423,7 +533,7 @@ def test_decision_file_records_a_promotion(tmp_path):
     assert payload["archived_to"] == "models/archive/x.joblib"
     assert payload["champion"]["buy_f1"] == 0.40
     assert payload["challenger"] == challenger
-    assert len(payload["checks"]) == 4
+    assert len(payload["checks"]) == 6
     assert "timestamp_utc" in payload
 
 

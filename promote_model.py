@@ -61,10 +61,12 @@ from config import (
     MODEL_ARCHIVE_RETAIN,
     PROMOTION_DECISION_PATH,
     CONFIDENCE_THRESHOLD,
-    PROMOTION_MIN_BUY_F1_IMPROVEMENT,
     PROMOTION_MIN_BUY_PRECISION,
     PROMOTION_MIN_BUY_RECALL,
     PROMOTION_MIN_TEST_BUY_SUPPORT,
+    PROMOTION_MIN_RETURN_IMPROVEMENT_PCT,
+    PROMOTION_MIN_BACKTEST_TRADES,
+    PROMOTION_MAX_DRAWDOWN_PCT,
 )
 
 CHAMPION_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
@@ -90,6 +92,59 @@ def extract_gate_metrics(report: dict) -> dict:
         "buy_support":   int(buy.get("support", 0)),
         "accuracy":      float(report.get("accuracy", 0.0)),
     }
+
+
+def extract_backtest_metrics(stats: dict) -> dict:
+    """Pull the simulated-trading metrics the gate decides on.
+
+    An empty stats dict (backtest produced nothing) collapses to values that
+    fail every check rather than passing vacuously — the gate must not promote
+    on the strength of a simulation that did not run.
+    """
+    if not stats:
+        return {
+            "total_return": 0.0,
+            "n_trades":     0,
+            "bt_win_rate":  0.0,
+            "avg_return":   0.0,
+            "max_drawdown": -100.0,
+            "final_value":  0.0,
+        }
+    return {
+        "total_return": float(stats.get("total_return", 0.0)),
+        "n_trades":     int(stats.get("n_trades", 0)),
+        "bt_win_rate":  float(stats.get("win_rate", 0.0)),
+        "avg_return":   float(stats.get("avg_return", 0.0)),
+        "max_drawdown": float(stats.get("max_drawdown", -100.0)),
+        "final_value":  float(stats.get("final_value", 0.0)),
+    }
+
+
+def score_model(bundle: dict, X_test, y_test, threshold: float) -> dict:
+    """Score one model both ways: classification on the test rows, and
+    simulated trading over the same window.
+
+    Returns one merged metrics dict — the gate reasons about a single object
+    per model rather than juggling two parallel ones.
+    """
+    from compare_models import evaluate
+    from backtest import run_backtest, load_all_tickers
+
+    classification = extract_gate_metrics(
+        evaluate(bundle, X_test, y_test, threshold)["report_thresh"]
+    )
+
+    # Signals are model-specific, so ticker_data must be regenerated per model.
+    # run_backtest applies the same split boundaries as trainer.py.
+    ticker_data = load_all_tickers(bundle["model"], bundle["encoder"])
+    stats = run_backtest(
+        split="test",
+        model=bundle["model"],
+        encoder=bundle["encoder"],
+        ticker_data=ticker_data,
+    )
+
+    return {**classification, **extract_backtest_metrics(stats)}
 
 
 # ---------------------------------------------------------------------------
@@ -146,25 +201,45 @@ def decide_promotion(
         f"scores well by refusing to buy",
     )
 
-    # --- 3. Beat the incumbent by a margin ---------------------------------
+    # --- 3. Enough simulated trades to judge the return on ------------------
+    trades_ok = record(
+        "backtest_trade_count",
+        challenger["n_trades"] >= PROMOTION_MIN_BACKTEST_TRADES,
+        f"{challenger['n_trades']} simulated trades "
+        f"(minimum {PROMOTION_MIN_BACKTEST_TRADES})",
+    )
+
+    # --- 4. Risk floor ------------------------------------------------------
+    drawdown_ok = record(
+        "challenger_max_drawdown",
+        challenger["max_drawdown"] >= PROMOTION_MAX_DRAWDOWN_PCT,
+        f"max drawdown {challenger['max_drawdown']:.2f}% "
+        f"(floor {PROMOTION_MAX_DRAWDOWN_PCT:.2f}%) - a model that earns more "
+        f"by risking ruin is not an improvement",
+    )
+
+    # --- 5. Beat the incumbent in dollars ----------------------------------
     if champion is None:
         improvement_ok = record(
-            "beats_champion",
+            "beats_champion_return",
             True,
             "no champion on disk - floors alone decide this first promotion",
         )
     else:
-        required = champion["buy_f1"] + PROMOTION_MIN_BUY_F1_IMPROVEMENT
-        delta = challenger["buy_f1"] - champion["buy_f1"]
+        required = champion["total_return"] + PROMOTION_MIN_RETURN_IMPROVEMENT_PCT
+        delta = challenger["total_return"] - champion["total_return"]
         improvement_ok = record(
-            "beats_champion",
-            challenger["buy_f1"] >= required,
-            f"BUY F1 {challenger['buy_f1']:.3f} vs champion "
-            f"{champion['buy_f1']:.3f} (delta {delta:+.3f}, "
-            f"required {PROMOTION_MIN_BUY_F1_IMPROVEMENT:+.3f})",
+            "beats_champion_return",
+            challenger["total_return"] >= required,
+            f"backtest return {challenger['total_return']:+.2f}% vs champion "
+            f"{champion['total_return']:+.2f}% (delta {delta:+.2f}pp, "
+            f"required {PROMOTION_MIN_RETURN_IMPROVEMENT_PCT:+.2f}pp)",
         )
 
-    promote = support_ok and precision_ok and recall_ok and improvement_ok
+    promote = (
+        support_ok and precision_ok and recall_ok
+        and trades_ok and drawdown_ok and improvement_ok
+    )
 
     if promote:
         summary = "PROMOTE - challenger cleared every gate check"
@@ -283,21 +358,19 @@ def build_report(
 
     lines = [header, ""]
 
+    def _row(label: str, m: dict) -> str:
+        return (
+            f"{label} — return **{m['total_return']:+.2f}%** over "
+            f"{m['n_trades']} trades, drawdown {m['max_drawdown']:.2f}%\n"
+            f"　　BUY F1 {m['buy_f1']:.3f}  prec {m['buy_precision']:.3f}  "
+            f"recall {m['buy_recall']:.3f}  acc {m['accuracy']:.3f}"
+        )
+
     if champion is None:
         lines.append("Champion: _none on disk_")
     else:
-        lines.append(
-            f"Champion   — BUY F1 {champion['buy_f1']:.3f}  "
-            f"prec {champion['buy_precision']:.3f}  "
-            f"recall {champion['buy_recall']:.3f}  "
-            f"acc {champion['accuracy']:.3f}"
-        )
-    lines.append(
-        f"Challenger — BUY F1 {challenger['buy_f1']:.3f}  "
-        f"prec {challenger['buy_precision']:.3f}  "
-        f"recall {challenger['buy_recall']:.3f}  "
-        f"acc {challenger['accuracy']:.3f}"
-    )
+        lines.append(_row("Champion  ", champion))
+    lines.append(_row("Challenger", challenger))
     lines.append("")
 
     for check in decision["checks"]:
@@ -395,17 +468,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[FATAL] Could not load candidate {args.candidate}: {exc}")
         return 1
 
-    challenger_metrics = extract_gate_metrics(
-        evaluate(challenger_bundle, X_test, y_test, args.threshold)["report_thresh"]
-    )
+    print("\n=== Scoring challenger (classification + backtest) ===")
+    challenger_metrics = score_model(challenger_bundle, X_test, y_test, args.threshold)
 
     champion_metrics = None
     if os.path.exists(CHAMPION_PATH):
         try:
             champion_bundle = joblib.load(CHAMPION_PATH)
-            champion_metrics = extract_gate_metrics(
-                evaluate(champion_bundle, X_test, y_test, args.threshold)["report_thresh"]
-            )
+            print("\n=== Scoring champion (classification + backtest) ===")
+            champion_metrics = score_model(champion_bundle, X_test, y_test, args.threshold)
         except Exception as exc:
             # An unreadable champion is not a licence to promote blindly.
             print(f"[FATAL] Champion exists at {CHAMPION_PATH} but could not be scored: {exc}")
