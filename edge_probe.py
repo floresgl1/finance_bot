@@ -34,6 +34,7 @@ Usage:
     python edge_probe.py                          # lookback sweep + baselines
     python edge_probe.py --features               # SHAP ranking + top-K retrain
     python edge_probe.py --label-scales 1 1.5 2 3 # HOLD band width sweep
+    python edge_probe.py --regimes                # RETURN vs buy-and-hold (decisive)
     python edge_probe.py --test-start 2026-05-20
     python edge_probe.py --lookbacks 1 3 5 10
     python edge_probe.py --refresh                # re-download the history
@@ -54,7 +55,7 @@ from sklearn.metrics import classification_report
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
-from config import WATCHLIST, FEATURE_COLUMNS, XGB_PARAMS
+from config import WATCHLIST, FEATURE_COLUMNS, XGB_PARAMS, CONFIDENCE_THRESHOLD
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 PROBE_DIR = os.path.join(_HERE, "data", "edge_probe")
@@ -64,6 +65,9 @@ RESULTS_PATH = os.path.join(_HERE, "data", "edge_probe_results.json")
 PROBE_HISTORY = "10y"
 MARKET_SYMBOLS = ["SPY", "XLK", "XLF", "XLE", "XLV", "XLY", "^VIX"]
 LABELS = ["BUY", "HOLD", "SELL"]
+
+# Top 5 by mean |SHAP|, from `--features`. See docs/EDGE_INVESTIGATION_2026-09-08.md.
+TOP5_FEATURES = ["Volatility", "Return_60d", "RSI_14", "MACD_signal", "MACD"]
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +386,114 @@ def run_feature_probe(test_start: pd.Timestamp, lookback_years: int = 3,
     }
 
 
+# Windows chosen to span regimes. A strategy that runs at ~50% average exposure
+# is structurally handicapped in a rally and structurally advantaged in a
+# drawdown, so measuring it only on recent (rising) data cannot distinguish
+# "no edge" from "defensive by construction".
+REGIME_WINDOWS = {
+    "covid crash 2020": ("2020-02-15", "2020-04-30"),
+    "bear 2022":        ("2022-01-01", "2022-10-31"),
+    "rally 2025-26":    ("2025-11-07", "2026-05-28"),
+    "recent 2026":      ("2026-05-29", "2026-09-08"),
+}
+
+
+def run_regime_benchmark(cols: list[str], scale: float,
+                         windows: dict | None = None,
+                         lookback_years: int = 3) -> dict:
+    """Walk-forward return benchmark against buy-and-hold, across regimes.
+
+    Per window: train on the `lookback_years` immediately before it, generate
+    signals inside it with that model, simulate, and compare to holding the
+    same basket over the same dates.
+
+    **DESIGN DECISION:**
+    This trains a fresh model per window rather than reusing one. backtest.py's
+    `train` split shows +365% precisely because the model was fitted on those
+    dates; any window a single model spans is contaminated the same way.
+    """
+    import backtest as bt
+
+    windows = windows or REGIME_WINDOWS
+    per_ticker = _build_per_ticker(scale)
+    combined = pd.concat(per_ticker.values()).sort_index()
+    results = {}
+
+    for name, (start_s, end_s) in windows.items():
+        start, end = pd.Timestamp(start_s), pd.Timestamp(end_s)
+        train_mask = (combined.index >= start - pd.DateOffset(years=lookback_years)) & \
+                     (combined.index < start)
+        X_train, y_train = combined[train_mask][cols], combined[train_mask]["Signal"]
+        if len(X_train) < 500:
+            print(f"  {name}: only {len(X_train)} training rows, skipping")
+            continue
+
+        encoder = LabelEncoder()
+        model = XGBClassifier(**XGB_PARAMS, random_state=42)
+        model.fit(X_train, encoder.fit_transform(y_train))
+        classes = np.array(encoder.classes_)
+
+        ticker_data = {}
+        for ticker, df in per_ticker.items():
+            win = df[(df.index >= start) & (df.index <= end)]
+            if win.empty:
+                continue
+            proba = model.predict_proba(win[cols].values)
+            top_idx = np.argmax(proba, axis=1)
+            top_prob = proba[np.arange(len(proba)), top_idx]
+            signals = classes[top_idx].copy()
+            signals[top_prob < CONFIDENCE_THRESHOLD] = "HOLD"
+            out = win[["Close"]].copy()
+            out["Signal"] = signals
+            out["Confidence"] = top_prob
+            ticker_data[ticker] = out
+
+        if not ticker_data:
+            continue
+
+        dates = sorted(set().union(*[set(d.index) for d in ticker_data.values()]))
+        strat = bt._summarise(*bt._simulate(dates, ticker_data), dates, name)
+        hold = bt._summarise(*bt._simulate_buy_and_hold(dates, ticker_data), dates, name)
+        delta = strat["total_return"] - hold["total_return"]
+
+        results[name] = {
+            "window": f"{start.date()} to {end.date()}",
+            "strategy_return": strat["total_return"],
+            "hold_return": hold["total_return"],
+            "delta_pp": delta,
+            "max_drawdown": strat["max_drawdown"],
+            "n_trades": strat["n_trades"],
+            "avg_exposure": strat["avg_exposure"],
+        }
+
+        print(f"  {name:<20}{strat['total_return']:>9.2f}%{hold['total_return']:>11.2f}%"
+              f"{delta:>+9.2f}pp{strat['avg_exposure']:>8.0f}% exp"
+              f"{strat['n_trades']:>7} trades")
+
+    return results
+
+
+def _build_per_ticker(scale: float) -> dict:
+    """Per-ticker featured+labelled frames from the probe data."""
+    import features
+    import labels as labels_mod
+
+    features.DATA_DIR = PROBE_DIR
+    features.MARKET_DATA_DIR = PROBE_MARKET_DIR
+    features._load_market_close.cache_clear()
+    labels_mod._SPY_PATH = os.path.join(PROBE_MARKET_DIR, "SPY.csv")
+    labels_mod._VIX_PATH = os.path.join(PROBE_MARKET_DIR, "^VIX.csv")
+
+    out = {}
+    for ticker in WATCHLIST:
+        try:
+            df = labels_mod.add_labels(features.load_and_process(ticker))
+            out[ticker] = _relabel(df, scale) if scale != 1.0 else df
+        except Exception as exc:
+            print(f"  {ticker}: FAILED {exc}")
+    return out
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure the model against trivial baselines and sweep training history.",
@@ -398,6 +510,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--refresh", action="store_true",
         help="Re-download the probe history even if it is already cached.",
+    )
+    parser.add_argument(
+        "--regimes", action="store_true",
+        help="Walk-forward RETURN benchmark vs buy-and-hold across bull and bear "
+             "windows. This is the measurement that decides whether the strategy "
+             "is worth running; classification metrics are a proxy for it.",
     )
     parser.add_argument(
         "--features", action="store_true",
@@ -486,7 +604,33 @@ def main(argv: list[str] | None = None) -> int:
     print(f"=== Downloading {PROBE_HISTORY} history into {PROBE_DIR} ===")
     download_history(refresh=args.refresh)
 
-    if args.features:
+    if args.regimes:
+        print("\n=== Regime benchmark: strategy vs buy-and-hold (walk-forward) ===")
+        configs = {
+            "shipped (20 feat, 1.0x labels)": (FEATURE_COLUMNS, 1.0),
+            "top-5 feat + 1.5x labels":       (TOP5_FEATURES, 1.5),
+        }
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "regimes",
+            "configs": {},
+        }
+        for label, (cols, scale) in configs.items():
+            print(f"\n  {label}")
+            print(f"  {'window':<20}{'strategy':>10}{'hold':>11}{'delta':>11}")
+            results["configs"][label] = run_regime_benchmark(cols, scale)
+
+        print()
+        for label, res in results["configs"].items():
+            if not res:
+                continue
+            deltas = [r["delta_pp"] for r in res.values()]
+            wins = sum(1 for d in deltas if d > 0)
+            print(f"  {label:<34} beat hold in {wins}/{len(deltas)} windows, "
+                  f"mean delta {np.mean(deltas):+.2f}pp")
+        print()
+        print("  A strategy with real edge beats holding across regimes, not in one.")
+    elif args.features:
         print("\n=== Feature probe (SHAP ranking + top-K retrain) ===")
         results = run_feature_probe(test_start)
         k_results = results["top_k"]

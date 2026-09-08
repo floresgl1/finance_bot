@@ -211,24 +211,90 @@ but it is not a transformation. A 4.4pp edge over always-guessing-the-majority
 is still a weak model, and none of it has yet been shown to survive into
 out-of-sample *returns*, which finding A says is where this actually fails.
 
+## E. The decisive test — do B and C fix the return deficit?
+
+They do not. `edge_probe.py --regimes` trains a fresh model on the 3 years
+before each window, generates signals inside it, and simulates. Every window is
+fully out-of-sample for its own model.
+
+| Window | | shipped (20 feat, 1.0×) | top-5 + 1.5× |
+|---|---|---|---|
+| covid crash 2020 | hold −5.52% | +2.89% (**+8.41pp**) | −5.23% (+0.29pp) |
+| bear 2022 | hold −29.00% | −33.41% (−4.41pp) | −19.30% (**+9.70pp**) |
+| rally 2025-26 | hold +20.29% | +3.26% (−17.03pp) | +2.28% (−18.01pp) |
+| recent 2026 | hold +3.49% | +1.68% (−1.81pp) | −0.56% (−4.05pp) |
+| | | **1/4 windows, mean −3.71pp** | **2/4 windows, mean −3.02pp** |
+
+**The classification improvements did not improve returns.** The B+C
+configuration wins one more window but is *worse* in three of four individually,
+and both configurations lose to buy-and-hold on average. Improving a proxy
+metric moved the real metric the wrong way — which is the whole reason the
+promotion gate was switched to simulated return rather than F1.
+
+Note also that the shipped config's earlier +1.43pp on the test split does not
+survive proper walk-forward training. That figure came from the deployed
+champion evaluated on the live 3-year data; retraining strictly before the
+window gives −1.81pp. The one positive out-of-sample data point was an artifact
+of which model was being scored.
+
+### What the regime spread actually shows
+
+The strategy is **defensive, not skilled**. It runs at ~50% average exposure, so
+it structurally lags a fully-invested benchmark in rallies and structurally
+beats it in drawdowns. That pattern is visible — +8.41pp in the COVID crash,
+−17.03pp in the rally — and it is what low exposure alone would produce.
+
+But exposure does not explain all of it. Being 50% invested in a basket that
+returned +20.29% should yield roughly +10%; the strategy returned +3.26%. The
+extra ~7pp is selection, and it is negative. Conversely in 2022 the shipped
+config lost 33.41% while holding lost 29.00% — worse than the market at half
+the exposure, across 270 trades.
+
+Results that swing from +9.70pp to −18.01pp with no consistent sign, and that
+reverse when the feature set changes, are what a strategy with **no durable
+edge** looks like.
+
 ## Where this leaves things
 
-The honest summary: **the strategy does not currently beat buy-and-hold out of
-sample**, and the classification work above improves the model's edge over a
-trivial baseline without yet demonstrating that it fixes that.
+**The strategy does not beat buy-and-hold out of sample, and the model changes
+that improve its classification metrics do not fix that.** Both configurations
+lose to holding on average across four regime windows.
 
-Sequenced from here:
+Nothing was changed in production as a result. `FEATURE_COLUMNS` still contains
+all 20 features including `BB_middle`, and the labels are unchanged — because
+no tested configuration is better on the measure that matters, and swapping the
+feature set would require promoting a new champion. There is nothing here worth
+promoting.
 
-1. **Re-run the buy-and-hold benchmark with the top-5 + 1.5× configuration.**
-   This is the only measurement that matters, and it is now a cheap one. If the
-   validation-window deficit closes, the changes are worth shipping; if it does
-   not, they are cosmetic.
-2. **Drop `BB_middle` regardless.** It is a duplicate column carrying zero
-   information, and removing it costs nothing.
-3. **Treat the exposure gap as a lever, not a footnote.** The strategy delivers
-   its returns at ~50% invested. If selection is roughly break-even, sizing up
-   is worth more than more model work.
-4. **Do not extend `HISTORY_PERIOD`** — finding 1 above.
+### Specifically NOT recommended
+
+- **Do not extend `HISTORY_PERIOD`.** Finding 1: more data makes it slightly worse.
+- **Do not adopt top-5 features or 1.5× labels on the strength of finding D.**
+  Finding E shows the classification gain does not survive into returns.
+- **Do not drop `BB_middle` on its own.** It is genuinely dead weight, but
+  removing it changes the feature contract and breaks the deployed champion,
+  which expects 20 columns. It is a coordinated retrain-and-promote, not a
+  free deletion — worth folding into the next promotion that happens for
+  other reasons, not worth triggering one.
+
+### Worth trying, in order
+
+1. **Exposure and sizing, not the model.** The strategy runs at ~50% invested
+   and its returns are roughly consistent with that, minus a selection drag.
+   Position sizing and exposure rules are a larger lever than feature work and
+   have not been examined at all.
+2. **A regime filter.** The defensive profile is real: +8.41pp in the COVID
+   crash. A rule that goes fully invested in confirmed uptrends and defers to
+   the model only in drawdowns would exploit the one thing the signals seem to
+   do, instead of averaging it away.
+3. **A different label horizon.** Everything here uses a 7-day forward return.
+   That choice has never been tested, and it determines what "signal" means
+   more than any feature does.
+4. **Accept the result.** A 12-ticker daily-bar long-only strategy on standard
+   technical indicators is a crowded, well-arbitraged space. "No durable edge"
+   is the expected outcome, not a bug — and the pipeline around it (risk
+   controls, monitoring, P&L attribution, the promotion gate) is sound
+   engineering regardless of whether this particular signal works.
 
 ## Recommended next steps (original, from the first pass)
 
