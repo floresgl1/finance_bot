@@ -596,16 +596,116 @@ investigation should be quoted as describing the bot until `_simulate()` models
 The classification findings (1–4, B, C, D) are unaffected: they are measured on a
 fixed test window and never touch position sizing.
 
+## J. The sizing conflict resolved, and what it revealed
+
+Finding I left a live defect and a broken simulator. Both are now fixed, and the
+result is the clearest statement this investigation has produced.
+
+### The resolution
+
+`live_trader.get_position_size()` now sizes new positions from
+`capital_allocator.get_allocation_tier()` — the same table that governs top-ups —
+so nothing opens above the cap that governs it afterwards:
+
+| confidence | was | now |
+|---|---|---|
+| < 35 | skip | skip |
+| 35–50 | 10% | **3%** (`SMALL_POSITION_PCT`) |
+| 50–65 | 15–20% | **5%** (`NORMAL_POSITION_PCT`) |
+| 65+ | 20% | **7%** (`LARGE_POSITION_PCT`) |
+
+All three sit under `MAX_POSITION_PCT = 0.08`. The rebalancer returns to being a
+safety net instead of a routine step, and `check_add_to_position` gets headroom
+to work with for the first time.
+
+`backtest._simulate()` now uses the same tier table **and tops up held
+positions** rather than skipping any ticker already owned. That second change
+turned out to be the larger of the two.
+
+### Concentration was the alternative, and it loses
+
+Raising `MAX_POSITION_PCT` to 0.20 was the other way to resolve the conflict. On
+the live window alone it looked clearly better — and that is exactly the trap
+finding H documented:
+
+| Arm | live window (1) | broad (10) |
+|---|---|---|
+| shipped, 8% tiers | −12.86pp | **−27.52pp** |
+| concentrated, 20% / 80% | **+0.93pp** | **−29.13pp** |
+
+A single window said concentration beats buy-and-hold. Ten windows say it is the
+worst arm tested. Concentration only pays when there is selection edge to
+concentrate into, and six measurements say there is none — so it buys variance
+and nothing else.
+
+### The simulator and reality finally agree
+
+Configured to what the bot actually did during the live window — 20% opens, adds
+enabled — the simulation lands close to the account for the first time:
+
+| | return | vs hold | exposure |
+|---|---|---|---|
+| simulated at live's actual sizing | +18.14% | +0.93pp | 65% |
+| **LIVE account** | **+15.11%** | −3.23pp | ~82% |
+
+A ~3pp residual, in the direction you would expect from the trim churn the
+simulator does not model — 47 `REBALANCER_SELL` against 17 `BUY`, each paying
+slippage and a commission. Finding I's 14pp discrepancy was almost entirely the
+missing add-to-position logic.
+
+### Sizing is not the lever. Exposure is.
+
+Broad sample, faithful simulator:
+
+| Arm | Beat hold | Mean vs hold | Mean exposure |
+|---|---|---|---|
+| shipped, 8% tiers | 2/10 | −27.52pp | **33%** |
+| full-size buys | 1/10 | −26.50pp | 39% |
+| concentrated, 20% / 80% | 1/10 | −29.13pp | 55% |
+| regime filter only (**no model**) | 2/10 | −9.46pp | **79%** |
+| regime + model | 2/10 | **−7.55pp** | **88%** |
+
+Every model-driven sizing variant lands between −26.5pp and −29.1pp. **The
+choice of sizing rule moves the result by 2.6 percentage points on a 27-point
+deficit.** It is not the lever.
+
+The two arms that come close to holding are the two that are nearly always
+invested, and the better of them is the one with the least model in it. Sort the
+table by exposure and it sorts by performance. Over a decade in which the basket
+compounded through +69%, +75% and +43% windows, every hour spent in cash is the
+cost, and the model's signal is what puts the book in cash.
+
+`regime + model` at −7.55pp is now the best arm across both window sets — but it
+is 88% invested and defers to the model only on risk-off days. It is closer to
+"hold, with an occasional exit" than to a strategy.
+
+### The cost of the fix
+
+The resolution lowers simulated exposure from 55% (at live's old 20% opens) to
+33%. Given that exposure is the dominant factor, that is a real downside, and it
+is the one reason to revisit the tier percentages — `SMALL_POSITION_PCT = 3%`
+against a `MAX_POSITION_PCT` of 8% leaves the book half empty for the modal
+signal. Raising the tiers toward the cap keeps the diversification and the
+absence of churn while restoring the exposure.
+
+That is deliberately **not** done here. It is a strategy parameter, the broad
+sample separates the sizing variants by less than 3pp, and tuning it on this
+data is precisely how finding H happened.
+
 ## Where this leaves things
 
 **The strategy does not beat buy-and-hold**, on every measurement taken: six
 simulated attempts to find an edge, and the live account itself at −3.23pp over
 its first six months.
 
-**But the magnitude is now in question.** Finding I shows `backtest._simulate()`
-has never modelled the live sizing rule, and the live account beat its own
-simulation by 14pp on identical dates. Treat −24pp as describing a strategy that
-was never deployed; treat −3.23pp as what the bot actually did.
+Finding I found `backtest._simulate()` had never modelled the live sizing rule.
+Finding J fixed it, and the simulator now reproduces the live account to within
+~3pp on the same window — the first time simulation and reality have agreed.
+
+**The lever is exposure, not the model and not the sizing rule.** Every
+model-driven sizing variant lands between −26.5pp and −29.1pp against holding
+over ten windows. The only arms that come close are the two that stay ~80–88%
+invested, and the better of those contains no model on risk-on days at all.
 
 Measured over ten continuous windows spanning 2019–2026, the shipped
 configuration returns **−24.09pp against simply holding the watchlist, beating

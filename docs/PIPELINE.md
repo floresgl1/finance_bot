@@ -953,35 +953,47 @@ changed as a result** — there was nothing better to ship. The conclusion is no
 enforced by the `beats_buy_and_hold` promotion-gate check rather than left in a
 document.
 
-### KNOWN DEFECT — live position sizing contradicts itself
+### Position sizing — one rule for opens and top-ups
 
-Found 2026-09-08 while trying to make `backtest.py` simulate the live bot. Not
-fixed, because the two ways to resolve it produce materially different systems.
+Fixed 2026-09-08. `live_trader.get_position_size()` previously opened positions
+at 10/15/20% of equity while `MAX_POSITION_PCT` capped the same position at 8%.
+Every entry arrived over-weight: the rebalancer trimmed it back to 7.5% over
+roughly three sessions, paying slippage and a commission on stock the bot had
+chosen to buy days earlier, and `check_add_to_position` refused every top-up in
+between. The signal log recorded **47 `REBALANCER_SELL` against 17 `BUY`**, and
+31 `INVALID_HEADROOM`.
 
-| Path | Rule | Size |
-|---|---|---|
-| new position | `live_trader.get_position_size()` | conf 35–40 → 10%, 40–45 → 15%, 45+ → 20% |
-| add to position | `capital_allocator._get_allocation_tier()` | 3/5/7%, capped by headroom to `MAX_POSITION_PCT` = 8% |
-| trim | `rebalancer` | weight > 8.1% → sell down to 7.5%, max 25% of shares per run |
+Both paths now size from `capital_allocator.get_allocation_tier()`:
 
-A new position opens at **10–20%** of equity and is then governed by an **8%**
-cap. Every position the bot opens is over-weight on arrival, is trimmed back
-over roughly three sessions, and cannot be added to in the meantime. The signal
-log shows 47 `REBALANCER_SELL` against 17 `BUY`, and 31 `INVALID_HEADROOM`.
+| confidence | fraction of equity |
+|---|---|
+| < `CONFIDENCE_THRESHOLD` × 100 | skip, treated as HOLD |
+| 35–50 | `SMALL_POSITION_PCT` (3%) |
+| 50–65 | `NORMAL_POSITION_PCT` (5%) |
+| 65+ | `LARGE_POSITION_PCT` (7%) |
 
-Each trim pays slippage and a commission on stock the bot chose to buy days
-earlier. Two possible resolutions, and they are not equivalent:
+Every tier is below `MAX_POSITION_PCT`, so nothing opens above its own cap, the
+rebalancer is a safety net rather than a routine step, and adding to a position
+has headroom to work with for the first time.
 
-- **Raise `MAX_POSITION_PCT` toward 0.20.** Keeps the conviction sizing in
-  `get_position_size`, stops the churn, gives a concentrated 4–5 name book.
-- **Lower `get_position_size` toward 0.08.** Keeps the diversified twelve-name
-  book the account currently ends up with, stops the churn, removes the
-  conviction weighting.
+**DESIGN DECISION — diversified, not concentrated.**
+The alternative resolution was raising `MAX_POSITION_PCT` to 0.20 to legalise the
+old opens. On the live window alone that looked better (+0.93pp vs −12.86pp); over
+ten windows it is the worst arm tested (−29.13pp vs −27.52pp). Concentration only
+pays when there is selection edge to concentrate into, and six measurements say
+there is none. See finding J in `docs/EDGE_INVESTIGATION_2026-09-08.md`.
 
-`backtest._simulate()` models neither path — it sizes at
-`Confidence × MAX_POSITION_PCT` and never adds to an existing position, which is
-why it simulates a 22%-invested book against the live bot's ~82%. See finding I
-in `docs/EDGE_INVESTIGATION_2026-09-08.md`.
+`backtest._simulate()` uses the same tier table and now tops up held positions
+instead of skipping any ticker already owned. That second change was the larger
+one: with it, the simulator reproduces the live account to within ~3pp over the
+same window, against a 14pp discrepancy before.
+
+**Open question — the tier levels.** `SMALL_POSITION_PCT` is 3% against a cap of
+8%, and the modal signal lands in that tier, so the book runs around 33%
+invested. Exposure is the dominant factor in every measurement taken, so raising
+the tiers toward the cap is the obvious next lever. It is deliberately untuned:
+the broad sample separates all sizing variants by under 3pp, which is not enough
+signal to fit against.
 
 ### `compare_models.py`
 Compares test-set metrics between the current model and the backup model.

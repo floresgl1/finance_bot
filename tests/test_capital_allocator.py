@@ -22,7 +22,7 @@ from config import (
     INVALID_PORTFOLIO_SKIP,
     INVALID_SHARES_SKIP,
 )
-from capital_allocator import check_add_to_position, _get_allocation_tier
+from capital_allocator import check_add_to_position, get_allocation_tier
 
 
 def _call(**overrides) -> dict:
@@ -54,7 +54,7 @@ def _call(**overrides) -> dict:
 )
 def test_allocation_tier_boundaries(confidence, expected_tier, expected_pct):
     """Tier boundaries are inclusive on the lower edge."""
-    assert _get_allocation_tier(confidence) == (expected_tier, expected_pct)
+    assert get_allocation_tier(confidence) == (expected_tier, expected_pct)
 
 
 # --- guard ordering --------------------------------------------------------
