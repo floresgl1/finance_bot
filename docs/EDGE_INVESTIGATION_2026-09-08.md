@@ -692,6 +692,86 @@ That is deliberately **not** done here. It is a strategy parameter, the broad
 sample separates the sizing variants by less than 3pp, and tuning it on this
 data is precisely how finding H happened.
 
+## K. Sizing is exhausted. The signal is what caps exposure.
+
+`python edge_probe.py --tiers --broad`
+
+Finding J left one lever untested: `SMALL_POSITION_PCT` is 3% against an 8% cap
+and the modal signal lands in that tier, so the book runs about a third
+invested. Nobody chose that — the tier constants were designed as *increments
+for topping up a position*, and reusing them as opening sizes is an accident.
+
+**DESIGN DECISION:**
+The question asked was whether the relationship is **monotone**, not which level
+scores best. If return rises all the way to a nearly-full book, the conclusion is
+structural and the constants barely matter. If it peaks in the middle, that is a
+curve fit on ten windows and the right response is to change nothing. Picking the
+argmax of a sweep like this is how finding H happened. One model is trained per
+window and shared by every level, so nothing here can be the model.
+
+| Tier level | Exposure | Beat hold | Mean vs hold | Mean max DD |
+|---|---|---|---|---|
+| half of shipped (1.5/2.5/3.5) | 27% | 2/10 | −29.73pp | −10.28% |
+| **shipped (3/5/7)** | **33%** | 2/10 | **−27.52pp** | −10.23% |
+| 4/6/8 | 35% | 2/10 | −26.80pp | −10.24% |
+| 5/6.5/8 | 36% | 1/10 | −26.56pp | −10.35% |
+| 6/7/8 | 38% | 1/10 | −26.35pp | −10.51% |
+| flat at the cap (8/8/8) | 40% | 1/10 | **−25.14pp** | −10.57% |
+
+**Monotone at every step**, and cheap: the whole range costs 0.29pp of mean
+drawdown. So the direction is structural, not fitted — more exposure is better,
+and there is no interior optimum to be fooled by.
+
+### But the effect is tiny, and the reason is the important part
+
+The entire sweep — from half the shipped sizes to flat at the cap, a 2.7×
+change in position size — moves exposure only from **27% to 40%**, and return by
+4.6pp on a 27-point deficit.
+
+Divide exposure by position size and the reason is immediate:
+
+| Tier level | Exposure | Top tier | Implied names held |
+|---|---|---|---|
+| shipped (3/5/7) | 33% | 7% | **~4.7 of 12** |
+| 6/7/8 | 38% | 8% | ~4.7 of 12 |
+| flat at the cap | 40% | 8% | **~5.0 of 12** |
+
+Position size changes, and the number of names held does not. **The book is
+capped by how many tickers the model has in a BUY state at once — about five of
+twelve — not by how large each position is.**
+
+Twelve names at the 8% cap would be a 96% book. The arms that lose only 7.6–9.5pp
+to buy-and-hold run at 79–88%. Reaching that requires holding ten to twelve names
+simultaneously, and the model never has that many in BUY. `regime filter only`
+gets there precisely by ignoring the model and forcing every name to BUY while
+SPY is above its 200-day average.
+
+### The loop closes
+
+- Exposure is what drives the shortfall — findings F, H, J.
+- **The model's signal is what caps exposure** — this finding.
+- Therefore the shortfall cannot be fixed by sizing, by feature selection, by
+  label width, or by label horizon. It is fixed only by trading the signal less,
+  at which point there is no strategy left.
+
+That is the same conclusion the whole investigation kept reaching from different
+directions, but this is the first version of it that identifies the mechanism
+rather than the correlation.
+
+### Recommendation: change nothing right now
+
+Adopting `6/7/8` or flat-at-cap is defensible — monotone, structural, ~1–2pp for
+0.3pp of drawdown. It is not adopted here for two reasons.
+
+Live sizing changed today already (finding J), and the effect of that change has
+not yet been observed in production. Changing it twice before the first
+verification is churn on a system that trades daily. And the gain is small enough
+that it should follow evidence the previous change behaved as predicted, not
+precede it.
+
+The finding stands regardless of whether the constants ever move: **sizing is
+exhausted as a lever.**
+
 ## Where this leaves things
 
 **The strategy does not beat buy-and-hold**, on every measurement taken: six
@@ -702,16 +782,16 @@ Finding I found `backtest._simulate()` had never modelled the live sizing rule.
 Finding J fixed it, and the simulator now reproduces the live account to within
 ~3pp on the same window — the first time simulation and reality have agreed.
 
-**The lever is exposure, not the model and not the sizing rule.** Every
-model-driven sizing variant lands between −26.5pp and −29.1pp against holding
-over ten windows. The only arms that come close are the two that stay ~80–88%
-invested, and the better of those contains no model on risk-on days at all.
+**The lever is exposure — and the model's own signal is what caps it.** Every
+model-driven sizing variant lands between −25.1pp and −29.7pp against holding
+over ten windows. Position size can be tripled and the book still holds about
+five of twelve names, because that is how many the model has in BUY at once
+(finding K). The only arms that come close to buy-and-hold stay 79–88% invested,
+and they get there by overriding the signal rather than following it.
 
-Measured over ten continuous windows spanning 2019–2026, the shipped
-configuration returns **−24.09pp against simply holding the watchlist, beating
-it in 1 window out of 10.** About 6pp of that is exposure — running at 46%
-invested through a decade of large up years — and the remaining ~18pp is
-selection. Sizing up recovers the first part and leaves the second.
+So the deficit is not fixable by sizing, features, label width or label horizon.
+It is fixable only by trading the signal less — and at the limit of that, there
+is no strategy left.
 
 Finding H is the one to remember methodologically: the four-window sample used
 for findings A, E and F was half drawdowns by construction, and it flattered
@@ -820,6 +900,9 @@ python edge_probe.py --exposure                 # allocation policy (finding F)
 python edge_probe.py --horizons 3 5 7 14 21     # label window     (finding G)
 python edge_probe.py --horizons 3 7 21 --broad  # ten windows, not four (finding H)
 python edge_probe.py --exposure --broad         # F, corrected
+python edge_probe.py --tiers --broad            # position sizes (finding K)
+python edge_probe.py --exposure --window 2026-03-05 2026-09-04
+                                                # simulate one exact period
 ```
 
 **Use `--broad` for any figure quoted as a mean.** `REGIME_WINDOWS` is half

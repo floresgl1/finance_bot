@@ -40,6 +40,7 @@ Usage:
     python edge_probe.py --horizons 3 7 21 --broad  # over 10 windows, not 4
     python edge_probe.py --exposure --window 2026-03-05 2026-09-04
                                                   # simulate one exact period
+    python edge_probe.py --tiers --broad          # does exposure buy return?
     python edge_probe.py --test-start 2026-05-20
     python edge_probe.py --lookbacks 1 3 5 10
     python edge_probe.py --refresh                # re-download the history
@@ -815,6 +816,170 @@ def _build_per_ticker(scale: float, window: int | None = None) -> dict:
 # configuration with a clearly better classification edge producing worse
 # returns, so a horizon sweep scored on accuracy would repeat that mistake.
 
+# ---------------------------------------------------------------------------
+# Position-tier sweep
+# ---------------------------------------------------------------------------
+#
+# Every other finding says exposure dominates: model-driven arms at 33-55%
+# invested lose 26-29pp to holding, while arms at 79-88% lose 7.6-9.5pp. The
+# shipped tiers (3/5/7% against an 8% cap) were designed as *increments for
+# topping up a position*, not as opening sizes, and reusing them for opens is
+# what leaves the book around a third invested. Nobody chose that.
+#
+# **DESIGN DECISION:**
+# The question asked here is whether the relationship is MONOTONE, not which
+# level scores best. If return rises all the way to a nearly-full book the
+# conclusion is structural -- "be invested" -- and the exact constants barely
+# matter. If it peaks somewhere in the middle, that is a curve fit on ten
+# windows and the right response is to leave the constants alone. Picking the
+# argmax of this sweep is how finding H happened.
+#
+# One model is trained per window and shared by every tier level, so a
+# difference between levels cannot be the model.
+
+# label -> (SMALL_POSITION_PCT, NORMAL_POSITION_PCT, LARGE_POSITION_PCT)
+DEFAULT_TIER_LEVELS = {
+    "half of shipped":   (0.015, 0.025, 0.035),
+    "shipped 3/5/7":     (0.030, 0.050, 0.070),
+    "4/6/8":             (0.040, 0.060, 0.080),
+    "5/6.5/8":           (0.050, 0.065, 0.080),
+    "6/7/8":             (0.060, 0.070, 0.080),
+    "flat at the cap":   (0.080, 0.080, 0.080),
+}
+
+
+@contextlib.contextmanager
+def _tiers(small: float, normal: float, large: float):
+    """Temporarily override the confidence-tier position sizes.
+
+    capital_allocator.get_allocation_tier() reads these as module globals, and
+    backtest._simulate() calls it, so patching them here changes both the
+    simulated opens and the simulated top-ups together -- which is how the live
+    bot behaves since they share one table.
+    """
+    import capital_allocator as alloc
+
+    previous = (alloc.SMALL_POSITION_PCT, alloc.NORMAL_POSITION_PCT,
+                alloc.LARGE_POSITION_PCT)
+    alloc.SMALL_POSITION_PCT = small
+    alloc.NORMAL_POSITION_PCT = normal
+    alloc.LARGE_POSITION_PCT = large
+    try:
+        yield
+    finally:
+        (alloc.SMALL_POSITION_PCT, alloc.NORMAL_POSITION_PCT,
+         alloc.LARGE_POSITION_PCT) = previous
+
+
+def run_tier_sweep(levels: dict | None = None, cols: list[str] | None = None,
+                   scale: float = 1.0, windows: dict | None = None,
+                   lookback_years: int = 3) -> dict:
+    """Simulate each tier level over every window, sharing one model per window."""
+    import backtest as bt
+
+    levels = levels or DEFAULT_TIER_LEVELS
+    cols = cols or FEATURE_COLUMNS
+    windows = windows or BROAD_WINDOWS
+    per_ticker = _build_per_ticker(scale)
+    if not per_ticker:
+        return {}
+    combined = pd.concat(per_ticker.values()).sort_index()
+
+    results = {label: {"levels": lvl, "windows": {}} for label, lvl in levels.items()}
+
+    for name, (start_s, end_s) in windows.items():
+        start, end = pd.Timestamp(start_s), pd.Timestamp(end_s)
+        base = _window_signals(per_ticker, combined, cols, start, end,
+                               lookback_years, label=name)
+        if base is None:
+            continue
+
+        dates = sorted(set().union(*[set(d.index) for d in base.values()]))
+        hold = bt._summarise(*bt._simulate_buy_and_hold(dates, base), dates, name)
+        print(f"\n  {name}  (hold {hold['total_return']:+.2f}%)")
+        print(f"  {'tier level':<20}{'return':>10}{'vs hold':>11}"
+              f"{'max DD':>10}{'exp':>7}{'trades':>8}")
+        print("  " + "-" * 66)
+
+        for label, (small, normal, large) in levels.items():
+            with _tiers(small, normal, large):
+                stats = bt._summarise(*bt._simulate(dates, base), dates, name)
+            delta = stats["total_return"] - hold["total_return"]
+            results[label]["windows"][name] = {
+                "hold_return":  hold["total_return"],
+                "total_return": stats["total_return"],
+                "delta_pp":     delta,
+                "max_drawdown": stats["max_drawdown"],
+                "avg_exposure": stats["avg_exposure"],
+                "n_trades":     stats["n_trades"],
+            }
+            print(f"  {label:<20}{stats['total_return']:>9.2f}%{delta:>+10.2f}pp"
+                  f"{stats['max_drawdown']:>9.2f}%{stats['avg_exposure']:>6.0f}%"
+                  f"{stats['n_trades']:>8}")
+
+    for label, res in results.items():
+        rows = list(res["windows"].values())
+        if not rows:
+            continue
+        res["mean_delta_pp"] = float(np.mean([r["delta_pp"] for r in rows]))
+        res["mean_exposure"] = float(np.mean([r["avg_exposure"] for r in rows]))
+        res["mean_max_drawdown"] = float(np.mean([r["max_drawdown"] for r in rows]))
+        res["windows_beating_hold"] = sum(1 for r in rows if r["delta_pp"] > 0)
+        res["n_windows"] = len(rows)
+
+    return results
+
+
+def summarise_tiers(results: dict) -> str:
+    """Report the sweep and say whether exposure buys return monotonically."""
+    scored = {k: v for k, v in results.items() if "mean_delta_pp" in v}
+    if not scored:
+        return "\n  No tier level produced results."
+
+    ordered = sorted(scored.items(), key=lambda kv: kv[1]["mean_exposure"])
+
+    lines = ["", "  " + "=" * 74,
+             f"  {'tier level':<20}{'exposure':>10}{'beat hold':>12}"
+             f"{'mean vs hold':>16}{'mean max DD':>14}",
+             "  " + "-" * 74]
+    for label, res in ordered:
+        wins = f"{res['windows_beating_hold']}/{res['n_windows']}"
+        lines.append(f"  {label:<20}{res['mean_exposure']:>9.0f}%{wins:>12}"
+                     f"{res['mean_delta_pp']:>+15.2f}pp"
+                     f"{res['mean_max_drawdown']:>13.2f}%")
+    lines.append("  " + "=" * 74)
+
+    deltas = [res["mean_delta_pp"] for _, res in ordered]
+    monotone = all(b >= a for a, b in zip(deltas, deltas[1:]))
+    best_label, best = max(scored.items(), key=lambda kv: kv[1]["mean_delta_pp"])
+    least, most = ordered[0], ordered[-1]
+
+    if monotone:
+        lines += [
+            f"  MONOTONE: return rises with exposure at every step, "
+            f"{least[1]['mean_delta_pp']:+.2f}pp at",
+            f"  {least[1]['mean_exposure']:.0f}% invested up to "
+            f"{most[1]['mean_delta_pp']:+.2f}pp at {most[1]['mean_exposure']:.0f}%.",
+            "  That is a structural result, not a fitted one: the conclusion is",
+            "  'be invested', and the exact tier constants barely matter.",
+        ]
+    else:
+        lines += [
+            f"  NOT MONOTONE: the best level is '{best_label}' "
+            f"({best['mean_delta_pp']:+.2f}pp at",
+            f"  {best['mean_exposure']:.0f}% invested), with worse results on both sides.",
+            "  A peak in the middle of ten windows is a curve fit. Do NOT adopt it;",
+            "  leave the tier constants alone.",
+        ]
+
+    drawdown_cost = most[1]["mean_max_drawdown"] - least[1]["mean_max_drawdown"]
+    lines.append("")
+    lines.append(f"  Cost of the extra exposure: mean max drawdown "
+                 f"{least[1]['mean_max_drawdown']:.2f}% -> "
+                 f"{most[1]['mean_max_drawdown']:.2f}% ({drawdown_cost:+.2f}pp).")
+    return "\n".join(lines)
+
+
 DEFAULT_HORIZONS = [3, 5, 7, 14, 21]
 
 
@@ -927,6 +1092,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Re-label at each forward-return horizon and re-run the "
              "walk-forward return benchmark. The 7-day window in labels.py was "
              "never tested. Example: --horizons 3 5 7 14 21",
+    )
+    parser.add_argument(
+        "--tiers", action="store_true",
+        help="Sweep the confidence-tier position sizes and report return, "
+             "drawdown and realised exposure per level. Asks whether the "
+             "relationship is monotone, not which level wins.",
     )
     parser.add_argument(
         "--window", nargs=2, default=None, metavar=("START", "END"),
@@ -1078,6 +1249,17 @@ def main(argv: list[str] | None = None) -> int:
                                           windows=window_set),
         }
         print(summarise_exposure(results["windows"]))
+    elif args.tiers:
+        print(f"\n=== Position-tier sweep ({window_label}) ===")
+        print("  One model per window, shared by every level; only the tier")
+        print("  position sizes differ.")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "tiers",
+            "window_set": window_label,
+            "levels": run_tier_sweep(windows=window_set),
+        }
+        print(summarise_tiers(results["levels"]))
     elif args.horizons:
         print(f"\n=== Label horizon probe (walk-forward returns, "
               f"{window_label}) ===")

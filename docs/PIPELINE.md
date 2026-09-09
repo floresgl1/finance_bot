@@ -928,6 +928,7 @@ at it, so the live CSVs the next real training run reads are untouched. Writes
 | `--horizons` | Does the forward-return label window matter? Re-labels and re-benchmarks at 3/5/7/14/21 days. |
 | `--broad` | Modifier. Swaps the four regime windows for ten continuous ones. |
 | `--window START END` | Modifier. Runs one explicit window — use it to simulate the exact dates the live account traded. |
+| `--tiers` | Sweeps the confidence-tier position sizes; reports return, drawdown and realised exposure per level. |
 
 **DESIGN DECISION:**
 Every `--exposure` arm is expressed as a rewrite of the signal frames and run
@@ -988,12 +989,22 @@ instead of skipping any ticker already owned. That second change was the larger
 one: with it, the simulator reproduces the live account to within ~3pp over the
 same window, against a 14pp discrepancy before.
 
-**Open question — the tier levels.** `SMALL_POSITION_PCT` is 3% against a cap of
-8%, and the modal signal lands in that tier, so the book runs around 33%
-invested. Exposure is the dominant factor in every measurement taken, so raising
-the tiers toward the cap is the obvious next lever. It is deliberately untuned:
-the broad sample separates all sizing variants by under 3pp, which is not enough
-signal to fit against.
+**Answered — the tier levels are not the constraint.** `edge_probe.py --tiers
+--broad` sweeps them from half the shipped sizes to flat at the cap. The
+relationship is monotone (more exposure, better return, at 0.29pp of extra mean
+drawdown), so the direction is structural rather than fitted — but a 2.7x change
+in position size moves the book only from 27% to 40% invested.
+
+Divide exposure by position size and the reason is plain: the book holds about
+**five of twelve names** at every level. Position size changes; the number of
+names held does not, because that is set by how many tickers the model has in a
+BUY state at once. Twelve names at the cap would be a 96% book, and the arms
+that come closest to buy-and-hold run at 79-88% — reached by overriding the
+signal, not by following it.
+
+**Sizing is exhausted as a lever.** Adopting `6/7/8` or flat-at-cap would be
+defensible and worth 1-2pp, but the constants stay where they are until the
+finding-J change has been observed in production. See finding K.
 
 ### `compare_models.py`
 Compares test-set metrics between the current model and the backup model.
