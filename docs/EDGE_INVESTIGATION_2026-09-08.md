@@ -772,6 +772,103 @@ precede it.
 The finding stands regardless of whether the constants ever move: **sizing is
 exhausted as a lever.**
 
+## L. The sell side is not the weakness. Selling less is the edge.
+
+`python edge_probe.py --exits --broad`
+
+The bot looks bad at selling. A HOLD signal does nothing at all — `hold_sigs` in
+`live_trader.py` is collected and only logged — so an owned position survives
+until an explicit SELL, a stop, a take-profit or a rebalancer trim. A SELL only
+fires on a name already held, and the sentiment veto suppresses some of those.
+The live log reads **47 `REBALANCER_SELL` and 12 stop backfills against 9 model
+`SELL`s**. The model is barely involved in getting out.
+
+Meanwhile `backtest._simulate()` closed on *any* non-BUY signal, so every
+simulated result was computed under a far tighter exit discipline than the bot
+has. `_simulate` now takes an `exit_policy`, and this compares them.
+
+### The classifier's SELL was never the problem
+
+Fixed test window, 828 rows, 3-year lookback:
+
+| class | precision | recall | F1 | edge over its own constant baseline |
+|---|---|---|---|---|
+| BUY | 0.407 | 0.477 | 0.439 | +0.0075 |
+| **SELL** | **0.422** | 0.412 | 0.417 | **+0.0353** |
+| HOLD | 0.205 | 0.147 | 0.171 | **negative** — below its 0.214 base rate |
+
+SELL carries roughly **five times BUY's edge** over its own baseline, and the
+promotion gate had never looked at it. It is now gated (`test_sell_support`,
+`challenger_sell_precision`, `challenger_sell_recall`).
+
+HOLD is the class that is actually broken: precision 0.205 against a base rate
+of 0.214, so the model is *worse than chance* at recognising "no move". It is
+reported but deliberately not gated — a floor on it would block every promotion
+for a reason unrelated to trading.
+
+### Every exit reason you add costs money
+
+| Exit policy | Beat hold | Mean vs hold | Exposure | Trades |
+|---|---|---|---|---|
+| **exit on SELL only** (live today) | 1/10 | **−23.45pp** | 47% | **130** |
+| exit on SELL or stop | 1/10 | −23.98pp | 47% | 140 |
+| exit at label horizon | 0/10 | −26.14pp | 46% | 177 |
+| exit on any non-BUY (old simulator) | 2/10 | −27.52pp | 33% | 202 |
+| exit on SELL, stop or horizon | 1/10 | −28.69pp | 38% | 215 |
+
+Sort that table by trade count and it sorts by return, monotonically:
+130 → −23.45pp, 140 → −23.98, 177 → −26.14, 202 → −27.52, 215 → −28.69.
+**Every additional reason to exit makes the result worse.**
+
+### The "weakness" is the best policy tested
+
+Holding through HOLD — the behaviour that looks like a missing feature — beats
+the old simulator rule by **+4.07pp**, at 47% exposure against 33%, on 130 trades
+instead of 202. It is the best of the five.
+
+Adding stop-loss exits on top costs 0.53pp. Adding a time-based exit costs
+2.7pp. Adding all three costs 5.2pp.
+
+This is finding K from another angle. The book is capped by how many names sit
+in BUY at once, so anything that closes positions faster cuts exposure, and
+exposure is what the deficit is made of. The bot's lax exit is not an oversight
+that survived; it is the single most valuable thing about its execution layer.
+
+### It also revises the headline again
+
+Under the exit rule the bot actually uses, the shipped configuration is
+**−23.45pp** against buy-and-hold over ten windows, not the −27.52pp quoted in
+findings J and K. Those were computed with `not_buy`, which no deployed version
+of this bot has ever done. The direction is unchanged and the conclusion is
+unchanged; the simulator was understating the bot by roughly four points on top
+of everything findings I and J already corrected.
+
+### What to do about HOLD
+
+Nothing that involves teaching the model to predict it better.
+
+"No move" is the hardest of the three targets — it is defined as the *absence*
+of a signal, its width moves with VIX, and it is the minority class at 21.4%.
+Findings B, E, G and H already tested every width and horizon that would change
+it, and none of them improved returns.
+
+The principled fix is to **stop asking the model for HOLD at all**: train a
+binary BUY/SELL classifier and derive HOLD from a two-sided confidence band at
+inference. That turns HOLD from a learned class the model is worse than chance
+at into an operating decision with a tunable width — and this finding says
+exactly which way to tune it, because band width controls trade frequency and
+trading less is what wins.
+
+Note that `CONFIDENCE_THRESHOLD = 0.35` cannot be reused as-is: with two classes
+the top probability is always at least 0.5, so the existing gate would never
+fire and every row would become a decisive trade. The band needs its own
+threshold, and it should be wide.
+
+Expected return improvement: small. Every structural change tested in this
+investigation has been. The reason to do it is that it removes a component that
+is measurably worse than chance and replaces it with a knob pointed in the
+direction the evidence favours.
+
 ## Where this leaves things
 
 **The strategy does not beat buy-and-hold**, on every measurement taken: six
@@ -782,16 +879,20 @@ Finding I found `backtest._simulate()` had never modelled the live sizing rule.
 Finding J fixed it, and the simulator now reproduces the live account to within
 ~3pp on the same window — the first time simulation and reality have agreed.
 
-**The lever is exposure — and the model's own signal is what caps it.** Every
-model-driven sizing variant lands between −25.1pp and −29.7pp against holding
-over ten windows. Position size can be tripled and the book still holds about
-five of twelve names, because that is how many the model has in BUY at once
-(finding K). The only arms that come close to buy-and-hold stay 79–88% invested,
-and they get there by overriding the signal rather than following it.
+**The lever is exposure — and the model's own signal is what caps it.** The
+book holds about five of twelve names because that is how many the model has in
+BUY at once (finding K), and every exit rule that closes positions faster makes
+the result worse (finding L). Position size can be tripled and exposure barely
+moves.
 
-So the deficit is not fixable by sizing, features, label width or label horizon.
-It is fixable only by trading the signal less — and at the limit of that, there
-is no strategy left.
+Under the exit rule the bot actually uses, the shipped configuration is
+**−23.45pp** against buy-and-hold over ten windows. The only arms that come
+close stay 79–88% invested, and they get there by overriding the signal rather
+than following it.
+
+So the deficit is not fixable by sizing, features, label width, label horizon or
+exit discipline. It is fixable only by trading the signal less — and at the
+limit of that, there is no strategy left.
 
 Finding H is the one to remember methodologically: the four-window sample used
 for findings A, E and F was half drawdowns by construction, and it flattered
@@ -901,6 +1002,7 @@ python edge_probe.py --horizons 3 5 7 14 21     # label window     (finding G)
 python edge_probe.py --horizons 3 7 21 --broad  # ten windows, not four (finding H)
 python edge_probe.py --exposure --broad         # F, corrected
 python edge_probe.py --tiers --broad            # position sizes (finding K)
+python edge_probe.py --exits --broad            # exit policy    (finding L)
 python edge_probe.py --exposure --window 2026-03-05 2026-09-04
                                                 # simulate one exact period
 ```

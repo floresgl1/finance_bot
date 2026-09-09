@@ -706,3 +706,148 @@ def test_tier_summary_is_ascii_only():
     })
 
     summarise_tiers(results).encode("ascii")
+
+
+# --- exit policies ---------------------------------------------------------
+#
+# The simulator and the bot have never agreed on how a position closes.
+# _simulate closed on any non-BUY signal; live, a HOLD does nothing at all, so a
+# position survives until an explicit SELL, a stop, a take-profit or a trim.
+# _should_exit is where that difference now lives, so it has to be exact.
+
+from backtest import EXIT_POLICIES, _should_exit          # noqa: E402
+from edge_probe import EXIT_POLICY_LABELS, summarise_exits  # noqa: E402
+
+
+def _position(entry_price: float = 100.0, entry_index: int = 0) -> dict:
+    return {"shares": 10.0, "entry_price": entry_price, "cost": 1000.0,
+            "entry_index": entry_index}
+
+
+def _exit(policy, signal="HOLD", close_px=100.0, day_index=1,
+          stop_loss_pct=0.10, max_hold_days=7, position=None):
+    return _should_exit(policy, signal, close_px, position or _position(),
+                        day_index, stop_loss_pct, max_hold_days)
+
+
+def test_not_buy_closes_on_hold_which_is_what_live_does_not_do():
+    """The old simulator rule. Documented here precisely because it diverges
+    from the bot: live holds through HOLD."""
+    assert _exit("not_buy", signal="HOLD") is True
+    assert _exit("not_buy", signal="SELL") is True
+    assert _exit("not_buy", signal="BUY") is False
+
+
+def test_sell_only_holds_through_hold():
+    """What live_trader actually does — hold_sigs is collected and only logged."""
+    assert _exit("sell_only", signal="HOLD") is False
+    assert _exit("sell_only", signal="BUY") is False
+    assert _exit("sell_only", signal="SELL") is True
+
+
+def test_a_stop_fires_at_the_configured_loss_and_not_before():
+    below = _exit("sell_or_stop", signal="HOLD", close_px=89.99)
+    at = _exit("sell_or_stop", signal="HOLD", close_px=90.0)
+    above = _exit("sell_or_stop", signal="HOLD", close_px=90.01)
+
+    assert below is True and at is True and above is False
+
+
+def test_a_stop_does_not_fire_under_sell_only():
+    """sell_only is the live model-driven rule; stops are a separate mechanism,
+    and conflating them would hide which one is doing the work."""
+    assert _exit("sell_only", signal="HOLD", close_px=50.0) is False
+
+
+def test_the_horizon_exit_closes_when_the_label_stops_being_about_the_future():
+    assert _exit("horizon", day_index=6, max_hold_days=7) is False
+    assert _exit("horizon", day_index=7, max_hold_days=7) is True
+
+
+def test_the_horizon_exit_ignores_the_signal_entirely():
+    assert _exit("horizon", signal="BUY", day_index=9, max_hold_days=7) is True
+
+
+def test_the_combined_policy_fires_on_any_of_its_three_reasons():
+    assert _exit("sell_stop_or_horizon", signal="SELL", day_index=1) is True
+    assert _exit("sell_stop_or_horizon", close_px=50.0, day_index=1) is True
+    assert _exit("sell_stop_or_horizon", day_index=9) is True
+    assert _exit("sell_stop_or_horizon", signal="BUY", day_index=1) is False
+
+
+def test_an_unknown_policy_is_rejected():
+    with pytest.raises(ValueError, match="unknown exit policy"):
+        _exit("no_such_policy")
+
+
+def test_every_labelled_policy_is_implemented():
+    """EXIT_POLICY_LABELS and EXIT_POLICIES are edited separately; a typo would
+    otherwise surface halfway through a long probe run."""
+    assert set(EXIT_POLICY_LABELS) == set(EXIT_POLICIES)
+    for policy in EXIT_POLICIES:
+        _exit(policy)   # must not raise
+
+
+def _exit_results(rows: dict) -> dict:
+    return {
+        policy: {
+            "label": EXIT_POLICY_LABELS.get(policy, policy),
+            "windows": {},
+            "mean_delta_pp": delta,
+            "mean_exposure": exposure,
+            "mean_max_drawdown": -10.0,
+            "mean_trades": trades,
+            "windows_beating_hold": 1,
+            "n_windows": 10,
+        }
+        for policy, (delta, exposure, trades) in rows.items()
+    }
+
+
+def test_exit_summary_reports_nothing_to_summarise():
+    assert "No exit policy" in summarise_exits({})
+
+
+def test_exit_summary_credits_holding_through_hold_when_it_wins():
+    results = _exit_results({
+        "not_buy":   (-27.0, 33.0, 160.0),
+        "sell_only": (-12.0, 70.0, 40.0),
+    })
+
+    out = summarise_exits(results)
+
+    assert "feature, not the bug" in out
+    assert "+15.00pp" in out
+
+
+def test_exit_summary_says_so_when_holding_through_hold_costs_return():
+    results = _exit_results({
+        "not_buy":   (-12.0, 33.0, 160.0),
+        "sell_only": (-27.0, 70.0, 40.0),
+    })
+
+    out = summarise_exits(results)
+
+    assert "costs return" in out
+    assert "exit on HOLD as well as on SELL" in out
+
+
+def test_exit_summary_flags_a_policy_neither_side_uses():
+    results = _exit_results({
+        "not_buy":      (-27.0, 33.0, 160.0),
+        "sell_only":    (-20.0, 70.0, 40.0),
+        "sell_or_stop": (-5.0, 65.0, 55.0),
+    })
+
+    out = summarise_exits(results)
+
+    assert "Best overall" in out
+    assert "Neither the simulator" in out
+
+
+def test_exit_summary_is_ascii_only():
+    results = _exit_results({
+        "not_buy": (-27.0, 33.0, 160.0), "sell_only": (-12.0, 70.0, 40.0),
+    })
+
+    summarise_exits(results).encode("ascii")

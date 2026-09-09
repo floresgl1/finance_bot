@@ -64,6 +64,9 @@ from config import (
     PROMOTION_MIN_BUY_PRECISION,
     PROMOTION_MIN_BUY_RECALL,
     PROMOTION_MIN_TEST_BUY_SUPPORT,
+    PROMOTION_MIN_SELL_PRECISION,
+    PROMOTION_MIN_SELL_RECALL,
+    PROMOTION_MIN_TEST_SELL_SUPPORT,
     PROMOTION_MIN_RETURN_IMPROVEMENT_PCT,
     PROMOTION_MIN_BACKTEST_TRADES,
     PROMOTION_MAX_DRAWDOWN_PCT,
@@ -78,20 +81,33 @@ CANDIDATE_PATH = os.path.join(MODEL_DIR, CANDIDATE_MODEL_FILENAME)
 # Metric extraction
 # ---------------------------------------------------------------------------
 def extract_gate_metrics(report: dict) -> dict:
-    """Pull the BUY-class metrics the gate reasons about out of a
+    """Pull the directional-class metrics the gate reasons about out of a
     classification_report(output_dict=True).
 
-    BUY is the class that matters: a false BUY spends real money, while a
-    missed BUY costs only opportunity. HOLD dominates the label distribution,
-    so overall accuracy would hide a model that simply stopped buying.
+    BUY and SELL are both gated; HOLD is not. HOLD is reported for context only
+    because the model is measurably worse than chance at it — precision 0.205
+    against a 0.214 base rate — so a floor on it would either be vacuous or
+    would block every promotion for a reason unrelated to trading.
+
+    SELL was ungated until 2026-09-08 on the reasoning that a false BUY spends
+    money while a false SELL costs only opportunity. On the same test window
+    SELL carried roughly five times BUY's edge over its own constant baseline,
+    and it is the side the bot executes worst, so it is now gated the same way.
     """
     buy = report.get("BUY") or {}
+    sell = report.get("SELL") or {}
+    hold = report.get("HOLD") or {}
     return {
-        "buy_f1":        float(buy.get("f1-score", 0.0)),
-        "buy_precision": float(buy.get("precision", 0.0)),
-        "buy_recall":    float(buy.get("recall", 0.0)),
-        "buy_support":   int(buy.get("support", 0)),
-        "accuracy":      float(report.get("accuracy", 0.0)),
+        "buy_f1":         float(buy.get("f1-score", 0.0)),
+        "buy_precision":  float(buy.get("precision", 0.0)),
+        "buy_recall":     float(buy.get("recall", 0.0)),
+        "buy_support":    int(buy.get("support", 0)),
+        "sell_f1":        float(sell.get("f1-score", 0.0)),
+        "sell_precision": float(sell.get("precision", 0.0)),
+        "sell_recall":    float(sell.get("recall", 0.0)),
+        "sell_support":   int(sell.get("support", 0)),
+        "hold_f1":        float(hold.get("f1-score", 0.0)),
+        "accuracy":       float(report.get("accuracy", 0.0)),
     }
 
 
@@ -218,6 +234,31 @@ def decide_promotion(
         f"scores well by refusing to buy",
     )
 
+    # --- 2b. The same floors on the SELL side ------------------------------
+    # A challenger that quietly stopped selling would leave losers on the book
+    # and still clear every BUY check, because nothing here would notice.
+    sell_support_ok = record(
+        "test_sell_support",
+        challenger.get("sell_support", 0) >= PROMOTION_MIN_TEST_SELL_SUPPORT,
+        f"{challenger.get('sell_support', 0)} true SELL rows in test set "
+        f"(minimum {PROMOTION_MIN_TEST_SELL_SUPPORT})",
+    )
+
+    sell_precision_ok = record(
+        "challenger_sell_precision",
+        challenger.get("sell_precision", 0.0) >= PROMOTION_MIN_SELL_PRECISION,
+        f"SELL precision {challenger.get('sell_precision', 0.0):.3f} "
+        f"(floor {PROMOTION_MIN_SELL_PRECISION})",
+    )
+
+    sell_recall_ok = record(
+        "challenger_sell_recall",
+        challenger.get("sell_recall", 0.0) >= PROMOTION_MIN_SELL_RECALL,
+        f"SELL recall {challenger.get('sell_recall', 0.0):.3f} "
+        f"(floor {PROMOTION_MIN_SELL_RECALL}) - guards against a model that "
+        f"stops exiting and leaves losers on the book",
+    )
+
     # --- 3. Enough simulated trades to judge the return on ------------------
     trades_ok = record(
         "backtest_trade_count",
@@ -279,6 +320,7 @@ def decide_promotion(
 
     promote = (
         support_ok and precision_ok and recall_ok
+        and sell_support_ok and sell_precision_ok and sell_recall_ok
         and trades_ok and drawdown_ok and improvement_ok
         and beats_hold_ok
     )
@@ -404,8 +446,12 @@ def build_report(
         return (
             f"{label} — return **{m['total_return']:+.2f}%** over "
             f"{m['n_trades']} trades, drawdown {m['max_drawdown']:.2f}%\n"
-            f"　　BUY F1 {m['buy_f1']:.3f}  prec {m['buy_precision']:.3f}  "
-            f"recall {m['buy_recall']:.3f}  acc {m['accuracy']:.3f}"
+            f"　　BUY  F1 {m['buy_f1']:.3f}  prec {m['buy_precision']:.3f}  "
+            f"recall {m['buy_recall']:.3f}\n"
+            f"　　SELL F1 {m.get('sell_f1', 0.0):.3f}  "
+            f"prec {m.get('sell_precision', 0.0):.3f}  "
+            f"recall {m.get('sell_recall', 0.0):.3f}  "
+            f"acc {m['accuracy']:.3f}"
         )
 
     if champion is None:
