@@ -549,3 +549,160 @@ def test_broad_windows_are_mostly_not_drawdowns():
     drawdowns = {"covid crash 2020", "bear 2022"}
     assert len(BROAD_WINDOWS) >= 8
     assert len(drawdowns) / len(BROAD_WINDOWS) < 0.3
+
+
+# --- position-tier sweep ---------------------------------------------------
+#
+# The sweep exists to ask whether return rises MONOTONICALLY with exposure, not
+# which level scores best. A peak in the middle of ten windows is a curve fit,
+# and adopting it is exactly the mistake finding H recorded — so the summary has
+# to say which of those two shapes it is seeing, and say it correctly.
+
+from edge_probe import (          # noqa: E402
+    DEFAULT_TIER_LEVELS,
+    _tiers,
+    summarise_tiers,
+)
+
+
+def test_tier_override_sets_and_restores_the_allocator_globals():
+    import capital_allocator as alloc
+
+    before = (alloc.SMALL_POSITION_PCT, alloc.NORMAL_POSITION_PCT,
+              alloc.LARGE_POSITION_PCT)
+
+    with _tiers(0.01, 0.02, 0.03):
+        assert alloc.get_allocation_tier(0.90) == ("large", 0.03)
+        assert alloc.get_allocation_tier(0.55) == ("normal", 0.02)
+        assert alloc.get_allocation_tier(0.40) == ("small", 0.01)
+
+    assert (alloc.SMALL_POSITION_PCT, alloc.NORMAL_POSITION_PCT,
+            alloc.LARGE_POSITION_PCT) == before
+
+
+def test_tier_override_restores_after_an_exception():
+    """A level that blows up must not leave its sizes behind for the next one —
+    that would silently reattribute one level's results to another."""
+    import capital_allocator as alloc
+
+    before = (alloc.SMALL_POSITION_PCT, alloc.NORMAL_POSITION_PCT,
+              alloc.LARGE_POSITION_PCT)
+
+    with pytest.raises(RuntimeError):
+        with _tiers(0.01, 0.02, 0.03):
+            raise RuntimeError("level blew up")
+
+    assert (alloc.SMALL_POSITION_PCT, alloc.NORMAL_POSITION_PCT,
+            alloc.LARGE_POSITION_PCT) == before
+
+
+def test_the_sweep_reaches_the_live_bot_through_the_allocator():
+    """backtest._simulate sizes via get_allocation_tier, so the override has to
+    change the simulated book, not just a local variable."""
+    import backtest as bt
+
+    with _tiers(0.02, 0.02, 0.02):
+        _label, small = bt.get_allocation_tier(0.90)
+    with _tiers(0.08, 0.08, 0.08):
+        _label, large = bt.get_allocation_tier(0.90)
+
+    assert small == 0.02 and large == 0.08
+
+
+def test_default_levels_never_exceed_the_position_cap():
+    """A tier above MAX_POSITION_PCT recreates the exact defect this sweep is
+    downstream of: a position opening above the cap that governs it."""
+    import config
+
+    for label, (small, normal, large) in DEFAULT_TIER_LEVELS.items():
+        assert small <= normal <= large, label
+        assert large <= config.MAX_POSITION_PCT, label
+
+
+def test_default_levels_span_a_range_worth_sweeping():
+    larges = [l for _s, _n, l in DEFAULT_TIER_LEVELS.values()]
+    assert min(larges) < max(larges) / 2
+
+
+def _tier_results(rows: dict) -> dict:
+    """rows: {label: (mean_exposure, mean_delta_pp, mean_max_drawdown)}"""
+    return {
+        label: {
+            "levels": (0.03, 0.05, 0.07),
+            "windows": {},
+            "mean_exposure": exposure,
+            "mean_delta_pp": delta,
+            "mean_max_drawdown": drawdown,
+            "windows_beating_hold": 0,
+            "n_windows": 10,
+        }
+        for label, (exposure, delta, drawdown) in rows.items()
+    }
+
+
+def test_tier_summary_reports_nothing_to_summarise():
+    assert "No tier level" in summarise_tiers({})
+
+
+def test_tier_summary_calls_a_monotone_relationship_structural():
+    results = _tier_results({
+        "low":  (20.0, -30.0, -8.0),
+        "mid":  (50.0, -20.0, -12.0),
+        "high": (85.0, -8.0, -18.0),
+    })
+
+    out = summarise_tiers(results)
+
+    assert "MONOTONE" in out
+    assert "structural" in out
+    assert "be invested" in out
+
+
+def test_tier_summary_refuses_to_adopt_a_peak():
+    """The finding-H guard. A middle maximum is a fit on ten windows."""
+    results = _tier_results({
+        "low":  (20.0, -30.0, -8.0),
+        "mid":  (50.0, -5.0, -12.0),
+        "high": (85.0, -25.0, -18.0),
+    })
+
+    out = summarise_tiers(results)
+
+    assert "NOT MONOTONE" in out
+    assert "curve fit" in out
+    assert "Do NOT adopt" in out
+    assert "leave the tier constants alone" in out
+
+
+def test_tier_summary_orders_by_exposure_not_by_score():
+    """Monotonicity is only meaningful along the exposure axis."""
+    results = _tier_results({
+        "high": (85.0, -8.0, -18.0),
+        "low":  (20.0, -30.0, -8.0),
+        "mid":  (50.0, -20.0, -12.0),
+    })
+
+    body = summarise_tiers(results).split("-" * 74)[1]
+
+    assert body.index("low") < body.index("mid") < body.index("high")
+
+
+def test_tier_summary_states_the_drawdown_cost():
+    """More exposure is not free, and the report has to price it."""
+    results = _tier_results({
+        "low":  (20.0, -30.0, -8.0),
+        "high": (85.0, -8.0, -18.0),
+    })
+
+    out = summarise_tiers(results)
+
+    assert "Cost of the extra exposure" in out
+    assert "-10.00pp" in out
+
+
+def test_tier_summary_is_ascii_only():
+    results = _tier_results({
+        "low": (20.0, -30.0, -8.0), "high": (85.0, -8.0, -18.0),
+    })
+
+    summarise_tiers(results).encode("ascii")
