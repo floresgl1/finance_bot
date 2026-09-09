@@ -246,6 +246,21 @@ PROMOTION_MIN_BUY_RECALL    = 0.10
 # noise and the gate refuses to decide rather than guessing.
 PROMOTION_MIN_TEST_BUY_SUPPORT = 30
 
+# --- SELL floors ------------------------------------------------------------
+# SELL went ungated until 2026-09-08, on the reasoning that a false BUY spends
+# money while a false SELL only costs opportunity. Measurement says that was
+# backwards about which class is worth watching: on the same test window SELL
+# precision beat its own constant baseline by +0.0353 against BUY's +0.0075, so
+# SELL carries roughly five times the edge and nothing was checking it.
+#
+# It is also the side the bot is weakest at executing — a HOLD signal does not
+# close a position, and a SELL only fires on a name already owned — so a
+# challenger that quietly stopped selling would leave losers on the book and
+# clear every other check.
+PROMOTION_MIN_SELL_PRECISION = 0.35
+PROMOTION_MIN_SELL_RECALL    = 0.10
+PROMOTION_MIN_TEST_SELL_SUPPORT = 30
+
 # Retention for models/archive/. Superseded champions are kept so a bad
 # promotion can be rolled back by hand.
 MODEL_ARCHIVE_RETAIN = 10

@@ -22,6 +22,7 @@ from config import (
     MAX_POSITION_PCT,
     MAX_TOTAL_EXPOSURE,
     ADD_TO_POSITION_CONFIDENCE,
+    STOP_LOSS_PCT,
 )
 from features import load_and_process
 
@@ -115,30 +116,82 @@ def _split_dates(all_dates: list) -> dict[str, list]:
 # Core simulation
 # ---------------------------------------------------------------------------
 
+# How a held position is closed. The default reproduces the behaviour every
+# result before 2026-09-08 was computed under.
+#
+# **DESIGN DECISION:**
+# `not_buy` is NOT what the live bot does, and the difference is large. Live,
+# a HOLD signal does nothing at all -- `hold_sigs` in live_trader.py is collected
+# and only logged -- so an owned position survives a HOLD and is closed only by
+# an explicit SELL, a stop, a take-profit or a rebalancer trim. The simulator
+# exiting on HOLD gives it a far tighter exit discipline than the bot has, which
+# is one reason live outperformed its own simulation (findings I/J).
+EXIT_POLICIES = ("not_buy", "sell_only", "sell_or_stop", "horizon",
+                 "sell_stop_or_horizon")
+
+
+def _should_exit(policy: str, signal: str, close_px: float, position: dict,
+                 day_index: int, stop_loss_pct: float, max_hold_days: int) -> bool:
+    """Whether an open position closes today under `policy`."""
+    stopped = close_px <= position["entry_price"] * (1 - stop_loss_pct)
+    expired = (day_index - position["entry_index"]) >= max_hold_days
+
+    if policy == "not_buy":
+        return signal != "BUY"
+    if policy == "sell_only":
+        return signal == "SELL"
+    if policy == "sell_or_stop":
+        return signal == "SELL" or stopped
+    if policy == "horizon":
+        return expired
+    if policy == "sell_stop_or_horizon":
+        return signal == "SELL" or stopped or expired
+    raise ValueError(f"unknown exit policy: {policy!r}")
+
+
 def _simulate(
     dates: list,
     ticker_data: dict[str, pd.DataFrame],
+    exit_policy: str = "not_buy",
+    stop_loss_pct: float = STOP_LOSS_PCT,
+    max_hold_days: int | None = None,
 ) -> tuple[list, list]:
     """
     Run the day-by-day portfolio simulation over the given dates.
+
+    `exit_policy` selects how a held position is closed; see EXIT_POLICIES.
+    `max_hold_days` defaults to the label horizon, so a time-based exit closes
+    a position exactly when the label it was opened on stops being about the
+    future.
 
     Returns:
         trade_log    — list of dicts, one per closed trade
         equity_curve — list of dicts, one per day
     """
+    if exit_policy not in EXIT_POLICIES:
+        raise ValueError(f"unknown exit policy: {exit_policy!r}")
+    if max_hold_days is None:
+        import labels
+
+        max_hold_days = labels._WINDOW
     cash         = float(INITIAL_CAPITAL)
     positions    = {}   # ticker to{shares, entry_price, cost}
     trade_log    = []
     equity_curve = []
 
-    for date in dates:
+    for day_index, date in enumerate(dates):
 
-        # Step 1: close positions where today's signal is no longer BUY
+        # Step 1: close positions the exit policy says are done
         to_close = [
             ticker for ticker, pos in positions.items()
             if ticker in ticker_data
             and date in ticker_data[ticker].index
-            and ticker_data[ticker].loc[date, "Signal"] != "BUY"
+            and _should_exit(
+                exit_policy,
+                ticker_data[ticker].loc[date, "Signal"],
+                ticker_data[ticker].loc[date, "Close"],
+                pos, day_index, stop_loss_pct, max_hold_days,
+            )
         ]
         for ticker in to_close:
             pos        = positions.pop(ticker)
@@ -233,6 +286,7 @@ def _simulate(
             else:
                 positions[ticker] = {
                     "shares": shares, "entry_price": entry_price, "cost": cost,
+                    "entry_index": day_index,
                 }
 
         # Step 4: record daily equity (recalculate after new positions)

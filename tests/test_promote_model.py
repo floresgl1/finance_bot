@@ -34,6 +34,11 @@ def _metrics(
     buy_precision: float = 0.50,
     buy_recall: float = 0.50,
     buy_support: int = 100,
+    sell_f1: float = 0.50,
+    sell_precision: float = 0.50,
+    sell_recall: float = 0.50,
+    sell_support: int = 100,
+    hold_f1: float = 0.17,
     accuracy: float = 0.60,
     total_return: float = 5.0,
     n_trades: int = 40,
@@ -48,6 +53,11 @@ def _metrics(
         "buy_precision": buy_precision,
         "buy_recall": buy_recall,
         "buy_support": buy_support,
+        "sell_f1": sell_f1,
+        "sell_precision": sell_precision,
+        "sell_recall": sell_recall,
+        "sell_support": sell_support,
+        "hold_f1": hold_f1,
         "accuracy": accuracy,
         "total_return": total_return,
         "n_trades": n_trades,
@@ -71,6 +81,9 @@ def _winner(champion: dict) -> dict:
         buy_precision=config.PROMOTION_MIN_BUY_PRECISION + 0.10,
         buy_recall=config.PROMOTION_MIN_BUY_RECALL + 0.10,
         buy_support=config.PROMOTION_MIN_TEST_BUY_SUPPORT + 50,
+        sell_precision=config.PROMOTION_MIN_SELL_PRECISION + 0.10,
+        sell_recall=config.PROMOTION_MIN_SELL_RECALL + 0.10,
+        sell_support=config.PROMOTION_MIN_TEST_SELL_SUPPORT + 50,
         total_return=total_return,
         n_trades=config.PROMOTION_MIN_BACKTEST_TRADES + 25,
         max_drawdown=config.PROMOTION_MAX_DRAWDOWN_PCT + 15.0,
@@ -395,6 +408,7 @@ def test_every_check_runs_even_after_one_fails():
     challenger = _metrics(
         buy_f1=0.01, buy_precision=0.01, buy_recall=0.01, buy_support=1,
         total_return=-20.0, n_trades=2, max_drawdown=-90.0, hold_return=5.0,
+        sell_precision=0.01, sell_recall=0.01, sell_support=1,
     )
 
     decision = decide_promotion(champion, challenger)
@@ -404,12 +418,15 @@ def test_every_check_runs_even_after_one_fails():
         "test_buy_support",
         "challenger_buy_precision",
         "challenger_buy_recall",
+        "test_sell_support",
+        "challenger_sell_precision",
+        "challenger_sell_recall",
         "backtest_trade_count",
         "challenger_max_drawdown",
         "beats_champion_return",
         "beats_buy_and_hold",
     ]
-    assert len(_failed_check_names(decision)) == 7
+    assert len(_failed_check_names(decision)) == 10
 
 
 def test_summary_names_the_failed_checks():
@@ -540,7 +557,7 @@ def test_decision_file_records_a_promotion(tmp_path):
     assert payload["archived_to"] == "models/archive/x.joblib"
     assert payload["champion"]["buy_f1"] == 0.40
     assert payload["challenger"] == challenger
-    assert len(payload["checks"]) == 7
+    assert len(payload["checks"]) == 10
     assert "timestamp_utc" in payload
 
 
@@ -743,3 +760,120 @@ def test_extract_backtest_metrics_reports_a_missing_hold_arm_as_none():
 
     assert extract_backtest_metrics({"total_return": 5.0})["hold_return"] is None
     assert extract_backtest_metrics({}, None)["hold_return"] is None
+
+
+# --- SELL floors -----------------------------------------------------------
+#
+# SELL went ungated until 2026-09-08 on the reasoning that a false BUY spends
+# money while a false SELL only costs opportunity. Measurement says that was
+# backwards about which class is worth watching: SELL beat its own constant
+# baseline by +0.0353 against BUY's +0.0075. It is also the side the bot
+# executes worst -- a HOLD signal does not close a position -- so a challenger
+# that stopped selling would leave losers on the book and clear every BUY check.
+
+
+def test_a_challenger_that_stopped_selling_is_rejected():
+    """The failure mode the SELL recall floor exists for: every BUY metric is
+    excellent and the model simply never exits."""
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["sell_recall"] = 0.0
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is False
+    assert _failed_check_names(decision) == {"challenger_sell_recall"}
+
+
+def test_a_challenger_selling_at_random_is_rejected():
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["sell_precision"] = config.PROMOTION_MIN_SELL_PRECISION - 0.01
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is False
+    assert _failed_check_names(decision) == {"challenger_sell_precision"}
+
+
+def test_a_thin_sell_test_set_refuses_to_decide():
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["sell_support"] = config.PROMOTION_MIN_TEST_SELL_SUPPORT - 1
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is False
+    assert _failed_check_names(decision) == {"test_sell_support"}
+
+
+def test_sell_floors_exactly_at_the_boundary_pass():
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["sell_precision"] = config.PROMOTION_MIN_SELL_PRECISION
+    challenger["sell_recall"] = config.PROMOTION_MIN_SELL_RECALL
+    challenger["sell_support"] = config.PROMOTION_MIN_TEST_SELL_SUPPORT
+
+    assert decide_promotion(champion, challenger)["promote"] is True
+
+
+def test_missing_sell_metrics_are_treated_as_zero_and_reject():
+    """Failure-biased: a metrics dict without SELL fields must not pass
+    vacuously just because the key is absent."""
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    for key in ("sell_precision", "sell_recall", "sell_support"):
+        challenger.pop(key)
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is False
+    assert "challenger_sell_precision" in _failed_check_names(decision)
+
+
+def test_hold_is_reported_but_never_gated():
+    """The model is worse than chance at HOLD (precision 0.205 against a 0.214
+    base rate). A floor on it would block every promotion for a reason that has
+    nothing to do with trading."""
+    champion = _metrics(total_return=1.0)
+    challenger = _winner(champion)
+    challenger["hold_f1"] = 0.0
+
+    decision = decide_promotion(champion, challenger)
+
+    assert decision["promote"] is True
+    assert not any("hold_f1" in c["name"] for c in decision["checks"])
+
+
+def test_extract_gate_metrics_reads_all_three_classes():
+    report = {
+        "BUY":  {"f1-score": 0.44, "precision": 0.41, "recall": 0.48, "support": 331},
+        "SELL": {"f1-score": 0.42, "precision": 0.42, "recall": 0.41, "support": 320},
+        "HOLD": {"f1-score": 0.17, "precision": 0.21, "recall": 0.15, "support": 177},
+        "accuracy": 0.40,
+    }
+
+    metrics = extract_gate_metrics(report)
+
+    assert metrics["sell_precision"] == 0.42
+    assert metrics["sell_support"] == 320
+    assert metrics["hold_f1"] == 0.17
+
+
+def test_extract_gate_metrics_zeroes_a_missing_sell_class():
+    """A report with no SELL rows must fail the floors, not skip them."""
+    metrics = extract_gate_metrics({"BUY": {"f1-score": 0.5}, "accuracy": 0.4})
+
+    assert metrics["sell_precision"] == 0.0
+    assert metrics["sell_support"] == 0
+
+
+def test_report_shows_the_sell_line():
+    champion = _metrics(total_return=2.0)
+    challenger = _winner(champion)
+    decision = decide_promotion(champion, challenger)
+
+    report = build_report(decision, champion, challenger,
+                          dry_run=False, archived_to=None)
+
+    assert "SELL" in report
