@@ -144,6 +144,9 @@ degenerate model that scores high precision by almost never firing.
 | `challenger_max_drawdown` | `PROMOTION_MAX_DRAWDOWN_PCT` (-35%) | Earns more by risking ruin |
 | `beats_champion_return` | `PROMOTION_MIN_RETURN_IMPROVEMENT_PCT` (1.0pp) | Simulated return improvement below the margin, or worse |
 | `beats_buy_and_hold` | `PROMOTION_MIN_HOLD_DELTA_PCT` (0.0pp) | Loses to holding an equal-weight basket over the same dates |
+| `test_sell_support` | `PROMOTION_MIN_TEST_SELL_SUPPORT` (30) | Too few true SELL rows to judge the exit side |
+| `challenger_sell_precision` | `PROMOTION_MIN_SELL_PRECISION` (0.35) | Sells at random |
+| `challenger_sell_recall` | `PROMOTION_MIN_SELL_RECALL` (0.10) | Stopped exiting, leaving losers on the book |
 
 **DESIGN DECISION — the head-to-head is dollars, not BUY F1.**
 The gate originally compared BUY F1. F1 is a proxy for money and can move the
@@ -152,6 +155,19 @@ each made or lost, so a model can improve F1 while trading worse. Both models ar
 now run through `backtest.py` on the shared test split — net of the slippage and
 commission the simulator already applies — and compared on `total_return`.
 BUY F1 is still computed and reported for context but no longer gates.
+
+**DESIGN DECISION — SELL is gated, HOLD is not.**
+SELL went ungated until 2026-09-08 on the reasoning that a false BUY spends money
+while a false SELL costs only opportunity. Measurement says that was backwards
+about which class is worth watching: on the same test window SELL beat its own
+constant baseline by +0.0353 against BUY's +0.0075, roughly five times the edge.
+It is also the side the bot executes worst, so a challenger that quietly stopped
+selling would leave losers on the book and clear every BUY check.
+
+HOLD is extracted and reported but never gated. The model is *worse than chance*
+at it — precision 0.205 against a 0.214 base rate — so a floor would either be
+vacuous or block every promotion for a reason unrelated to trading. See finding L
+for what to do about HOLD instead.
 
 **DESIGN DECISION — beating the champion is not sufficient.**
 Checks 1-5 are all relative to the incumbent or to absolute floors, and none of
@@ -899,6 +915,16 @@ can be compared side-by-side.
 buy-and-hold arm over the same dates, with the same slippage and commission,
 through a shared `_summarise()`.
 
+**DESIGN DECISION — the exit rule is a parameter, and the default is not the
+bot.** `_simulate(exit_policy=...)` selects how a held position closes. The
+default `not_buy` reproduces every result computed before 2026-09-08, but the
+live bot does **not** do this: a HOLD signal does nothing at all (`hold_sigs` in
+`live_trader.py` is collected and only logged), so a position survives until an
+explicit SELL, a stop, a take-profit or a rebalancer trim. Finding L measured the
+difference at **+4.07pp in the bot's favour** — holding through HOLD is the best
+of the five policies tested, and every extra reason to exit makes the result
+worse.
+
 **DESIGN DECISION:**
 Without a hold arm a positive backtest return says nothing — a rising market
 makes almost any long-biased strategy look profitable. The `train` and `full`
@@ -929,6 +955,7 @@ at it, so the live CSVs the next real training run reads are untouched. Writes
 | `--broad` | Modifier. Swaps the four regime windows for ten continuous ones. |
 | `--window START END` | Modifier. Runs one explicit window — use it to simulate the exact dates the live account traded. |
 | `--tiers` | Sweeps the confidence-tier position sizes; reports return, drawdown and realised exposure per level. |
+| `--exits` | Compares how a held position is closed: on any non-BUY, on SELL only, on SELL or a stop, at the label horizon, or all three. |
 
 **DESIGN DECISION:**
 Every `--exposure` arm is expressed as a rewrite of the signal frames and run
