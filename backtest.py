@@ -12,13 +12,28 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from config import WATCHLIST, FEATURE_COLUMNS, CONFIDENCE_THRESHOLD, MODEL_DIR, MODEL_FILENAME
+from capital_allocator import get_allocation_tier
+from config import (
+    WATCHLIST,
+    FEATURE_COLUMNS,
+    CONFIDENCE_THRESHOLD,
+    MODEL_DIR,
+    MODEL_FILENAME,
+    MAX_POSITION_PCT,
+    MAX_TOTAL_EXPOSURE,
+    ADD_TO_POSITION_CONFIDENCE,
+)
 from features import load_and_process
 
 # --- Backtest settings ---
+#
+# MAX_POSITION_PCT and MAX_TOTAL_EXPOSURE come from config.py so this simulates
+# the book the live bot actually builds. They were previously redeclared here as
+# 0.20 / 0.80 -- a concentrated four-position strategy, where the live bot runs
+# up to twelve names at 8% with no portfolio-level cap. Every simulated return
+# figure produced before 2026-09-08 measured that other strategy, and the live
+# account beat its own simulation by roughly 20pp because of it.
 INITIAL_CAPITAL    = 10_000   # starting cash in USD
-MAX_POSITION_PCT   = 0.20     # max 20% of portfolio in any single stock
-MAX_TOTAL_EXPOSURE = 0.80     # max 80% of portfolio invested at once
 SLIPPAGE           = 0.001    # 0.1% price penalty applied on entry and exit
 COMMISSION         = 1.00     # flat fee per trade (entry or exit), in USD
 
@@ -151,21 +166,45 @@ def _simulate(
         portfolio_value = cash + invested_value
         exposure_pct    = invested_value / portfolio_value if portfolio_value > 0 else 0
 
-        # Step 3: open new positions on BUY signals
+        # Step 3: open new positions, and add to held ones, on BUY signals
+        #
+        # **DESIGN DECISION:**
+        # Sizing comes from capital_allocator.get_allocation_tier, the same
+        # table live_trader uses, and a held ticker is topped up rather than
+        # skipped. Before 2026-09-08 this sized at Confidence x MAX_POSITION_PCT
+        # (~3.6%) and skipped any ticker already held, which simulated a
+        # ~22%-invested book against a live bot running near 82%. Every return
+        # figure produced by that version measured a strategy nobody ran.
         for ticker, df in ticker_data.items():
-            if ticker in positions or date not in df.index:
+            if date not in df.index:
                 continue
             row = df.loc[date]
             if row["Signal"] != "BUY" or exposure_pct >= MAX_TOTAL_EXPOSURE:
                 continue
 
-            alloc_pct  = min(row["Confidence"] * MAX_POSITION_PCT, MAX_POSITION_PCT)
-            alloc_pct  = min(alloc_pct, MAX_TOTAL_EXPOSURE - exposure_pct)
+            close = row["Close"]
+            held  = positions.get(ticker)
+
+            if held is not None:
+                # Topping up needs more conviction than opening, and the result
+                # is capped at MAX_POSITION_PCT of the book -- check_add_to_position.
+                if row["Confidence"] < ADD_TO_POSITION_CONFIDENCE:
+                    continue
+                current_weight = (held["shares"] * close / portfolio_value
+                                  if portfolio_value > 0 else 0.0)
+                headroom = MAX_POSITION_PCT - current_weight
+                if headroom <= 0:
+                    continue
+            else:
+                headroom = MAX_POSITION_PCT
+
+            _tier, tier_pct = get_allocation_tier(row["Confidence"])
+            alloc_pct  = min(tier_pct, headroom, MAX_TOTAL_EXPOSURE - exposure_pct)
             alloc_cash = portfolio_value * alloc_pct
             if alloc_cash < 10:
                 continue
 
-            entry_price = row["Close"] * (1 + SLIPPAGE)
+            entry_price = close * (1 + SLIPPAGE)
             shares      = (alloc_cash - COMMISSION) / entry_price
             if shares <= 0:
                 continue
@@ -177,10 +216,24 @@ def _simulate(
                     continue
                 cost = shares * entry_price + COMMISSION
 
-            cash          -= cost
+            cash           -= cost
             invested_value += shares * entry_price
-            exposure_pct   = invested_value / portfolio_value if portfolio_value > 0 else 0
-            positions[ticker] = {"shares": shares, "entry_price": entry_price, "cost": cost}
+            exposure_pct    = invested_value / portfolio_value if portfolio_value > 0 else 0
+
+            if held is not None:
+                # Weighted average entry, so trade_return stays meaningful when
+                # the position was built over several sessions.
+                total_shares = held["shares"] + shares
+                held["entry_price"] = (
+                    (held["entry_price"] * held["shares"] + entry_price * shares)
+                    / total_shares
+                )
+                held["shares"] = total_shares
+                held["cost"]  += cost
+            else:
+                positions[ticker] = {
+                    "shares": shares, "entry_price": entry_price, "cost": cost,
+                }
 
         # Step 4: record daily equity (recalculate after new positions)
         invested_value = sum(

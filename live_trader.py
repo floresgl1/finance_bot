@@ -48,9 +48,11 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
 
-from capital_allocator import check_add_to_position
+from capital_allocator import check_add_to_position, get_allocation_tier
 from rebalancer import run_rebalancer
 from config import (
+    CONFIDENCE_THRESHOLD,
+    MAX_POSITION_PCT,
     INSUFFICIENT_EQUITY,
     STALE_DAYS,
     REBALANCER_TICKERS_SKIP,
@@ -550,19 +552,38 @@ def get_position_size(confidence: float) -> float | None:
     """
     Map a model confidence score (0–100) to a portfolio fraction.
 
-    Tiers:
-      below 35  → None  (skip trade entirely, treat as HOLD)
-      35 – 40   → 0.10  (10 % of equity)
-      40 – 45   → 0.15  (15 % of equity)
-      45+       → 0.20  (20 % of equity)
+    Tiers (from capital_allocator, so an open and a top-up share one rule):
+      below CONFIDENCE_THRESHOLD × 100 → None  (skip trade entirely, treat as HOLD)
+      35 – 50   → SMALL_POSITION_PCT   (3 % of equity)
+      50 – 65   → NORMAL_POSITION_PCT  (5 % of equity)
+      65+       → LARGE_POSITION_PCT   (7 % of equity)
+
+    **DESIGN DECISION:**
+    This used to open positions at 10/15/20% of equity while MAX_POSITION_PCT
+    capped the same position at 8%. Every entry therefore arrived over-weight:
+    the rebalancer trimmed it back to 7.5% over roughly three sessions, paying
+    slippage and a commission on stock the bot had chosen to buy days earlier,
+    and check_add_to_position refused every top-up in between with
+    INVALID_HEADROOM. The signal log recorded 47 REBALANCER_SELL against 17 BUY
+    and 31 INVALID_HEADROOM.
+
+    Sizing from the same tier table the add path uses fixes all three: nothing
+    opens above its own cap, the rebalancer returns to being a safety net rather
+    than a routine step, and adding to a winner becomes possible for the first
+    time. It also keeps the diversified, near-fully-invested book the account
+    was already converging on by way of the trims — which is the configuration
+    that actually beat every simulated alternative
+    (docs/EDGE_INVESTIGATION_2026-09-08.md, finding I).
+
+    Concentration was the alternative resolution — raising MAX_POSITION_PCT to
+    0.20 instead. It was rejected because concentration only pays when there is
+    selection edge to concentrate into, and six independent measurements say
+    there is none.
     """
-    if confidence < 35:
+    if confidence < CONFIDENCE_THRESHOLD * 100:
         return None
-    if confidence < 40:
-        return 0.10
-    if confidence < 45:
-        return 0.15
-    return 0.20
+    _tier, pct = get_allocation_tier(confidence / 100.0)
+    return min(pct, MAX_POSITION_PCT)
 
 
 def compute_buy_qty(equity: float, price: float, fraction: float = 0.20) -> int:

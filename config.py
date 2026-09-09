@@ -147,6 +147,25 @@ REBALANCER_SKIPPED_HALT        = "REBALANCER_SKIPPED_HALT"
 # Used by capital_allocator.py to compute headroom before adding to a position.
 MAX_POSITION_PCT = 0.08
 
+# Maximum fraction of the portfolio invested at once.
+#
+# RISK NOTE: the live path does not enforce this. live_trader.py and
+# capital_allocator.py contain no portfolio-level exposure check at all — the
+# only bound is MAX_POSITION_PCT per name, so twelve full positions reach ~96%
+# invested. 1.00 is therefore the *faithful* value: it makes backtest.py model
+# what the bot actually does, rather than a stricter strategy that is not
+# deployed.
+#
+# It lives here rather than in backtest.py because that file previously
+# declared its own MAX_POSITION_PCT = 0.20 and MAX_TOTAL_EXPOSURE = 0.80,
+# silently simulating a concentrated four-position book while the live bot ran
+# twelve names at 8%. Every simulated return figure produced before 2026-09-08
+# describes that other strategy.
+#
+# If a real cap is ever wanted, lowering this is NOT sufficient — live_trader.py
+# must enforce it too, or the simulation and the bot diverge again.
+MAX_TOTAL_EXPOSURE = 1.00
+
 # Minimum model confidence (0–1 scale) required to add shares to an already-owned
 # position.  Signals below this threshold keep the existing "already owned" skip.
 ADD_TO_POSITION_CONFIDENCE = 0.40

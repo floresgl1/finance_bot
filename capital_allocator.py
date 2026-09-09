@@ -12,6 +12,10 @@ Confidence tiers
     0.50 ≤ confidence < 0.65                        → normal (NORMAL_POSITION_PCT = 5 %)
     confidence ≥ 0.65                               → large  (LARGE_POSITION_PCT  = 7 %)
 
+`get_allocation_tier` is public because live_trader.get_position_size() sizes
+NEW positions from the same table. Every tier is below MAX_POSITION_PCT, so a
+position can never open above the cap that governs it afterwards.
+
 Headroom logic
 --------------
     current_position_value = shares_owned × current_price
@@ -45,8 +49,15 @@ from config import (
 )
 
 
-def _get_allocation_tier(confidence: float) -> tuple[str, float]:
-    """Return (tier_label, target_position_pct) for the given confidence score."""
+def get_allocation_tier(confidence: float) -> tuple[str, float]:
+    """Return (tier_label, target_position_pct) for the given confidence score.
+
+    Public because live_trader.get_position_size() sizes NEW positions from it
+    too. Those were separate rules and they contradicted each other: new
+    positions opened at 10/15/20% of equity while MAX_POSITION_PCT capped the
+    same position at 8%, so every entry arrived over-weight and the rebalancer
+    trimmed it straight back down.
+    """
     if confidence >= ADD_TO_POSITION_CONFIDENCE_LARGE:
         return "large", LARGE_POSITION_PCT
     if confidence >= ADD_TO_POSITION_CONFIDENCE_NORMAL:
@@ -132,7 +143,7 @@ def check_add_to_position(
             "allocation_tier": "",
         }
 
-    tier_label, tier_pct = _get_allocation_tier(confidence_normalized)
+    tier_label, tier_pct = get_allocation_tier(confidence_normalized)
     buy_pct               = min(tier_pct, headroom)
     buy_amount            = buy_pct * portfolio_value
     shares_to_buy         = math.floor(buy_amount / price)

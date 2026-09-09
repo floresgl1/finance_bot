@@ -505,16 +505,35 @@ def test_partial_failure_across_multiple_stops_blocks_the_sell(monkeypatch):
     [
         (0.0, None),
         (34.99, None),
-        (35.0, 0.10),
-        (39.99, 0.10),
-        (40.0, 0.15),
-        (44.99, 0.15),
-        (45.0, 0.20),
-        (99.9, 0.20),
+        (35.0, 0.03),
+        (49.99, 0.03),
+        (50.0, 0.05),
+        (64.99, 0.05),
+        (65.0, 0.07),
+        (99.9, 0.07),
     ],
 )
 def test_position_size_tiers(confidence, expected):
     assert get_position_size(confidence) == expected
+
+
+def test_no_tier_opens_above_its_own_position_cap():
+    """The defect this replaced: positions opened at 10-20% of equity while
+    MAX_POSITION_PCT capped them at 8%, so the rebalancer trimmed every entry
+    back over the following sessions and no top-up ever had headroom."""
+    import config
+
+    for confidence in (35.0, 45.0, 55.0, 65.0, 99.9):
+        assert get_position_size(confidence) <= config.MAX_POSITION_PCT
+
+
+def test_position_size_uses_the_same_tiers_as_adding_to_a_position():
+    """One rule for opens and top-ups; two rules is what contradicted itself."""
+    from capital_allocator import get_allocation_tier
+
+    for confidence in (35.0, 50.0, 65.0, 90.0):
+        _tier, pct = get_allocation_tier(confidence / 100.0)
+        assert get_position_size(confidence) == pct
 
 
 def test_compute_buy_qty_floors_to_whole_shares():

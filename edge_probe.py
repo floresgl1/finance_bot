@@ -38,6 +38,8 @@ Usage:
     python edge_probe.py --exposure               # sizing + regime-filter arms
     python edge_probe.py --horizons 3 7 14 21     # forward-return label window
     python edge_probe.py --horizons 3 7 21 --broad  # over 10 windows, not 4
+    python edge_probe.py --exposure --window 2026-03-05 2026-09-04
+                                                  # simulate one exact period
     python edge_probe.py --test-start 2026-05-20
     python edge_probe.py --lookbacks 1 3 5 10
     python edge_probe.py --refresh                # re-download the history
@@ -59,7 +61,14 @@ from sklearn.metrics import classification_report
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
-from config import WATCHLIST, FEATURE_COLUMNS, XGB_PARAMS, CONFIDENCE_THRESHOLD
+from config import (
+    WATCHLIST,
+    FEATURE_COLUMNS,
+    XGB_PARAMS,
+    CONFIDENCE_THRESHOLD,
+    MAX_POSITION_PCT,
+    MAX_TOTAL_EXPOSURE,
+)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 PROBE_DIR = os.path.join(_HERE, "data", "edge_probe")
@@ -551,12 +560,18 @@ REGIME_SMA_WINDOW = 200
 _EQ_POSITION_PCT = 1.0 / max(len(WATCHLIST), 1)
 
 # label -> (policy, MAX_POSITION_PCT, MAX_TOTAL_EXPOSURE)
+#
+# "shipped" tracks config.py, so it simulates the book the live bot builds:
+# 8% per name, no portfolio cap. "concentrated (old sim)" is what backtest.py
+# hardcoded before 2026-09-08 and is kept as an explicit arm, because it is the
+# only way to see how much of the historical deficit was the sizing mismatch
+# rather than the model.
 EXPOSURE_ARMS = {
-    "shipped":             ("shipped",           0.20, 0.80),
-    "full-size buys":      ("full_size",         0.20, 0.80),
-    "full-size, 100% cap": ("full_size",         0.25, 1.00),
-    "regime filter only":  ("regime_only",       _EQ_POSITION_PCT, 1.00),
-    "regime + model":      ("regime_plus_model", _EQ_POSITION_PCT, 1.00),
+    "shipped":              ("shipped",           MAX_POSITION_PCT, MAX_TOTAL_EXPOSURE),
+    "full-size buys":       ("full_size",         MAX_POSITION_PCT, MAX_TOTAL_EXPOSURE),
+    "concentrated (old sim)": ("shipped",         0.20, 0.80),
+    "regime filter only":   ("regime_only",       _EQ_POSITION_PCT, 1.00),
+    "regime + model":       ("regime_plus_model", _EQ_POSITION_PCT, 1.00),
 }
 
 
@@ -709,7 +724,7 @@ def summarise_exposure(results: dict) -> str:
     lines.append("  " + "=" * 68)
 
     shipped = means.get("shipped")
-    full = means.get("full-size, 100% cap")
+    full = means.get("full-size buys")
     if shipped is not None and full is not None:
         if full > shipped:
             lines.append(f"  Sizing up helps ({shipped:+.2f}pp -> {full:+.2f}pp): part of")
@@ -718,6 +733,15 @@ def summarise_exposure(results: dict) -> str:
             lines.append(f"  Sizing up makes it WORSE ({shipped:+.2f}pp -> {full:+.2f}pp).")
             lines.append("  The deficit is selection, not exposure -- more of these picks")
             lines.append("  is more of the problem.")
+
+    old_sim = means.get("concentrated (old sim)")
+    if shipped is not None and old_sim is not None:
+        lines.append("")
+        lines.append(f"  Live-matching sizing {shipped:+.2f}pp vs the pre-2026-09-08 "
+                     f"simulated")
+        lines.append(f"  sizing {old_sim:+.2f}pp: {shipped - old_sim:+.2f}pp of the "
+                     f"historical deficit was")
+        lines.append("  the simulator modelling a strategy that was never deployed.")
 
     only = means.get("regime filter only")
     plus = means.get("regime + model")
@@ -905,6 +929,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "never tested. Example: --horizons 3 5 7 14 21",
     )
     parser.add_argument(
+        "--window", nargs=2, default=None, metavar=("START", "END"),
+        help="Run over one explicit window instead of a preset set. Use this to "
+             "simulate the exact dates the live account traded, which is the "
+             "only apples-to-apples comparison against live_benchmark.py.",
+    )
+    parser.add_argument(
         "--broad", action="store_true",
         help="Use BROAD_WINDOWS (10 continuous windows) instead of the four "
              "regime windows. REGIME_WINDOWS is half drawdowns by design, which "
@@ -997,8 +1027,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"=== Downloading {PROBE_HISTORY} history into {PROBE_DIR} ===")
     download_history(refresh=args.refresh)
 
-    window_set = BROAD_WINDOWS if args.broad else REGIME_WINDOWS
-    window_label = "broad (10 windows)" if args.broad else "regime (4 windows)"
+    if args.window:
+        window_set = {f"{args.window[0]} to {args.window[1]}": tuple(args.window)}
+        window_label = f"explicit ({args.window[0]} to {args.window[1]})"
+    elif args.broad:
+        window_set, window_label = BROAD_WINDOWS, "broad (10 windows)"
+    else:
+        window_set, window_label = REGIME_WINDOWS, "regime (4 windows)"
 
     if args.regimes:
         print(f"\n=== Regime benchmark: strategy vs buy-and-hold "

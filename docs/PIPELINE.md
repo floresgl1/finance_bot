@@ -927,6 +927,7 @@ at it, so the live CSVs the next real training run reads are untouched. Writes
 | `--exposure` | Is the return deficit exposure or selection? Five allocation policies over one model per window. |
 | `--horizons` | Does the forward-return label window matter? Re-labels and re-benchmarks at 3/5/7/14/21 days. |
 | `--broad` | Modifier. Swaps the four regime windows for ten continuous ones. |
+| `--window START END` | Modifier. Runs one explicit window — use it to simulate the exact dates the live account traded. |
 
 **DESIGN DECISION:**
 Every `--exposure` arm is expressed as a rewrite of the signal frames and run
@@ -951,6 +952,48 @@ horizon or allocation policy tested fixes that. **Nothing in production was
 changed as a result** — there was nothing better to ship. The conclusion is now
 enforced by the `beats_buy_and_hold` promotion-gate check rather than left in a
 document.
+
+### Position sizing — one rule for opens and top-ups
+
+Fixed 2026-09-08. `live_trader.get_position_size()` previously opened positions
+at 10/15/20% of equity while `MAX_POSITION_PCT` capped the same position at 8%.
+Every entry arrived over-weight: the rebalancer trimmed it back to 7.5% over
+roughly three sessions, paying slippage and a commission on stock the bot had
+chosen to buy days earlier, and `check_add_to_position` refused every top-up in
+between. The signal log recorded **47 `REBALANCER_SELL` against 17 `BUY`**, and
+31 `INVALID_HEADROOM`.
+
+Both paths now size from `capital_allocator.get_allocation_tier()`:
+
+| confidence | fraction of equity |
+|---|---|
+| < `CONFIDENCE_THRESHOLD` × 100 | skip, treated as HOLD |
+| 35–50 | `SMALL_POSITION_PCT` (3%) |
+| 50–65 | `NORMAL_POSITION_PCT` (5%) |
+| 65+ | `LARGE_POSITION_PCT` (7%) |
+
+Every tier is below `MAX_POSITION_PCT`, so nothing opens above its own cap, the
+rebalancer is a safety net rather than a routine step, and adding to a position
+has headroom to work with for the first time.
+
+**DESIGN DECISION — diversified, not concentrated.**
+The alternative resolution was raising `MAX_POSITION_PCT` to 0.20 to legalise the
+old opens. On the live window alone that looked better (+0.93pp vs −12.86pp); over
+ten windows it is the worst arm tested (−29.13pp vs −27.52pp). Concentration only
+pays when there is selection edge to concentrate into, and six measurements say
+there is none. See finding J in `docs/EDGE_INVESTIGATION_2026-09-08.md`.
+
+`backtest._simulate()` uses the same tier table and now tops up held positions
+instead of skipping any ticker already owned. That second change was the larger
+one: with it, the simulator reproduces the live account to within ~3pp over the
+same window, against a 14pp discrepancy before.
+
+**Open question — the tier levels.** `SMALL_POSITION_PCT` is 3% against a cap of
+8%, and the modal signal lands in that tier, so the book runs around 33%
+invested. Exposure is the dominant factor in every measurement taken, so raising
+the tiers toward the cap is the obvious next lever. It is deliberately untuned:
+the broad sample separates all sizing variants by under 3pp, which is not enough
+signal to fit against.
 
 ### `compare_models.py`
 Compares test-set metrics between the current model and the backup model.
