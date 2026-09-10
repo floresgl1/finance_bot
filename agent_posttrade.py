@@ -84,7 +84,9 @@ def load_evaluated_entries(
     entries["date"] = pd.to_datetime(entries["date"], errors="coerce")
     entries = entries.dropna(subset=["date"])
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    # CSV dates are tz-naive; compare with a tz-naive cutoff to avoid
+    # "Cannot compare tz-naive and tz-aware" errors from pandas.
+    cutoff = pd.Timestamp.now("UTC").tz_localize(None) - timedelta(days=window_days)
     entries = entries[entries["date"] >= cutoff]
 
     # Parse numeric columns
@@ -282,6 +284,8 @@ def build_table_d(df: pd.DataFrame) -> str:
 
 def compute_overall_win_rate(df: pd.DataFrame) -> float:
     """Portfolio-wide win rate excluding NEUTRALs."""
+    if df.empty or "result" not in df.columns:
+        return 0.0
     decided = df[df["result"].isin(["WIN", "LOSS"])]
     if decided.empty:
         return 0.0
