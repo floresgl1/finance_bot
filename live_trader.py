@@ -27,8 +27,9 @@ predictor.py, then executes trades one at a time in a stateful loop:
     - Stop-loss / take-profit and sentiment-veto alerts still fire immediately.
 
 Veto layers applied before execution:
-  1. Sentiment veto  (FinBERT)
-  2. Earnings veto   (recent Surprise%)
+  1. Sentiment veto  (FinBERT)          — inside get_signals()
+  2. Earnings veto   (recent Surprise%) — inside get_signals()
+  3. Agent veto      (LLM news check)   — after get_signals(), before execution
 
 Stop-loss check runs before model signals:
   Loss > 10 % from avg entry → market sell + Discord alert
@@ -78,6 +79,8 @@ from config import (
     BUY_SKIPPED_HALT,
     REBALANCER_SKIPPED_HALT,
     LAST_RUN_GUARD_PATH,
+    AGENT_VETO,
+    AGENT_DECISIONS_PATH,
     today_utc,
 )
 
@@ -401,6 +404,53 @@ def read_last_close(ticker: str) -> float | None:
         return float(df["Close"].iloc[-1])
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Pre-trade agent decisions (Phase 3 of the three-phase pipeline)
+# ---------------------------------------------------------------------------
+def _load_agent_decisions() -> dict[str, str]:
+    """Load agent_decisions.json and return a {ticker: verdict} map.
+
+    Permissive: returns an empty dict (= ABSTAIN for all tickers) on any
+    failure — missing file, parse error, wrong date, or unexpected schema.
+    live_trader.py must never fail to trade because the agent layer broke.
+    """
+    today = today_utc()
+
+    if not os.path.exists(AGENT_DECISIONS_PATH):
+        print("  [AGENT] No agent_decisions.json found — defaulting to ABSTAIN for all.")
+        return {}
+
+    try:
+        with open(AGENT_DECISIONS_PATH) as fh:
+            envelope = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"  [AGENT] Cannot parse agent_decisions.json ({exc}) — defaulting to ABSTAIN.")
+        return {}
+
+    # Date guard: reject yesterday's decisions
+    file_date = envelope.get("date")
+    if file_date != today:
+        print(f"  [AGENT] agent_decisions.json is for {file_date}, not {today} — defaulting to ABSTAIN.")
+        return {}
+
+    decisions = envelope.get("decisions", {})
+    if not isinstance(decisions, dict):
+        print("  [AGENT] 'decisions' is not a dict — defaulting to ABSTAIN.")
+        return {}
+
+    # Log what the agent decided
+    vetoes = [t for t, v in decisions.items() if v == "VETO"]
+    confirms = [t for t, v in decisions.items() if v == "CONFIRM"]
+    if vetoes:
+        print(f"  [AGENT] Will VETO: {', '.join(sorted(vetoes))}")
+    if confirms:
+        print(f"  [AGENT] CONFIRM: {', '.join(sorted(confirms))}")
+    if not vetoes and not confirms:
+        print("  [AGENT] All signals ABSTAIN (no vetoes or confirms).")
+
+    return decisions
 
 
 # ---------------------------------------------------------------------------
@@ -1086,6 +1136,20 @@ def run() -> None:
     for r in stale_sigs:
         print(f"  [{r['final_signal']}] {r['ticker']} ({r['age_str']}) logged")
         _log_signal_early(r["ticker"], r["final_signal"], r["current_price"], 0, 0.0, r["final_signal"])
+
+    # 4b. Agent veto layer (permissive — missing file = ABSTAIN all)
+    agent_decisions = _load_agent_decisions()
+    for r in signals:
+        if r["final_signal"] in ("BUY", "SELL") and agent_decisions.get(r["ticker"]) == "VETO":
+            print(f"  [{AGENT_VETO}] {r['ticker']} {r['final_signal']} → HOLD (agent news veto)")
+            send_discord(
+                f"\N{NO ENTRY} **Agent Veto:** {r['ticker']} {today_utc()}  "
+                f"Model said: {r['final_signal']}  "
+                f"Agent decision: VETO  "
+                f"Action: HOLD"
+            )
+            r["final_signal"] = "HOLD"
+            r["veto_reason"] = AGENT_VETO
 
     # 5. Sort: SELLs first (confidence desc), then BUYs (confidence desc), then HOLDs
     sell_sigs = sorted(
