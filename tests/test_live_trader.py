@@ -34,6 +34,9 @@ from live_trader import (
     _wait_for_fill,
     _cancel_order_best_effort,
     _check_fill_after_cancel,
+    _is_infra_error,
+    _raise_if_infra,
+    AlpacaInfraError,
     check_portfolio_loss_limits,
     check_peak_drawdown,
     check_market_data_freshness,
@@ -527,6 +530,16 @@ def test_failure_reason_is_truncated_with_a_count(data_dir):
 # ---------------------------------------------------------------------------
 
 
+class _TickerError(Exception):
+    """Mock per-ticker Alpaca error (422) that the infra classifier lets through."""
+    status_code = 422
+
+
+class _InfraError(Exception):
+    """Mock infra-level Alpaca error (503) that triggers AlpacaInfraError."""
+    status_code = 503
+
+
 def _order(order_id: str, side: str = "sell", order_type: str = "stop", status: str = "new"):
     o = MagicMock()
     o.id = order_id
@@ -583,7 +596,7 @@ def test_stop_that_fills_during_cancel_counts_as_success(monkeypatch):
 
 def test_list_orders_failure_blocks_the_sell(monkeypatch):
     api = MagicMock()
-    api.list_orders.side_effect = Exception("alpaca timeout")
+    api.list_orders.side_effect = _TickerError("not found")
 
     assert cancel_standing_stops(api, "AAPL") == (False, [])
 
@@ -591,7 +604,7 @@ def test_list_orders_failure_blocks_the_sell(monkeypatch):
 def test_cancel_request_failure_blocks_the_sell(monkeypatch):
     api = MagicMock()
     api.list_orders.return_value = [_order("stop-1")]
-    api.cancel_order.side_effect = Exception("rejected")
+    api.cancel_order.side_effect = _TickerError("rejected")
 
     success, cancelled = cancel_standing_stops(api, "AAPL")
 
@@ -618,7 +631,7 @@ def test_partial_failure_across_multiple_stops_blocks_the_sell(monkeypatch):
     monkeypatch.setattr(live_trader.time, "sleep", lambda _s: None)
     api = MagicMock()
     api.list_orders.return_value = [_order("stop-1"), _order("stop-2")]
-    api.cancel_order.side_effect = [None, Exception("rejected")]
+    api.cancel_order.side_effect = [None, _TickerError("rejected")]
     api.get_order.return_value = _order("stop-1", status="canceled")
 
     success, cancelled = cancel_standing_stops(api, "AAPL")
@@ -928,14 +941,14 @@ def test_wait_for_fill_returns_none_on_timeout(monkeypatch):
 
 
 def test_wait_for_fill_retries_after_poll_error(monkeypatch):
-    """A transient API error doesn't abort — the loop retries."""
+    """A transient per-ticker API error doesn't abort — the loop retries."""
     monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
     ticks = iter([0.0, 1.0, 2.0, 3.0])
     monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
 
     api = MagicMock()
     filled = _order("o1", status="filled")
-    api.get_order.side_effect = [Exception("transient"), filled]
+    api.get_order.side_effect = [_TickerError("transient"), filled]
 
     assert _wait_for_fill(api, "o1") is filled
     assert api.get_order.call_count == 2
@@ -1169,9 +1182,10 @@ def test_check_fill_after_cancel_returns_none_on_canceled():
     assert _check_fill_after_cancel(api, "o1") is None
 
 
-def test_check_fill_after_cancel_swallows_api_error():
+def test_check_fill_after_cancel_swallows_per_ticker_error():
+    """Per-ticker errors are swallowed — returns None so retry can proceed."""
     api = MagicMock()
-    api.get_order.side_effect = Exception("timeout")
+    api.get_order.side_effect = _TickerError("not found")
 
     assert _check_fill_after_cancel(api, "o1") is None
 
@@ -1354,3 +1368,144 @@ def test_guard_not_stamped_before_first_fill(monkeypatch, tmp_path):
     # Guard should NOT exist yet
     assert not guard.exists()
     assert guard_stamped is False
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure-error classification (Audit Finding #4)
+# ---------------------------------------------------------------------------
+
+
+def test_is_infra_error_classifies_5xx():
+    exc = _InfraError("internal server error")
+    assert _is_infra_error(exc) is True
+
+
+def test_is_infra_error_classifies_429():
+    exc = type("RateLimited", (Exception,), {"status_code": 429})("too many requests")
+    assert _is_infra_error(exc) is True
+
+
+def test_is_infra_error_classifies_401():
+    exc = type("AuthError", (Exception,), {"status_code": 401})("unauthorized")
+    assert _is_infra_error(exc) is True
+
+
+def test_is_infra_error_classifies_422_as_ticker():
+    exc = _TickerError("bad order params")
+    assert _is_infra_error(exc) is False
+
+
+def test_is_infra_error_classifies_404_as_ticker():
+    exc = type("NotFound", (Exception,), {"status_code": 404})("symbol not found")
+    assert _is_infra_error(exc) is False
+
+
+def test_is_infra_error_classifies_403_insufficient_as_ticker():
+    """403 with 'insufficient' in message is buying-power, not auth."""
+    exc = type("Forbidden", (Exception,), {"status_code": 403})("insufficient buying power")
+    assert _is_infra_error(exc) is False
+
+
+def test_is_infra_error_classifies_403_auth_as_infra():
+    """403 without a per-ticker message is an auth failure."""
+    exc = type("Forbidden", (Exception,), {"status_code": 403})("forbidden")
+    assert _is_infra_error(exc) is True
+
+
+def test_is_infra_error_classifies_network_errors():
+    import requests.exceptions as req_exc
+    for exc_cls in (req_exc.ConnectionError, req_exc.Timeout, req_exc.ProxyError):
+        assert _is_infra_error(exc_cls("network down")) is True
+
+
+def test_is_infra_error_defaults_unknown_to_infra():
+    """Unknown exceptions are treated as infra (fail-safe)."""
+    assert _is_infra_error(Exception("something unexpected")) is True
+
+
+def test_raise_if_infra_raises_on_infra():
+    exc = _InfraError("server down")
+    with pytest.raises(AlpacaInfraError) as exc_info:
+        _raise_if_infra(exc, "submit_buy", "AAPL")
+    assert exc_info.value.operation == "submit_buy"
+    assert exc_info.value.ticker == "AAPL"
+    assert exc_info.value.cause is exc
+
+
+def test_raise_if_infra_passes_on_ticker_error():
+    exc = _TickerError("bad params")
+    # Should return normally — no exception
+    _raise_if_infra(exc, "submit_buy", "AAPL")
+
+
+def test_list_orders_infra_error_raises():
+    """Infra errors in cancel_standing_stops propagate as AlpacaInfraError."""
+    api = MagicMock()
+    api.list_orders.side_effect = _InfraError("server error")
+
+    with pytest.raises(AlpacaInfraError):
+        cancel_standing_stops(api, "AAPL")
+
+
+def test_get_owned_tickers_infra_error_raises():
+    """Infra errors in get_owned_tickers propagate as AlpacaInfraError."""
+    api = MagicMock()
+    api.list_positions.side_effect = _InfraError("server error")
+
+    with pytest.raises(AlpacaInfraError):
+        get_owned_tickers(api)
+
+
+def test_get_equity_infra_error_raises():
+    """Infra errors in get_equity propagate as AlpacaInfraError."""
+    api = MagicMock()
+    api.get_account.side_effect = _InfraError("server error")
+
+    with pytest.raises(AlpacaInfraError):
+        get_equity(api)
+
+
+def test_place_buy_infra_error_raises(monkeypatch):
+    """Infra errors in place_buy propagate as AlpacaInfraError."""
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    monkeypatch.setattr(live_trader.time, "time", lambda: 0.0)
+
+    api = MagicMock()
+    api.submit_order.side_effect = _InfraError("server error")
+
+    with pytest.raises(AlpacaInfraError):
+        place_buy(api, "AAPL", 10)
+
+
+def test_place_sell_infra_error_raises(monkeypatch):
+    """Infra errors in place_sell propagate as AlpacaInfraError."""
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    monkeypatch.setattr(live_trader.time, "time", lambda: 0.0)
+
+    api = MagicMock()
+    api.submit_order.side_effect = _InfraError("server error")
+
+    with pytest.raises(AlpacaInfraError):
+        place_sell(api, "AAPL", 10)
+
+
+def test_wait_for_fill_infra_error_raises(monkeypatch):
+    """Infra errors during fill polling halt immediately."""
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    api.get_order.side_effect = _InfraError("server error")
+
+    with pytest.raises(AlpacaInfraError):
+        _wait_for_fill(api, "o1")
+
+
+def test_check_fill_after_cancel_infra_error_raises():
+    """Infra errors in the post-cancel race check propagate."""
+    api = MagicMock()
+    api.get_order.side_effect = _InfraError("server error")
+
+    with pytest.raises(AlpacaInfraError):
+        _check_fill_after_cancel(api, "o1")

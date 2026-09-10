@@ -88,6 +88,7 @@ from config import (
     FILL_POLL_INTERVAL_S,
     BUY_UNFILLED,
     SELL_UNFILLED,
+    ALPACA_INFRA_HALT,
     today_utc,
 )
 
@@ -100,6 +101,103 @@ except ImportError:
     print("[setup] alpaca-trade-api not found — installing...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "alpaca-trade-api"])
     import alpaca_trade_api as tradeapi
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure-error classification (Audit Finding #4)
+# ---------------------------------------------------------------------------
+import requests.exceptions as _req_exc
+
+
+class AlpacaInfraError(Exception):
+    """Raised when an Alpaca API call fails with a non-recoverable
+    infrastructure error (5xx, 429, auth, network).
+
+    Propagates up to the top-level handler in ``run()``, which logs a
+    structured action code, sends a Discord alert, and halts the session.
+    Per-ticker logic errors (422 bad params, 404 unknown symbol,
+    insufficient buying power) are *not* wrapped in this class — they are
+    handled at the call site and the execution loop continues.
+    """
+
+    def __init__(self, operation: str, ticker: str, cause: Exception):
+        self.operation = operation
+        self.ticker    = ticker
+        self.cause     = cause
+        super().__init__(
+            f"[INFRA] {operation} on {ticker}: {cause}"
+        )
+
+
+# Status codes that indicate a per-ticker logic error, not an outage.
+_TICKER_ERROR_CODES = frozenset({
+    404,   # symbol / resource not found
+    422,   # unprocessable entity (bad order params)
+})
+
+# Substrings in the Alpaca error message that indicate per-ticker issues
+# even when the status code alone is ambiguous (e.g. 403 can be auth OR
+# insufficient buying power).
+_TICKER_ERROR_MESSAGES = (
+    "insufficient",
+    "buying power",
+    "not found",
+    "invalid symbol",
+    "account is not allowed to short",
+    "position does not exist",
+)
+
+
+def _is_infra_error(exc: Exception) -> bool:
+    """Classify an exception as infrastructure (True) or per-ticker (False).
+
+    Defaults to True (fail-safe) — unknown errors halt the session rather
+    than silently continuing through the entire signal queue.
+    """
+    # Network-level failures are always infra.
+    if isinstance(exc, (
+        _req_exc.ConnectionError,
+        _req_exc.Timeout,
+        _req_exc.ProxyError,
+        _req_exc.SSLError,
+        _req_exc.RetryError,
+    )):
+        return True
+
+    # Alpaca API errors carry a status code.
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        if status in _TICKER_ERROR_CODES:
+            return False
+
+        # 403 is ambiguous: auth failure (infra) vs. buying-power (ticker).
+        # Check the message to disambiguate.
+        msg = str(exc).lower()
+        if status == 403 and any(s in msg for s in _TICKER_ERROR_MESSAGES):
+            return False
+
+        # 4xx we didn't whitelist, or 5xx / 429 → infra
+        if status >= 500 or status == 429 or status == 401:
+            return True
+
+    # Check the error message as a fallback (some errors lack a status code).
+    msg = str(exc).lower()
+    if any(s in msg for s in _TICKER_ERROR_MESSAGES):
+        return False
+
+    # Unknown → fail-safe: treat as infra.
+    return True
+
+
+def _raise_if_infra(exc: Exception, operation: str, ticker: str = "SYSTEM") -> None:
+    """If *exc* is an infrastructure error, wrap and raise ``AlpacaInfraError``.
+
+    Call this inside an ``except`` block after the per-ticker fallback logic.
+    If the exception is a per-ticker error, this function returns normally
+    and the caller continues.
+    """
+    if _is_infra_error(exc):
+        raise AlpacaInfraError(operation, ticker, exc) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +760,7 @@ def get_signals(sentiment_df=None) -> list[dict]:
                 "age_str":       "stale market data",
             })
         except Exception as exc:
+            _raise_if_infra(exc, "get_signals", ticker)
             print(f"  [SKIP] {ticker} — {exc}")
 
     return results
@@ -672,12 +771,20 @@ def get_signals(sentiment_df=None) -> list[dict]:
 # ---------------------------------------------------------------------------
 def get_owned_tickers(api: tradeapi.REST) -> dict[str, float]:
     """Return {ticker: qty_held} for all current positions."""
-    positions = api.list_positions()
+    try:
+        positions = api.list_positions()
+    except Exception as exc:
+        _raise_if_infra(exc, "list_positions")
+        raise  # per-ticker errors shouldn't happen here, but don't swallow
     return {p.symbol: float(p.qty) for p in positions}
 
 
 def get_equity(api: tradeapi.REST) -> float:
-    return float(api.get_account().equity)
+    try:
+        return float(api.get_account().equity)
+    except Exception as exc:
+        _raise_if_infra(exc, "get_account")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +876,7 @@ def place_buy(api: tradeapi.REST, ticker: str, qty: int) -> dict:
         try:
             result = _submit_buy(api, ticker, qty)
         except Exception as exc:
+            _raise_if_infra(exc, "submit_buy", ticker)
             print(f"  [ERROR] {ticker} BUY submit failed: {exc}")
             return {"status": "error", "reason": str(exc)}
 
@@ -827,6 +935,7 @@ def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
         try:
             result = _submit_sell(api, ticker, qty)
         except Exception as exc:
+            _raise_if_infra(exc, "submit_sell", ticker)
             print(f"  [ERROR] {ticker} SELL submit failed: {exc}")
             return {"status": "error", "reason": str(exc)}
 
@@ -911,6 +1020,7 @@ def cancel_standing_stops(api, ticker: str) -> tuple[bool, list[str]]:
     try:
         open_orders = api.list_orders(status="open", symbols=[ticker])
     except Exception as exc:
+        _raise_if_infra(exc, "list_orders", ticker)
         print(f"  [CANCEL_STOPS] {ticker} — could not list open orders: {exc}")
         return (False, [])
 
@@ -932,6 +1042,7 @@ def cancel_standing_stops(api, ticker: str) -> tuple[bool, list[str]]:
         try:
             api.cancel_order(stop.id)
         except Exception as exc:
+            _raise_if_infra(exc, "cancel_order", ticker)
             print(f"  [CANCEL_STOPS] {ticker} — cancel request failed for order {stop.id}: {exc}")
             failed.append(stop.id)
             continue
@@ -942,6 +1053,7 @@ def cancel_standing_stops(api, ticker: str) -> tuple[bool, list[str]]:
             try:
                 current = api.get_order(stop.id)
             except Exception as exc:
+                _raise_if_infra(exc, "get_order_cancel_poll", ticker)
                 print(f"  [CANCEL_STOPS] {ticker} — status poll failed for order {stop.id}: {exc}")
                 break
             if current.status in ("canceled", "filled"):
@@ -978,6 +1090,7 @@ def _wait_for_fill(api, order_id: str) -> object | None:
         try:
             order = api.get_order(order_id)
         except Exception as exc:
+            _raise_if_infra(exc, "get_order_fill_poll")
             print(f"  [FILL_POLL] order {order_id} — status poll error: {exc}")
             time.sleep(FILL_POLL_INTERVAL_S)
             continue
@@ -1013,6 +1126,7 @@ def _check_fill_after_cancel(api, order_id: str) -> object | None:
             print(f"  [FILL_RACE] order {order_id} — filled after cancel ({order.status})")
             return order
     except Exception as exc:
+        _raise_if_infra(exc, "get_order_post_cancel")
         print(f"  [FILL_RACE] order {order_id} — post-cancel check failed: {exc}")
     return None
 
@@ -1041,7 +1155,11 @@ def check_position_limits(
         exited — list of tickers that were sold
         owned  — updated positions dict (exited tickers removed)
     """
-    positions = api.list_positions()
+    try:
+        positions = api.list_positions()
+    except Exception as exc:
+        _raise_if_infra(exc, "list_positions", "TAKE_PROFIT")
+        raise  # per-ticker errors shouldn't happen here, but don't swallow
     exited    = []
 
     for position in positions:
@@ -1275,6 +1393,38 @@ def run() -> None:
         sys.exit(1)
     print("  Market data freshness check passed.\n")
 
+    # --- Top-level infra-error handler (Audit Finding #4) ---
+    # Every Alpaca API call below classifies exceptions as infra vs. per-ticker.
+    # Infra errors (5xx, 429, auth, network) raise AlpacaInfraError, which
+    # propagates here for a structured halt + Discord alert.
+    try:
+        _run_execution(api)
+    except AlpacaInfraError as exc:
+        from signal_logger import log_signal as _log_infra
+        _log_infra("PIPELINE", "ALPACA_INFRA", 0, 0, 0, ALPACA_INFRA_HALT)
+        send_discord(
+            f"🚨 **PIPELINE HALTED — ALPACA INFRASTRUCTURE ERROR**\n"
+            f"Operation: {exc.operation}\n"
+            f"Ticker: {exc.ticker}\n"
+            f"Error: {exc.cause}\n"
+            f"Session halted to avoid blind trading. Manual review required."
+        )
+        print(f"\n  [INFRA HALT] {exc}")
+        sys.exit(1)
+    except Exception as exc:
+        # Safety net: any unclassified exception still gets a Discord alert
+        # rather than dying with only a stderr traceback.
+        send_discord(
+            f"🚨 **PIPELINE CRASHED — UNHANDLED ERROR**\n"
+            f"Error: {type(exc).__name__}: {exc}\n"
+            f"Session terminated. Manual review required."
+        )
+        print(f"\n  [CRASH] Unhandled error: {exc}")
+        raise
+
+
+def _run_execution(api: tradeapi.REST) -> None:
+    """Inner execution body of run(), wrapped by AlpacaInfraError handler."""
     # 3a. Portfolio-level loss limit — checked after freshness so we trust the
     # equity read. On trip: write halt flag, alert, continue (SELLs still run).
     halt_active = False
@@ -1477,6 +1627,7 @@ def run() -> None:
             position_before_sell = api.get_position(ticker)
             entry_price_for_exit = float(position_before_sell.avg_entry_price)
         except Exception as exc:
+            _raise_if_infra(exc, "get_position", ticker)
             print(f"  [WARN] Could not fetch avg_entry_price for {ticker}: {exc} — using signal price as fallback")
             entry_price_for_exit = float(price)
 
@@ -1612,8 +1763,18 @@ def run() -> None:
             owned  = get_owned_tickers(api)
             equity = get_equity(api)
 
-            bar        = api.get_latest_trade(ticker)
-            live_price = float(bar.price)
+            try:
+                bar        = api.get_latest_trade(ticker)
+                live_price = float(bar.price)
+            except Exception as exc:
+                _raise_if_infra(exc, "get_latest_trade", ticker)
+                print(f"  [SKIP] {ticker} — could not fetch live price: {exc}")
+                log_signal(ticker, "BUY", price, 0, confidence, "PRICE_FETCH_ERROR")
+                outcomes.append({
+                    "ticker": ticker, "action": "BUY", "qty": 0, "price": price,
+                    "status": "skipped", "order_id": "", "reason": "PRICE_FETCH_ERROR",
+                })
+                continue
 
             if ticker in owned:
                 # Already owned — ask capital_allocator with fresh state

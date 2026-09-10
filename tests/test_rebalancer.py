@@ -19,7 +19,18 @@ import pytest
 
 import config
 import rebalancer
+from live_trader import AlpacaInfraError
 from rebalancer import run_rebalancer, _TRIGGER_BUFFER, _TARGET_OFFSET
+
+
+class _TickerError(Exception):
+    """Mock per-ticker Alpaca error (422) that the infra classifier lets through."""
+    status_code = 422
+
+
+class _InfraError(Exception):
+    """Mock infra-level Alpaca error (503) that triggers AlpacaInfraError."""
+    status_code = 503
 
 
 # The hand-computed expectations below assume this cap. If it is retuned the
@@ -263,7 +274,7 @@ def test_unlinked_entry_order_id_falls_back(stub_side_effects):
 
 def test_avg_entry_price_fetch_failure_falls_back_to_current_price(stub_side_effects):
     api = _api(100_000.0, [_position("AAPL", 100, 100.0)])
-    api.get_position.side_effect = Exception("alpaca down")
+    api.get_position.side_effect = _TickerError("position not found")
 
     run_rebalancer(api)
 
@@ -286,7 +297,7 @@ def test_order_failure_records_error_and_logs_no_exit(stub_side_effects):
 def test_order_failure_on_one_ticker_does_not_abort_the_loop(stub_side_effects):
     positions = [_position("AAPL", 100, 100.0), _position("MSFT", 100, 100.0)]
     api = _api(100_000.0, positions)
-    api.submit_order.side_effect = [Exception("rejected"), MagicMock(id="order-2")]
+    api.submit_order.side_effect = [_TickerError("rejected"), MagicMock(id="order-2")]
 
     outcomes = run_rebalancer(api)
 
@@ -298,9 +309,20 @@ def test_order_failure_on_one_ticker_does_not_abort_the_loop(stub_side_effects):
 # --- infrastructure failure ------------------------------------------------
 
 
-def test_equity_fetch_failure_returns_empty_without_trading(stub_side_effects):
+def test_equity_fetch_infra_error_raises(stub_side_effects):
+    """Infra errors in the rebalancer propagate as AlpacaInfraError."""
     api = MagicMock()
-    api.get_account.side_effect = Exception("alpaca timeout")
+    api.get_account.side_effect = _InfraError("alpaca timeout")
+
+    with pytest.raises(AlpacaInfraError):
+        run_rebalancer(api)
+    api.submit_order.assert_not_called()
+
+
+def test_equity_fetch_ticker_error_returns_empty(stub_side_effects):
+    """Per-ticker errors in equity fetch skip the rebalancer gracefully."""
+    api = MagicMock()
+    api.get_account.side_effect = _TickerError("not found")
 
     assert run_rebalancer(api) == []
     api.submit_order.assert_not_called()
@@ -314,9 +336,20 @@ def test_non_positive_equity_returns_empty_without_trading(stub_side_effects, eq
     api.submit_order.assert_not_called()
 
 
-def test_positions_fetch_failure_returns_empty_without_trading(stub_side_effects):
+def test_positions_fetch_infra_error_raises(stub_side_effects):
+    """Infra errors in position listing propagate as AlpacaInfraError."""
     api = _api(100_000.0, [])
-    api.list_positions.side_effect = Exception("alpaca timeout")
+    api.list_positions.side_effect = _InfraError("alpaca timeout")
+
+    with pytest.raises(AlpacaInfraError):
+        run_rebalancer(api)
+    api.submit_order.assert_not_called()
+
+
+def test_positions_fetch_ticker_error_returns_empty(stub_side_effects):
+    """Per-ticker errors in position listing skip the rebalancer gracefully."""
+    api = _api(100_000.0, [])
+    api.list_positions.side_effect = _TickerError("not found")
 
     assert run_rebalancer(api) == []
     api.submit_order.assert_not_called()
@@ -355,13 +388,26 @@ def test_equity_is_refreshed_after_each_successful_trim(stub_side_effects):
     assert api.get_account.call_count == 3
 
 
-def test_equity_refresh_failure_after_trim_is_not_fatal(stub_side_effects):
+def test_equity_refresh_ticker_error_after_trim_is_not_fatal(stub_side_effects):
+    """Per-ticker errors during post-trim equity refresh don't halt."""
     positions = [_position("AAPL", 100, 100.0), _position("MSFT", 100, 100.0)]
     api = _api(100_000.0, positions)
     account = MagicMock()
     account.equity = "100000.0"
-    api.get_account.side_effect = [account, Exception("timeout"), account]
+    api.get_account.side_effect = [account, _TickerError("timeout"), account]
 
     outcomes = run_rebalancer(api)
 
     assert [o["status"] for o in outcomes] == ["placed", "placed"]
+
+
+def test_equity_refresh_infra_error_after_trim_raises(stub_side_effects):
+    """Infra errors during post-trim equity refresh propagate."""
+    positions = [_position("AAPL", 100, 100.0), _position("MSFT", 100, 100.0)]
+    api = _api(100_000.0, positions)
+    account = MagicMock()
+    account.equity = "100000.0"
+    api.get_account.side_effect = [account, _InfraError("server down"), account]
+
+    with pytest.raises(AlpacaInfraError):
+        run_rebalancer(api)
