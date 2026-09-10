@@ -776,10 +776,19 @@ def place_buy(api: tradeapi.REST, ticker: str, qty: int) -> dict:
         filled_order = _wait_for_fill(api, order_id)
         if filled_order is not None:
             print(f"  [FILL]  {ticker} order {order_id} — {filled_order.status}")
-            return {"status": "filled", "order_id": order_id}
+            return {"status": "filled", "order_id": order_id,
+                    "filled_qty": getattr(filled_order, "filled_qty", None)}
 
         # Not filled — cancel the pending order before a possible retry.
         _cancel_order_best_effort(api, order_id)
+
+        # Guard against the race where the order filled between our last
+        # poll and the cancel attempt. Without this check, the retry would
+        # double the position.
+        late_fill = _check_fill_after_cancel(api, order_id)
+        if late_fill is not None:
+            return {"status": "filled", "order_id": order_id,
+                    "filled_qty": getattr(late_fill, "filled_qty", None)}
 
         if attempt == 1:
             print(f"  [RETRY] {ticker} order {order_id} not filled — retrying once")
@@ -825,9 +834,15 @@ def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
         filled_order = _wait_for_fill(api, order_id)
         if filled_order is not None:
             print(f"  [FILL]  {ticker} order {order_id} — {filled_order.status}")
-            return {"status": "filled", "order_id": order_id}
+            return {"status": "filled", "order_id": order_id,
+                    "filled_qty": getattr(filled_order, "filled_qty", None)}
 
         _cancel_order_best_effort(api, order_id)
+
+        late_fill = _check_fill_after_cancel(api, order_id)
+        if late_fill is not None:
+            return {"status": "filled", "order_id": order_id,
+                    "filled_qty": getattr(late_fill, "filled_qty", None)}
 
         if attempt == 1:
             print(f"  [RETRY] {ticker} order {order_id} not filled — retrying once")
@@ -984,6 +999,24 @@ def _cancel_order_best_effort(api, order_id: str) -> None:
         print(f"  [FILL_CANCEL] order {order_id} — cancel failed (swallowed): {exc}")
 
 
+def _check_fill_after_cancel(api, order_id: str) -> object | None:
+    """One final status check after cancelling an order.
+
+    If the order filled between our last poll and the cancel attempt, the
+    cancel failed silently but the position is open. Retrying without
+    checking would double the position. Returns the order object if it
+    filled, ``None`` otherwise.
+    """
+    try:
+        order = api.get_order(order_id)
+        if order.status in _FILL_TERMINAL:
+            print(f"  [FILL_RACE] order {order_id} — filled after cancel ({order.status})")
+            return order
+    except Exception as exc:
+        print(f"  [FILL_RACE] order {order_id} — post-cancel check failed: {exc}")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Take-profit (stop-loss is now enforced via standing OTO orders)
 # ---------------------------------------------------------------------------
@@ -1049,6 +1082,10 @@ def check_position_limits(
                 )
                 exited.append(ticker)
                 owned.pop(ticker, None)
+            elif result["status"] == "unfilled":
+                # place_sell already sent a Discord alert — just log the action code.
+                from signal_logger import log_signal
+                log_signal(ticker, "SELL", current_price, qty, 0.0, SELL_UNFILLED)
             else:
                 from signal_logger import log_signal
                 log_signal(ticker, "SELL", current_price, qty, 0.0, TAKE_PROFIT_FAILED)
@@ -1097,7 +1134,7 @@ def build_post_order_alert(
     Each item in `outcomes` / `rebalancer_outcomes` has:
         ticker, action, qty, price, status, order_id, reason
     """
-    placed   = [o for o in outcomes if o["status"] in ("placed", "filled")]
+    filled   = [o for o in outcomes if o["status"] == "filled"]
     unfilled = [o for o in outcomes if o["status"] == "unfilled"]
     skipped  = [o for o in outcomes if o["status"] == "skipped"]
     errors   = [o for o in outcomes if o["status"] == "error"]
@@ -1108,12 +1145,12 @@ def build_post_order_alert(
         "```",
     ]
 
-    if placed:
-        lines.append("Placed:")
-        for o in placed:
+    if filled:
+        lines.append("Filled:")
+        for o in filled:
             lines.append(f"  {o['action']:<4} {o['ticker']:<6} x{o['qty']:<4} @ ${o['price']:>8.2f}  order {o['order_id']}")
     else:
-        lines.append("Placed:  none")
+        lines.append("Filled:  none")
 
     if unfilled:
         lines.append("Unfilled:")
@@ -1441,13 +1478,14 @@ def run() -> None:
             entry_price_for_exit = float(price)
 
         result = place_sell(api, ticker, qty)
+        actual_qty = float(result.get("filled_qty") or qty)
         if result["status"] == "filled":
             actual_action = "SELL"
         elif result["status"] == "unfilled":
             actual_action = SELL_UNFILLED
         else:
             actual_action = "SELL_ERROR"
-        log_signal(ticker, "SELL", price, qty, confidence, actual_action, shap_values=r.get("shap_values"))
+        log_signal(ticker, "SELL", price, actual_qty, confidence, actual_action, shap_values=r.get("shap_values"))
 
         if result["status"] == "filled":
             from signal_logger import log_exit, find_open_entry_order_id
@@ -1458,13 +1496,13 @@ def run() -> None:
                 entry_price    = entry_price_for_exit,
                 exit_price     = price,
                 exit_reason    = "MODEL_SELL",
-                shares         = qty,
+                shares         = actual_qty,
             )
 
         outcomes.append({
             "ticker":   ticker,
             "action":   "SELL",
-            "qty":      qty,
+            "qty":      actual_qty,
             "price":    price,
             "status":   result["status"],
             "order_id": result.get("order_id", ""),
@@ -1630,6 +1668,7 @@ def run() -> None:
             label = "add to position" if is_add else "new position"
             print(f"  Signal: BUY {ticker}{note_str} @ ${price:.2f} ({label})")
             result = place_buy(api, ticker, qty)
+            actual_qty = int(result.get("filled_qty") or qty)
             if result["status"] == "filled":
                 actual_action = "ADD_TO_POSITION" if is_add else "BUY"
             elif result["status"] == "unfilled":
@@ -1637,14 +1676,14 @@ def run() -> None:
             else:
                 actual_action = "BUY_ERROR"
             log_signal(
-                ticker, "BUY", price, qty, confidence, actual_action,
+                ticker, "BUY", price, actual_qty, confidence, actual_action,
                 shap_values=r.get("shap_values"),
                 entry_order_id=result.get("order_id") if result["status"] == "filled" else None,
             )
             outcomes.append({
                 "ticker":   ticker,
                 "action":   "BUY",
-                "qty":      qty,
+                "qty":      actual_qty,
                 "price":    price,
                 "status":   result["status"],
                 "order_id": result.get("order_id", ""),
