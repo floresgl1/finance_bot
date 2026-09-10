@@ -419,25 +419,33 @@ def _load_agent_decisions() -> dict[str, str]:
     today = today_utc()
 
     if not os.path.exists(AGENT_DECISIONS_PATH):
-        print("  [AGENT] No agent_decisions.json found — defaulting to ABSTAIN for all.")
+        msg = "No agent_decisions.json found"
+        print(f"  [AGENT] {msg} — defaulting to ABSTAIN for all.")
+        send_discord(f"⚠️ **Agent pipeline gap** — {msg}. Trading with ABSTAIN defaults (no vetoes).")
         return {}
 
     try:
         with open(AGENT_DECISIONS_PATH) as fh:
             envelope = json.load(fh)
     except (json.JSONDecodeError, OSError) as exc:
-        print(f"  [AGENT] Cannot parse agent_decisions.json ({exc}) — defaulting to ABSTAIN.")
+        msg = f"Cannot parse agent_decisions.json ({exc})"
+        print(f"  [AGENT] {msg} — defaulting to ABSTAIN.")
+        send_discord(f"⚠️ **Agent pipeline gap** — {msg}. Trading with ABSTAIN defaults (no vetoes).")
         return {}
 
     # Date guard: reject yesterday's decisions
     file_date = envelope.get("date")
     if file_date != today:
-        print(f"  [AGENT] agent_decisions.json is for {file_date}, not {today} — defaulting to ABSTAIN.")
+        msg = f"agent_decisions.json is for {file_date}, not {today}"
+        print(f"  [AGENT] {msg} — defaulting to ABSTAIN.")
+        send_discord(f"⚠️ **Agent pipeline gap** — {msg}. Trading with ABSTAIN defaults (no vetoes).")
         return {}
 
     decisions = envelope.get("decisions", {})
     if not isinstance(decisions, dict):
-        print("  [AGENT] 'decisions' is not a dict — defaulting to ABSTAIN.")
+        msg = "'decisions' is not a dict"
+        print(f"  [AGENT] {msg} — defaulting to ABSTAIN.")
+        send_discord(f"⚠️ **Agent pipeline gap** — {msg}. Trading with ABSTAIN defaults (no vetoes).")
         return {}
 
     # Log what the agent decided
