@@ -536,3 +536,133 @@ def test_webhook_http_error_logged_and_state_updated(patched_paths, monkeypatch,
     assert patched_paths["state_path"].exists()
     state = json.loads(patched_paths["state_path"].read_text())
     assert state["last_state"] == "BELOW_THRESHOLD"
+
+
+# --- retrain trigger -------------------------------------------------------
+
+
+@pytest.fixture
+def mock_post_with_pat(monkeypatch):
+    """Like mock_post, but also sets GITHUB_PAT so the trigger fires."""
+    posted = []
+
+    def fake_post(url, json=None, timeout=None, **kwargs):
+        posted.append({"url": url, "json": json, "timeout": timeout})
+        resp = MagicMock()
+        resp.status_code = 204
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setenv("GITHUB_PAT", "ghp_fake_token")
+    monkeypatch.setattr(edge_monitor.requests, "post", fake_post)
+    return posted
+
+
+def _discord_posts(posts: list[dict]) -> list[dict]:
+    return [p for p in posts if "github.com" not in p["url"]]
+
+
+def _github_posts(posts: list[dict]) -> list[dict]:
+    return [p for p in posts if "github.com" in p["url"]]
+
+
+def test_below_threshold_triggers_retrain(patched_paths, mock_post_with_pat):
+    """A transition to BELOW_THRESHOLD should dispatch the retrain workflow."""
+    rows = _make_buys(30, wins=7, end_date="2026-04-26")
+    csv = _write_signal_log(patched_paths["tmp"] / "signal_log.csv", rows)
+
+    edge_monitor.run_edge_monitor(signal_log_path=csv)
+
+    gh = _github_posts(mock_post_with_pat)
+    assert len(gh) == 1
+    assert "retrain.yml/dispatches" in gh[0]["url"]
+    assert gh[0]["json"]["inputs"]["auto_mode"] == "true"
+    assert gh[0]["json"]["ref"] == "main"
+
+
+def test_above_threshold_does_not_trigger_retrain(patched_paths, mock_post_with_pat):
+    """Recovery alert should NOT trigger a retrain."""
+    patched_paths["state_path"].write_text(json.dumps({
+        "last_run_utc": "2026-04-21T15:00:00Z",
+        "last_state": "BELOW_THRESHOLD",
+        "last_meaningful_state": "BELOW_THRESHOLD",
+        "last_hit_rate": 0.2,
+        "last_window_size": 30,
+    }))
+    rows = _make_buys(30, wins=12, end_date="2026-04-26")  # 40% — recovery
+    csv = _write_signal_log(patched_paths["tmp"] / "signal_log.csv", rows)
+
+    edge_monitor.run_edge_monitor(signal_log_path=csv)
+
+    assert len(_discord_posts(mock_post_with_pat)) == 1  # recovery alert
+    assert _github_posts(mock_post_with_pat) == []        # no retrain
+
+
+def test_stale_does_not_trigger_retrain(patched_paths, mock_post_with_pat):
+    """A stale-data alert should NOT trigger a retrain."""
+    rows = _make_buys(30, wins=15, end_date="2026-04-16")
+    csv = _write_signal_log(patched_paths["tmp"] / "signal_log.csv", rows)
+
+    edge_monitor.run_edge_monitor(signal_log_path=csv)
+
+    assert len(_discord_posts(mock_post_with_pat)) == 1
+    assert _github_posts(mock_post_with_pat) == []
+
+
+def test_stay_below_does_not_retrigger(patched_paths, mock_post_with_pat):
+    """Already BELOW → still BELOW: no alert, no retrain (already dispatched)."""
+    patched_paths["state_path"].write_text(json.dumps({
+        "last_run_utc": "2026-04-21T15:00:00Z",
+        "last_state": "BELOW_THRESHOLD",
+        "last_meaningful_state": "BELOW_THRESHOLD",
+        "last_hit_rate": 0.2,
+        "last_window_size": 30,
+    }))
+    rows = _make_buys(30, wins=8, end_date="2026-04-26")
+    csv = _write_signal_log(patched_paths["tmp"] / "signal_log.csv", rows)
+
+    edge_monitor.run_edge_monitor(signal_log_path=csv)
+
+    assert mock_post_with_pat == []  # no alert, no trigger
+
+
+def test_missing_github_pat_skips_trigger_silently(patched_paths, mock_post, caplog):
+    """Without GITHUB_PAT, the trigger logs a warning but doesn't crash."""
+    rows = _make_buys(30, wins=7, end_date="2026-04-26")
+    csv = _write_signal_log(patched_paths["tmp"] / "signal_log.csv", rows)
+
+    with caplog.at_level("WARNING", logger="edge_monitor"):
+        edge_monitor.run_edge_monitor(signal_log_path=csv)
+
+    assert any("GITHUB_PAT not set" in r.message for r in caplog.records)
+    assert len(mock_post) == 1  # only Discord, no GitHub
+
+
+def test_trigger_http_error_is_swallowed(patched_paths, monkeypatch, caplog):
+    """A failed dispatch should be logged but not crash the monitor."""
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setenv("GITHUB_PAT", "ghp_fake_token")
+
+    call_count = {"n": 0}
+
+    def mixed_post(url, json=None, timeout=None, **kwargs):
+        call_count["n"] += 1
+        if "github.com" in url:
+            raise ConnectionError("network unreachable")
+        resp = MagicMock()
+        resp.status_code = 204
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    monkeypatch.setattr(edge_monitor.requests, "post", mixed_post)
+    rows = _make_buys(30, wins=7, end_date="2026-04-26")
+    csv = _write_signal_log(patched_paths["tmp"] / "signal_log.csv", rows)
+
+    with caplog.at_level("WARNING", logger="edge_monitor"):
+        edge_monitor.run_edge_monitor(signal_log_path=csv)
+
+    assert any("retrain dispatch failed" in r.message for r in caplog.records)
+    # State should still be written
+    state = json.loads(patched_paths["state_path"].read_text())
+    assert state["last_state"] == "BELOW_THRESHOLD"

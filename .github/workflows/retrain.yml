@@ -23,6 +23,10 @@ on:
         description: 'Evaluate and report only — never swap the model'
         type: boolean
         default: false
+      auto_mode:
+        description: 'Train and evaluate but require manual approval before promoting'
+        type: boolean
+        default: false
 
 jobs:
   retrain:
@@ -103,7 +107,10 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          python promote_model.py ${{ inputs.dry_run && '--dry-run' || '' }}
+          FLAGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then FLAGS="$FLAGS --dry-run"; fi
+          if [ "${{ inputs.auto_mode }}" = "true" ]; then FLAGS="$FLAGS --auto"; fi
+          python promote_model.py $FLAGS
           python - <<'PYEOF' >> "$GITHUB_OUTPUT"
           import json
           from config import PROMOTION_DECISION_PATH
@@ -119,8 +126,53 @@ jobs:
       # A promotion is only real once PythonAnywhere has the new file —
       # that is where live_trader.py loads the model from.
       # ------------------------------------------------------------------
+      # ------------------------------------------------------------------
+      # Auto mode: upload the candidate (not the champion) and the decision
+      # file to PythonAnywhere. The user approves on PA with --approve.
+      # ------------------------------------------------------------------
+      - name: Upload candidate to PythonAnywhere (awaiting approval)
+        if: steps.gate.outputs.promoted == 'true' && inputs.auto_mode == true && !inputs.dry_run
+        env:
+          PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+        run: |
+          python - <<'PYEOF'
+          import os, sys, requests
+          from config import MODEL_DIR, CANDIDATE_MODEL_FILENAME, PROMOTION_DECISION_PATH
+
+          token    = os.environ["PYTHONANYWHERE_TOKEN"]
+          username = os.environ["PYTHONANYWHERE_USERNAME"]
+
+          uploads = [
+              (os.path.join(MODEL_DIR, CANDIDATE_MODEL_FILENAME),
+               f"/home/{username}/finance_bot/{MODEL_DIR}{CANDIDATE_MODEL_FILENAME}"),
+              (PROMOTION_DECISION_PATH,
+               f"/home/{username}/finance_bot/{PROMOTION_DECISION_PATH}"),
+          ]
+
+          for local, remote in uploads:
+              url = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{remote}"
+              with open(local, "rb") as fh:
+                  r = requests.post(
+                      url,
+                      headers={"Authorization": f"Token {token}"},
+                      files={"content": fh},
+                      timeout=120,
+                  )
+              if r.status_code in (200, 201):
+                  print(f"[OK] {os.path.basename(local)} -> {remote}")
+              else:
+                  print(f"[ERROR] HTTP {r.status_code}: {r.text.strip()}")
+                  sys.exit(1)
+
+          print("\nCandidate staged on PythonAnywhere — run: python promote_model.py --approve")
+          PYEOF
+
+      # ------------------------------------------------------------------
+      # Normal mode: upload the promoted model directly.
+      # ------------------------------------------------------------------
       - name: Upload promoted model to PythonAnywhere
-        if: steps.gate.outputs.promoted == 'true' && !inputs.dry_run
+        if: steps.gate.outputs.promoted == 'true' && inputs.auto_mode != true && !inputs.dry_run
         env:
           PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
           PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
