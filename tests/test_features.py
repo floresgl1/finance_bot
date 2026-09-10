@@ -9,6 +9,8 @@ stale prices if the Layer 1 gate is ever bypassed.
 
 from datetime import date, timedelta
 
+from pandas.tseries.offsets import BDay
+
 import pandas as pd
 import pytest
 
@@ -175,20 +177,23 @@ def test_stale_ticker_data_trips_the_wire(data_env):
     a signal being generated from old prices."""
     _price_rows(date.today() - timedelta(days=30)).to_csv(data_env / "AAPL.csv", index=False)
 
-    with pytest.raises(StaleMarketDataError, match="days behind today"):
+    with pytest.raises(StaleMarketDataError, match="business days behind today"):
         load_and_process("AAPL")
 
 
 def test_tolerance_accommodates_a_long_weekend(data_env):
-    """5-day tolerance exists for e.g. the Tuesday after a Monday holiday,
-    when the last trading day is the previous Thursday."""
-    _price_rows(date.today() - timedelta(days=4)).to_csv(data_env / "AAPL.csv", index=False)
+    """3 business-day tolerance covers long weekends and holidays.
+    2 bdays back (e.g. Thursday data checked on Monday) must pass."""
+    last_bday = (pd.Timestamp.today() - BDay(2)).date()
+    _price_rows(last_bday).to_csv(data_env / "AAPL.csv", index=False)
 
     load_and_process("AAPL")   # must not raise
 
 
-def test_six_days_behind_trips_the_wire(data_env):
-    _price_rows(date.today() - timedelta(days=6)).to_csv(data_env / "AAPL.csv", index=False)
+def test_beyond_bday_tolerance_trips_the_wire(data_env):
+    """Data 5 business days old clearly exceeds the 3 bday tolerance."""
+    stale_bday = (pd.Timestamp.today() - BDay(5)).date()
+    _price_rows(stale_bday).to_csv(data_env / "AAPL.csv", index=False)
 
     with pytest.raises(StaleMarketDataError):
         load_and_process("AAPL")

@@ -76,11 +76,12 @@ def _load_market_close(symbol: str) -> pd.Series:
     # Layer 3 tripwire (see load_and_process for full rationale)
     from datetime import date as _date
     last_date = close.dropna().index[-1].date()
-    days_behind = (_date.today() - last_date).days
-    if days_behind > 5:
+    today = _date.today()
+    bdays_behind = max(len(pd.bdate_range(last_date, today)) - 1, 0)
+    if bdays_behind > 3:
         raise StaleMarketDataError(
-            f"Market symbol {symbol}: last row {last_date} is {days_behind} days "
-            f"behind today (>5 day tolerance). Layer 1 pipeline gate should have caught this."
+            f"Market symbol {symbol}: last row {last_date} is {bdays_behind} business days "
+            f"behind today (>3 bday tolerance). Layer 1 pipeline gate should have caught this."
         )
 
     return close
@@ -295,14 +296,15 @@ def load_and_process(ticker: str) -> pd.DataFrame:
     # Layer 3 tripwire: defense-in-depth check
     # Primary defense is Layer 1 pipeline gate in live_trader.check_market_data_freshness().
     # This tripwire catches regressions where that gate is accidentally bypassed.
-    # 5-day tolerance accommodates long weekends (e.g. Tuesday after MLK Day).
+    # 3 business-day tolerance accommodates long weekends and holidays.
     from datetime import date as _date
     last_row_date = df.index[-1].date()
-    days_behind = (_date.today() - last_row_date).days
-    if days_behind > 5:
+    today = _date.today()
+    bdays_behind = max(len(pd.bdate_range(last_row_date, today)) - 1, 0)
+    if bdays_behind > 3:
         raise StaleMarketDataError(
-            f"{ticker}: last row {last_row_date} is {days_behind} days behind today "
-            f"(>5 day tolerance). Layer 1 pipeline gate should have caught this."
+            f"{ticker}: last row {last_row_date} is {bdays_behind} business days behind today "
+            f"(>3 bday tolerance). Layer 1 pipeline gate should have caught this."
         )
 
     return df
