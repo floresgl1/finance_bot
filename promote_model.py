@@ -630,6 +630,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return handle_approve()
 
+    # --auto means "evaluate but require manual approval"; --dry-run means
+    # "evaluate but change nothing." Combining them is contradictory.
+    if args.auto and args.dry_run:
+        print("[FATAL] --auto cannot be combined with --dry-run")
+        return 1
+
     # Imported here so --help and the unit-testable gate above do not pay for
     # xgboost/sklearn import time.
     from trainer import build_dataset, train

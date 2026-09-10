@@ -666,3 +666,77 @@ def test_trigger_http_error_is_swallowed(patched_paths, monkeypatch, caplog):
     # State should still be written
     state = json.loads(patched_paths["state_path"].read_text())
     assert state["last_state"] == "BELOW_THRESHOLD"
+
+
+def test_trigger_non_204_response_is_logged(patched_paths, monkeypatch, caplog):
+    """A non-204 status from GitHub (e.g. 403, 422) should be logged as a warning."""
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setenv("GITHUB_PAT", "ghp_fake_token")
+
+    def mixed_post(url, json=None, timeout=None, **kwargs):
+        resp = MagicMock()
+        if "github.com" in url:
+            resp.status_code = 422
+            resp.text = "Validation Failed"
+        else:
+            resp.status_code = 204
+            resp.raise_for_status = MagicMock()
+        return resp
+
+    monkeypatch.setattr(edge_monitor.requests, "post", mixed_post)
+    rows = _make_buys(30, wins=7, end_date="2026-04-26")
+    csv = _write_signal_log(patched_paths["tmp"] / "signal_log.csv", rows)
+
+    with caplog.at_level("WARNING", logger="edge_monitor"):
+        edge_monitor.run_edge_monitor(signal_log_path=csv)
+
+    assert any("retrain dispatch returned HTTP 422" in r.message for r in caplog.records)
+    # State should still update
+    state = json.loads(patched_paths["state_path"].read_text())
+    assert state["last_state"] == "BELOW_THRESHOLD"
+
+
+def test_below_to_stale_to_below_does_not_retrigger(patched_paths, mock_post_with_pat):
+    """BELOW → STALE → BELOW: the meaningful state stays BELOW through the STALE
+    interval, so returning to BELOW is not a new transition and should NOT
+    re-dispatch the retrain workflow."""
+    # Step 1: start BELOW
+    patched_paths["state_path"].write_text(json.dumps({
+        "last_run_utc": "2026-04-14T15:00:00Z",
+        "last_state": "BELOW_THRESHOLD",
+        "last_meaningful_state": "BELOW_THRESHOLD",
+        "last_hit_rate": 0.2,
+        "last_window_size": 30,
+    }))
+
+    # Step 2: transition to STALE (data goes old)
+    rows = _make_buys(30, wins=8, end_date="2026-04-15")  # 13 days stale
+    csv = _write_signal_log(patched_paths["tmp"] / "signal_log.csv", rows)
+
+    edge_monitor.run_edge_monitor(signal_log_path=csv)
+
+    state = json.loads(patched_paths["state_path"].read_text())
+    assert state["last_state"] == "STALE"
+    assert state["last_meaningful_state"] == "BELOW_THRESHOLD"
+    stale_posts = list(mock_post_with_pat)
+    # STALE alert (Discord only), no GitHub dispatch
+    assert len(_discord_posts(stale_posts)) == 1
+    assert _github_posts(stale_posts) == []
+
+    mock_post_with_pat.clear()
+
+    # Step 3: fresh data comes back, still BELOW — should NOT retrigger
+    patched_paths["monkeypatch"].setattr(
+        edge_monitor, "_today_utc",
+        lambda: datetime(2026, 5, 5, 15, 0, 0, tzinfo=timezone.utc),
+    )
+    rows2 = _make_buys(30, wins=7, end_date="2026-05-04")
+    csv2 = _write_signal_log(patched_paths["tmp"] / "signal_log2.csv", rows2)
+
+    edge_monitor.run_edge_monitor(signal_log_path=csv2)
+
+    state2 = json.loads(patched_paths["state_path"].read_text())
+    assert state2["last_state"] == "BELOW_THRESHOLD"
+    assert state2["last_meaningful_state"] == "BELOW_THRESHOLD"
+    # No alert, no trigger — meaningful state was already BELOW
+    assert mock_post_with_pat == []

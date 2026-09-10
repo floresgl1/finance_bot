@@ -1083,3 +1083,46 @@ def test_parse_args_auto_and_approve_are_exclusive():
 def test_parse_args_approve_and_dry_run_are_exclusive():
     result = promote_model.main(["--approve", "--dry-run"])
     assert result == 1
+
+
+def test_parse_args_auto_and_dry_run_are_exclusive():
+    """--auto and --dry-run are contradictory: one keeps the candidate for
+    approval, the other promises no files change."""
+    result = promote_model.main(["--auto", "--dry-run"])
+    assert result == 1
+
+
+def test_handle_approve_first_promotion_no_champion(monkeypatch, tmp_path):
+    """First-ever promotion via --approve: no champion to archive."""
+    decision_path = tmp_path / "promotion_decision.json"
+    monkeypatch.setattr(promote_model, "PROMOTION_DECISION_PATH", str(decision_path))
+
+    decision_path.write_text(json.dumps({
+        "timestamp_utc": "2026-09-10T06:00:00+00:00",
+        "promoted": True,
+        "awaiting_approval": True,
+        "summary": "PROMOTE - challenger cleared every gate check",
+        "checks": [],
+        "champion": None,
+        "challenger": {},
+        "archived_to": None,
+        "dry_run": False,
+    }))
+
+    champion = tmp_path / "XG_Boost.joblib"
+    monkeypatch.setattr(promote_model, "CHAMPION_PATH", str(champion))
+    monkeypatch.setattr(promote_model, "MODEL_ARCHIVE_DIR", str(tmp_path / "archive"))
+
+    candidate = tmp_path / config.CANDIDATE_MODEL_FILENAME
+    candidate.write_bytes(b"challenger-bytes")
+    monkeypatch.setattr(promote_model, "CANDIDATE_PATH", str(candidate))
+
+    with patch.object(promote_model, "send_discord"):
+        result = promote_model.handle_approve()
+
+    assert result == 0
+    # Candidate was installed as champion
+    assert champion.read_bytes() == b"challenger-bytes"
+    # No archive created (nothing to archive)
+    assert not (tmp_path / "archive").exists() or \
+        len(list((tmp_path / "archive").glob("*.joblib"))) == 0

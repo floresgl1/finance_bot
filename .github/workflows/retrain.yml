@@ -211,7 +211,7 @@ jobs:
       # can be rolled back even though models/ is gitignored.
       # ------------------------------------------------------------------
       - name: Upload archived champion as an artifact
-        if: steps.gate.outputs.promoted == 'true' && !inputs.dry_run
+        if: steps.gate.outputs.promoted == 'true' && inputs.auto_mode != true && !inputs.dry_run
         uses: actions/upload-artifact@v4
         with:
           name: superseded-champion-${{ github.run_id }}
