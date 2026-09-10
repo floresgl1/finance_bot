@@ -29,7 +29,10 @@ from live_trader import (
     _write_halt_flag,
     _check_halt_flag,
     _write_run_guard,
+    _read_peak_equity,
+    _write_peak_equity,
     check_portfolio_loss_limits,
+    check_peak_drawdown,
     check_market_data_freshness,
     cancel_standing_stops,
     compute_buy_qty,
@@ -234,6 +237,132 @@ def test_zero_baseline_equity_does_not_divide_by_zero(breaker):
     _write_portfolio_snapshot({"2026-09-04": 0.0})
     should_halt, _ = check_portfolio_loss_limits(_api_with_equity(5_000.0))
     assert should_halt is False
+
+
+# ---------------------------------------------------------------------------
+# Peak-to-current drawdown circuit breaker (tier 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def peak_path(monkeypatch, tmp_path):
+    """Isolate peak_equity.json to a tmp directory and freeze today."""
+    path = tmp_path / "data" / "peak_equity.json"
+    monkeypatch.setattr(live_trader, "PEAK_EQUITY_PATH", str(path))
+    monkeypatch.setattr(live_trader, "today_utc", lambda: "2026-09-08")
+    return path
+
+
+def test_first_run_seeds_peak_equity(peak_path):
+    """No stored peak → seed with current equity, no halt."""
+    should_halt, reason = check_peak_drawdown(10_000.0)
+
+    assert should_halt is False
+    assert reason == ""
+
+    state = json.loads(peak_path.read_text())
+    assert state["peak_equity"] == 10_000.0
+    assert state["updated_at"] == "2026-09-08"
+
+
+def test_new_high_water_mark_updates_peak(peak_path):
+    peak_path.parent.mkdir(parents=True, exist_ok=True)
+    peak_path.write_text(json.dumps({"peak_equity": 10_000.0, "updated_at": "2026-09-01"}))
+
+    should_halt, reason = check_peak_drawdown(11_000.0)
+
+    assert should_halt is False
+    state = json.loads(peak_path.read_text())
+    assert state["peak_equity"] == 11_000.0
+    assert state["updated_at"] == "2026-09-08"
+
+
+def test_drawdown_below_threshold_does_not_halt(peak_path):
+    peak_path.parent.mkdir(parents=True, exist_ok=True)
+    peak_path.write_text(json.dumps({"peak_equity": 10_000.0, "updated_at": "2026-09-01"}))
+
+    # 5% drawdown, well under the 15% threshold
+    should_halt, reason = check_peak_drawdown(9_500.0)
+
+    assert should_halt is False
+    assert reason == ""
+
+
+def test_drawdown_exactly_at_threshold_halts(peak_path):
+    """The comparison is >=, so exactly 15% triggers the halt."""
+    peak_path.parent.mkdir(parents=True, exist_ok=True)
+    peak_path.write_text(json.dumps({"peak_equity": 10_000.0, "updated_at": "2026-09-01"}))
+
+    equity = 10_000.0 * (1 - config.MAX_PEAK_DRAWDOWN_PCT)   # exactly 8500.0
+
+    should_halt, reason = check_peak_drawdown(equity)
+
+    assert should_halt is True
+    assert "Peak drawdown" in reason
+    assert "15.0%" in reason
+
+
+def test_drawdown_beyond_threshold_halts(peak_path):
+    peak_path.parent.mkdir(parents=True, exist_ok=True)
+    peak_path.write_text(json.dumps({"peak_equity": 10_000.0, "updated_at": "2026-09-01"}))
+
+    # 20% drawdown — well over the 15% threshold
+    should_halt, reason = check_peak_drawdown(8_000.0)
+
+    assert should_halt is True
+    assert "Peak drawdown" in reason
+    assert "peak $10,000.00" in reason
+
+
+def test_missing_peak_file_is_handled_gracefully(peak_path):
+    """If the file doesn't exist, _read returns {} and check seeds the peak."""
+    should_halt, _ = check_peak_drawdown(10_000.0)
+    assert should_halt is False
+
+
+def test_corrupt_peak_file_is_handled_gracefully(peak_path):
+    """A corrupt file must not crash the bot — fall back to seeding."""
+    peak_path.parent.mkdir(parents=True, exist_ok=True)
+    peak_path.write_text("{ not valid json }")
+
+    should_halt, _ = check_peak_drawdown(10_000.0)
+
+    assert should_halt is False
+    # The file should now have valid JSON after re-seeding
+    state = json.loads(peak_path.read_text())
+    assert state["peak_equity"] == 10_000.0
+
+
+def test_peak_write_failure_is_not_fatal(monkeypatch):
+    monkeypatch.setattr(
+        live_trader, "PEAK_EQUITY_PATH", "/proc/fake/peak.json",
+    )
+    monkeypatch.setattr(live_trader, "today_utc", lambda: "2026-09-08")
+
+    # _write_peak_equity must not raise even when the write fails
+    _write_peak_equity({"peak_equity": 10_000.0})   # should not raise
+
+
+def test_zero_stored_peak_reseeds_instead_of_dividing_by_zero(peak_path):
+    """A manually-edited or corrupt peak of 0.0 must not cause ZeroDivisionError."""
+    peak_path.parent.mkdir(parents=True, exist_ok=True)
+    peak_path.write_text(json.dumps({"peak_equity": 0.0, "updated_at": "2026-09-01"}))
+
+    should_halt, _ = check_peak_drawdown(10_000.0)
+
+    assert should_halt is False
+    state = json.loads(peak_path.read_text())
+    assert state["peak_equity"] == 10_000.0
+
+
+def test_peak_equity_read_write_round_trip(peak_path):
+    state = {"peak_equity": 12_345.67, "updated_at": "2026-09-05"}
+    peak_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_peak_equity(state)
+    result = _read_peak_equity()
+
+    assert result["peak_equity"] == 12_345.67
+    assert result["updated_at"] == "2026-09-05"
 
 
 # ---------------------------------------------------------------------------

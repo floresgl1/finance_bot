@@ -71,13 +71,16 @@ from config import (
     HALT_FLAG_PATH,
     MAX_SINGLE_DAY_LOSS_PCT,
     MAX_ROLLING_LOSS_PCT,
+    MAX_PEAK_DRAWDOWN_PCT,
     ROLLING_LOSS_WINDOW_DAYS,
     PORTFOLIO_SNAPSHOT_RETAIN_DAYS,
     PORTFOLIO_HALT_SINGLE_DAY,
     PORTFOLIO_HALT_ROLLING,
+    PORTFOLIO_HALT_PEAK_DRAWDOWN,
     HALT_FLAG_PRESENT,
     BUY_SKIPPED_HALT,
     REBALANCER_SKIPPED_HALT,
+    PEAK_EQUITY_PATH,
     LAST_RUN_GUARD_PATH,
     AGENT_VETO,
     AGENT_DECISIONS_PATH,
@@ -203,6 +206,76 @@ def check_portfolio_loss_limits(api) -> tuple[bool, str]:
                     f"(session {past_date}: ${past_equity:,.2f} -> today: ${current_equity:,.2f})"
                 )
 
+    return (False, "")
+
+
+# ---------------------------------------------------------------------------
+# Peak-to-current drawdown circuit breaker (third tier)
+# ---------------------------------------------------------------------------
+def _read_peak_equity() -> dict:
+    """Read peak_equity.json. Returns {} on first run or if unreadable."""
+    if not os.path.exists(PEAK_EQUITY_PATH):
+        return {}
+    try:
+        with open(PEAK_EQUITY_PATH, "r") as fh:
+            return json.load(fh)
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"  [PEAK] Warning: could not read {PEAK_EQUITY_PATH}: {exc}")
+        return {}
+
+
+def _write_peak_equity(state: dict) -> None:
+    """Write peak_equity.json. Non-fatal on error."""
+    try:
+        os.makedirs(os.path.dirname(PEAK_EQUITY_PATH) or ".", exist_ok=True)
+        with open(PEAK_EQUITY_PATH, "w") as fh:
+            json.dump(state, fh, indent=2)
+    except OSError as exc:
+        print(f"  [PEAK] Warning: could not write {PEAK_EQUITY_PATH}: {exc}")
+
+
+def check_peak_drawdown(current_equity: float) -> tuple[bool, str]:
+    """
+    Compare current equity against the all-time high-water mark.
+
+    Returns (should_halt, reason).  Updates the high-water mark when
+    equity exceeds the stored peak.  On first run (no stored peak),
+    seeds the peak with current equity and returns (False, "").
+    """
+    state = _read_peak_equity()
+    peak = state.get("peak_equity")
+
+    # First run or invalid stored peak — seed the high-water mark
+    if peak is None or peak <= 0:
+        state["peak_equity"] = current_equity
+        state["updated_at"] = today_utc()
+        _write_peak_equity(state)
+        print(f"  [PEAK] First run — seeding peak equity at ${current_equity:,.2f}")
+        return (False, "")
+
+    # New high-water mark
+    if current_equity > peak:
+        state["peak_equity"] = current_equity
+        state["updated_at"] = today_utc()
+        _write_peak_equity(state)
+        print(f"  [PEAK] New high-water mark: ${current_equity:,.2f} (was ${peak:,.2f})")
+        return (False, "")
+
+    drawdown = (peak - current_equity) / peak
+    print(f"  [PEAK] Equity ${current_equity:,.2f} vs peak ${peak:,.2f} "
+          f"— drawdown {drawdown * 100:.2f}%")
+
+    if drawdown >= MAX_PEAK_DRAWDOWN_PCT:
+        return (
+            True,
+            f"Peak drawdown {drawdown * 100:.2f}% exceeds "
+            f"{MAX_PEAK_DRAWDOWN_PCT * 100:.1f}% threshold "
+            f"(peak ${peak:,.2f} on {state.get('updated_at', '?')} "
+            f"-> today ${current_equity:,.2f})"
+        )
+
+    # Drawdown within tolerance — persist unchanged state
+    _write_peak_equity(state)
     return (False, "")
 
 
@@ -1055,6 +1128,8 @@ def run() -> None:
     # 3a. Portfolio-level loss limit — checked after freshness so we trust the
     # equity read. On trip: write halt flag, alert, continue (SELLs still run).
     halt_active = False
+    current_equity = float(api.get_account().equity)
+
     should_halt, halt_reason = check_portfolio_loss_limits(api)
     if should_halt:
         halt_active = True
@@ -1073,6 +1148,27 @@ def run() -> None:
         )
         print(f"\n  [HALT] Portfolio loss limit tripped: {halt_reason}\n")
         # continue — do NOT sys.exit. SELLs still run.
+
+    # 3b. Peak-to-current drawdown — catches slow bleeds the rolling window misses.
+    if not halt_active:
+        peak_halt, peak_reason = check_peak_drawdown(current_equity)
+        if peak_halt:
+            halt_active = True
+            _write_halt_flag(peak_reason)
+            from signal_logger import log_signal as _log_peak
+            _log_peak("PIPELINE", PORTFOLIO_HALT_PEAK_DRAWDOWN, 0, 0, 0,
+                      PORTFOLIO_HALT_PEAK_DRAWDOWN)
+            send_discord(
+                f"🚨 **PEAK DRAWDOWN HALT TRIGGERED**\n{peak_reason}\n"
+                f"BUYs and rebalancer DISABLED for this session. SELLs and take-profit still active.\n"
+                f"Flag written to `{HALT_FLAG_PATH}` — delete manually to resume.\n"
+                f"To reset the high-water mark after review, delete `{PEAK_EQUITY_PATH}`."
+            )
+            print(f"\n  [HALT] Peak drawdown tripped: {peak_reason}\n")
+    else:
+        # Still update the peak tracker even when halted by another tier,
+        # so the high-water mark stays current.
+        check_peak_drawdown(current_equity)
 
     # 3. Backfill + take-profit pass — standing stop-loss is enforced via OTO orders
     #    attached at entry time; take-profit is still evaluated in-script.

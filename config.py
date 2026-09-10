@@ -148,12 +148,15 @@ PORTFOLIO_SNAPSHOT_PATH        = "portfolio_snapshot.json"
 HALT_FLAG_PATH                 = "HALT_FLAG.txt"
 MAX_SINGLE_DAY_LOSS_PCT        = 0.05   # 5% session-over-session drawdown halt
 MAX_ROLLING_LOSS_PCT           = 0.08   # 8% rolling drawdown halt
+MAX_PEAK_DRAWDOWN_PCT          = 0.15   # 15% peak-to-current drawdown halt
 ROLLING_LOSS_WINDOW_DAYS       = 5      # trading sessions to look back
 PORTFOLIO_SNAPSHOT_RETAIN_DAYS = 30     # cap snapshot file growth
+PEAK_EQUITY_PATH               = "data/peak_equity.json"
 
 # Signal-logger action codes introduced by portfolio halt
 PORTFOLIO_HALT_SINGLE_DAY      = "PORTFOLIO_HALT_SINGLE_DAY"
 PORTFOLIO_HALT_ROLLING         = "PORTFOLIO_HALT_ROLLING"
+PORTFOLIO_HALT_PEAK_DRAWDOWN   = "PORTFOLIO_HALT_PEAK_DRAWDOWN"
 HALT_FLAG_PRESENT              = "HALT_FLAG_PRESENT"
 BUY_SKIPPED_HALT               = "BUY_SKIPPED_HALT"
 REBALANCER_SKIPPED_HALT        = "REBALANCER_SKIPPED_HALT"
