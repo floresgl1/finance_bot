@@ -160,6 +160,50 @@ def _format_stale(max_date: str, days_old: int) -> str:
     )
 
 
+_RETRAIN_DISPATCH_URL = (
+    "https://api.github.com/repos/floresgl1/finance_bot"
+    "/actions/workflows/retrain.yml/dispatches"
+)
+
+
+def _trigger_retrain_workflow() -> None:
+    """Dispatch the retrain workflow on GitHub Actions with auto_mode=true.
+
+    The workflow trains a challenger, evaluates it, and uploads the candidate
+    to PythonAnywhere for manual approval (``promote_model.py --approve``).
+    A missing GITHUB_PAT or a failed dispatch is logged but never fatal —
+    the edge monitor's primary job is the alert, not the retrain.
+    """
+    token = os.environ.get("GITHUB_PAT")
+    if not token:
+        logger.warning("GITHUB_PAT not set; skipping auto-retrain trigger")
+        return
+    try:
+        resp = requests.post(
+            _RETRAIN_DISPATCH_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"ref": "main", "inputs": {"auto_mode": "true"}},
+            timeout=15,
+        )
+        if resp.status_code == 204:
+            logger.info("retrain workflow dispatched successfully")
+        else:
+            logger.warning(
+                "retrain dispatch returned HTTP %s: %s",
+                resp.status_code,
+                resp.text.strip()[:200],
+            )
+    except Exception as exc:
+        logger.warning(
+            "retrain dispatch failed (swallowed): %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+
+
 def _try_send_discord(content: str) -> None:
     webhook = os.environ.get("DISCORD_WEBHOOK_URL")
     if not webhook:
@@ -200,6 +244,9 @@ def run_edge_monitor(signal_log_path: str = "data/signal_log.csv") -> None:
             days_old = (today.date() - pd.to_datetime(max_date).date()).days
             content = _format_stale(max_date, days_old)
         _try_send_discord(content)
+
+        if current_state == "BELOW_THRESHOLD":
+            _trigger_retrain_workflow()
 
     new_meaningful = (
         current_state

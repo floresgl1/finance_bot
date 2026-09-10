@@ -381,6 +381,7 @@ def write_decision_file(
     *,
     dry_run: bool,
     archived_to: str | None,
+    auto: bool = False,
     path: str = PROMOTION_DECISION_PATH,
 ) -> None:
     """Persist the decision as JSON for downstream consumers.
@@ -388,11 +389,15 @@ def write_decision_file(
     The candidate file is consumed on both outcomes — moved on promotion,
     deleted on rejection — so its absence cannot be used to infer what
     happened. CI reads this file instead.
+
+    When ``auto=True`` and the gate passed, ``awaiting_approval`` is set
+    so ``--approve`` can verify it is acting on an auto-mode decision.
     """
     payload = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "promoted": decision["promote"],
         "dry_run": dry_run,
+        "awaiting_approval": auto and decision["promote"],
         "summary": decision["summary"],
         "checks": decision["checks"],
         "champion": champion,
@@ -433,10 +438,19 @@ def build_report(
     *,
     dry_run: bool,
     archived_to: str | None,
+    auto: bool = False,
 ) -> str:
     """Format the promotion decision for Discord."""
-    icon = "✅" if decision["promote"] else "🛑"
-    header = f"{icon} **MODEL PROMOTION — {'PROMOTED' if decision['promote'] else 'REJECTED'}**"
+    if auto and decision["promote"]:
+        icon = "⏳"
+        verdict = "AWAITING APPROVAL"
+    elif decision["promote"]:
+        icon = "✅"
+        verdict = "PROMOTED"
+    else:
+        icon = "🛑"
+        verdict = "REJECTED"
+    header = f"{icon} **MODEL PROMOTION — {verdict}**"
     if dry_run:
         header += "  _(dry run — no files changed)_"
 
@@ -481,6 +495,12 @@ def build_report(
         lines.append("")
         lines.append(f"Previous champion archived to `{archived_to}`")
 
+    if auto and decision["promote"]:
+        lines.append("")
+        lines.append("⏳ **Awaiting manual approval**")
+        lines.append("Run on PythonAnywhere: `python promote_model.py --approve`")
+        lines.append("The candidate will be discarded on the next retrain if not approved.")
+
     return "\n".join(lines)
 
 
@@ -495,6 +515,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Evaluate and report the decision without touching any model file.",
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Train and evaluate but do not promote — keep the candidate on disk "
+             "for manual approval via --approve. Used by the edge-monitor auto-retrain.",
+    )
+    parser.add_argument(
+        "--approve",
+        action="store_true",
+        help="Approve a pending promotion from a previous --auto run. "
+             "Archives the champion and installs the candidate without re-evaluating.",
     )
     parser.add_argument(
         "--skip-train",
@@ -519,8 +551,90 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def handle_approve() -> int:
+    """Approve a pending promotion from a previous --auto run.
+
+    Reads the decision file, verifies it represents a passed gate awaiting
+    approval, then archives the champion and installs the candidate. No
+    re-evaluation — the gate already ran.
+    """
+    print("=" * 76)
+    print("  MODEL PROMOTION — MANUAL APPROVAL")
+    print(f"  {datetime.now(timezone.utc).isoformat()}")
+    print("=" * 76)
+
+    # 1. Read decision file
+    if not os.path.exists(PROMOTION_DECISION_PATH):
+        print(f"\n[FATAL] No decision file at {PROMOTION_DECISION_PATH}")
+        print("        Run promote_model.py --auto first.")
+        return 1
+
+    try:
+        with open(PROMOTION_DECISION_PATH) as fh:
+            decision = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"\n[FATAL] Could not read decision file: {exc}")
+        return 1
+
+    # 2. Verify it's a pending auto-mode promotion
+    if not decision.get("promoted"):
+        print(f"\n[FATAL] Decision says REJECT — nothing to approve.")
+        print(f"        Summary: {decision.get('summary', '?')}")
+        return 1
+
+    if not decision.get("awaiting_approval"):
+        print("\n[FATAL] Decision is not awaiting approval.")
+        print("        It was either already approved or not from an --auto run.")
+        return 1
+
+    # 3. Check candidate exists
+    if not os.path.exists(CANDIDATE_PATH):
+        print(f"\n[FATAL] Candidate model not found at {CANDIDATE_PATH}")
+        print("        It may have been cleaned up or never uploaded.")
+        return 1
+
+    # 4. Archive + install
+    archived_to = archive_champion(CHAMPION_PATH)
+    if archived_to:
+        print(f"\n  Champion archived to {archived_to}")
+    install_candidate(CANDIDATE_PATH, CHAMPION_PATH)
+    print(f"  Challenger installed as live model: {CHAMPION_PATH}")
+
+    # 5. Update decision file
+    decision["awaiting_approval"] = False
+    decision["approved_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        with open(PROMOTION_DECISION_PATH, "w") as fh:
+            json.dump(decision, fh, indent=2)
+    except OSError as exc:
+        print(f"  [DECISION] Warning: could not update {PROMOTION_DECISION_PATH}: {exc}")
+
+    # 6. Discord
+    send_discord(
+        "✅ **MODEL PROMOTION APPROVED**\n"
+        f"Challenger installed as live model: `{CHAMPION_PATH}`\n"
+        + (f"Previous champion archived to `{archived_to}`" if archived_to else "")
+    )
+
+    print("\n  Promotion approved and applied.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+
+    # --approve is a standalone path: no training, no evaluation.
+    if args.approve:
+        if args.dry_run or args.auto or args.skip_train:
+            print("[FATAL] --approve cannot be combined with --dry-run, --auto, or --skip-train")
+            return 1
+        return handle_approve()
+
+    # --auto means "evaluate but require manual approval"; --dry-run means
+    # "evaluate but change nothing." Combining them is contradictory.
+    if args.auto and args.dry_run:
+        print("[FATAL] --auto cannot be combined with --dry-run")
+        return 1
 
     # Imported here so --help and the unit-testable gate above do not pay for
     # xgboost/sklearn import time.
@@ -597,7 +711,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- 5. Act ------------------------------------------------------------
     archived_to = None
-    if decision["promote"] and not args.dry_run:
+    if decision["promote"] and args.auto:
+        # Auto mode — keep the candidate for manual approval.
+        print("\n  [AUTO] Gate passed — candidate kept for manual approval.")
+        print(f"  [AUTO] Run: python promote_model.py --approve")
+    elif decision["promote"] and not args.dry_run:
         archived_to = archive_champion()
         if archived_to:
             print(f"\n  Champion archived to {archived_to}")
@@ -608,7 +726,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         # Remove the rejected candidate so a later --skip-train run cannot
         # silently evaluate a stale challenger.
-        if not args.dry_run and os.path.exists(args.candidate):
+        if not args.dry_run and not args.auto and os.path.exists(args.candidate):
             os.remove(args.candidate)
             print(f"\n  Rejected candidate removed: {args.candidate}")
 
@@ -619,6 +737,7 @@ def main(argv: list[str] | None = None) -> int:
         challenger_metrics,
         dry_run=args.dry_run,
         archived_to=archived_to,
+        auto=args.auto,
     )
     send_discord(
         build_report(
@@ -627,6 +746,7 @@ def main(argv: list[str] | None = None) -> int:
             challenger_metrics,
             dry_run=args.dry_run,
             archived_to=archived_to,
+            auto=args.auto,
         )
     )
 

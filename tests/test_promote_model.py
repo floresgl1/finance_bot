@@ -877,3 +877,252 @@ def test_report_shows_the_sell_line():
                           dry_run=False, archived_to=None)
 
     assert "SELL" in report
+
+
+# --- auto mode (--auto) ----------------------------------------------------
+#
+# --auto trains and evaluates but keeps the candidate for manual approval
+# instead of promoting directly.
+
+
+def test_report_auto_mode_shows_awaiting_approval():
+    champion = _metrics(buy_f1=0.40)
+    challenger = _winner(champion)
+    decision = decide_promotion(champion, challenger)
+
+    report = build_report(
+        decision, champion, challenger,
+        dry_run=False, archived_to=None, auto=True,
+    )
+
+    assert "AWAITING APPROVAL" in report
+    assert "PROMOTED" not in report
+    assert "promote_model.py --approve" in report
+
+
+def test_report_auto_mode_rejected_shows_rejected():
+    """Auto mode doesn't change the rejection verdict."""
+    champion = _metrics(buy_f1=0.90, total_return=40.0)
+    challenger = _metrics(buy_f1=0.10, buy_support=200)
+    decision = decide_promotion(champion, challenger)
+
+    report = build_report(
+        decision, champion, challenger,
+        dry_run=False, archived_to=None, auto=True,
+    )
+
+    assert "REJECTED" in report
+    assert "AWAITING APPROVAL" not in report
+
+
+def test_decision_file_auto_mode_sets_awaiting_approval(tmp_path):
+    path = tmp_path / "promotion_decision.json"
+    champion = _metrics(buy_f1=0.40)
+    challenger = _winner(champion)
+    decision = decide_promotion(champion, challenger)
+
+    write_decision_file(
+        decision, champion, challenger,
+        dry_run=False, archived_to=None, auto=True, path=str(path),
+    )
+
+    payload = json.loads(path.read_text())
+    assert payload["promoted"] is True
+    assert payload["awaiting_approval"] is True
+
+
+def test_decision_file_auto_mode_rejected_does_not_set_awaiting(tmp_path):
+    path = tmp_path / "promotion_decision.json"
+    champion = _metrics(buy_f1=0.90, total_return=40.0)
+    challenger = _metrics(buy_f1=0.10, buy_support=200)
+    decision = decide_promotion(champion, challenger)
+
+    write_decision_file(
+        decision, champion, challenger,
+        dry_run=False, archived_to=None, auto=True, path=str(path),
+    )
+
+    payload = json.loads(path.read_text())
+    assert payload["promoted"] is False
+    assert payload["awaiting_approval"] is False
+
+
+def test_decision_file_normal_mode_never_sets_awaiting(tmp_path):
+    """Without --auto, awaiting_approval is always False."""
+    path = tmp_path / "promotion_decision.json"
+    champion = _metrics(buy_f1=0.40)
+    challenger = _winner(champion)
+    decision = decide_promotion(champion, challenger)
+
+    write_decision_file(
+        decision, champion, challenger,
+        dry_run=False, archived_to=None, auto=False, path=str(path),
+    )
+
+    payload = json.loads(path.read_text())
+    assert payload["promoted"] is True
+    assert payload["awaiting_approval"] is False
+
+
+# --- approve mode (--approve) ----------------------------------------------
+
+
+def test_handle_approve_succeeds(model_dir, monkeypatch, tmp_path):
+    """Happy path: decision file says awaiting, candidate exists."""
+    decision_path = tmp_path / "promotion_decision.json"
+    monkeypatch.setattr(promote_model, "PROMOTION_DECISION_PATH", str(decision_path))
+
+    decision_path.write_text(json.dumps({
+        "timestamp_utc": "2026-09-10T06:00:00+00:00",
+        "promoted": True,
+        "awaiting_approval": True,
+        "summary": "PROMOTE - challenger cleared every gate check",
+        "checks": [],
+        "champion": {},
+        "challenger": {},
+        "archived_to": None,
+        "dry_run": False,
+    }))
+
+    candidate = model_dir["root"] / config.CANDIDATE_MODEL_FILENAME
+    candidate.write_bytes(b"challenger-bytes")
+    monkeypatch.setattr(promote_model, "CANDIDATE_PATH", str(candidate))
+
+    model_dir["champion"].write_bytes(b"champion-bytes")
+
+    with patch.object(promote_model, "send_discord"):
+        result = promote_model.handle_approve()
+
+    assert result == 0
+    assert model_dir["champion"].read_bytes() == b"challenger-bytes"
+
+    updated = json.loads(decision_path.read_text())
+    assert updated["awaiting_approval"] is False
+    assert "approved_at" in updated
+
+
+def test_handle_approve_fails_when_no_decision_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        promote_model, "PROMOTION_DECISION_PATH",
+        str(tmp_path / "nonexistent.json"),
+    )
+
+    result = promote_model.handle_approve()
+
+    assert result == 1
+
+
+def test_handle_approve_fails_when_rejected(monkeypatch, tmp_path):
+    decision_path = tmp_path / "promotion_decision.json"
+    decision_path.write_text(json.dumps({
+        "timestamp_utc": "2026-09-10T06:00:00+00:00",
+        "promoted": False,
+        "awaiting_approval": False,
+        "summary": "REJECT",
+        "checks": [],
+        "champion": {},
+        "challenger": {},
+        "archived_to": None,
+        "dry_run": False,
+    }))
+    monkeypatch.setattr(promote_model, "PROMOTION_DECISION_PATH", str(decision_path))
+
+    result = promote_model.handle_approve()
+
+    assert result == 1
+
+
+def test_handle_approve_fails_when_not_awaiting(monkeypatch, tmp_path):
+    """Already-approved or non-auto decisions are not re-approvable."""
+    decision_path = tmp_path / "promotion_decision.json"
+    decision_path.write_text(json.dumps({
+        "timestamp_utc": "2026-09-10T06:00:00+00:00",
+        "promoted": True,
+        "awaiting_approval": False,
+        "summary": "PROMOTE",
+        "checks": [],
+        "champion": {},
+        "challenger": {},
+        "archived_to": None,
+        "dry_run": False,
+    }))
+    monkeypatch.setattr(promote_model, "PROMOTION_DECISION_PATH", str(decision_path))
+
+    result = promote_model.handle_approve()
+
+    assert result == 1
+
+
+def test_handle_approve_fails_when_candidate_missing(monkeypatch, tmp_path):
+    decision_path = tmp_path / "promotion_decision.json"
+    decision_path.write_text(json.dumps({
+        "timestamp_utc": "2026-09-10T06:00:00+00:00",
+        "promoted": True,
+        "awaiting_approval": True,
+        "summary": "PROMOTE",
+        "checks": [],
+        "champion": {},
+        "challenger": {},
+        "archived_to": None,
+        "dry_run": False,
+    }))
+    monkeypatch.setattr(promote_model, "PROMOTION_DECISION_PATH", str(decision_path))
+    monkeypatch.setattr(promote_model, "CANDIDATE_PATH", str(tmp_path / "nope.joblib"))
+
+    result = promote_model.handle_approve()
+
+    assert result == 1
+
+
+def test_parse_args_auto_and_approve_are_exclusive():
+    """--approve combined with --auto should fail in main()."""
+    result = promote_model.main(["--approve", "--auto"])
+    assert result == 1
+
+
+def test_parse_args_approve_and_dry_run_are_exclusive():
+    result = promote_model.main(["--approve", "--dry-run"])
+    assert result == 1
+
+
+def test_parse_args_auto_and_dry_run_are_exclusive():
+    """--auto and --dry-run are contradictory: one keeps the candidate for
+    approval, the other promises no files change."""
+    result = promote_model.main(["--auto", "--dry-run"])
+    assert result == 1
+
+
+def test_handle_approve_first_promotion_no_champion(monkeypatch, tmp_path):
+    """First-ever promotion via --approve: no champion to archive."""
+    decision_path = tmp_path / "promotion_decision.json"
+    monkeypatch.setattr(promote_model, "PROMOTION_DECISION_PATH", str(decision_path))
+
+    decision_path.write_text(json.dumps({
+        "timestamp_utc": "2026-09-10T06:00:00+00:00",
+        "promoted": True,
+        "awaiting_approval": True,
+        "summary": "PROMOTE - challenger cleared every gate check",
+        "checks": [],
+        "champion": None,
+        "challenger": {},
+        "archived_to": None,
+        "dry_run": False,
+    }))
+
+    champion = tmp_path / "XG_Boost.joblib"
+    monkeypatch.setattr(promote_model, "CHAMPION_PATH", str(champion))
+    monkeypatch.setattr(promote_model, "MODEL_ARCHIVE_DIR", str(tmp_path / "archive"))
+
+    candidate = tmp_path / config.CANDIDATE_MODEL_FILENAME
+    candidate.write_bytes(b"challenger-bytes")
+    monkeypatch.setattr(promote_model, "CANDIDATE_PATH", str(candidate))
+
+    with patch.object(promote_model, "send_discord"):
+        result = promote_model.handle_approve()
+
+    assert result == 0
+    # Candidate was installed as champion
+    assert champion.read_bytes() == b"challenger-bytes"
+    # No archive created (nothing to archive)
+    assert not (tmp_path / "archive").exists() or \
+        len(list((tmp_path / "archive").glob("*.joblib"))) == 0
