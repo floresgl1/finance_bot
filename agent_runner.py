@@ -310,6 +310,41 @@ def process_ticker(work_item: dict) -> dict:
         return row
 
 
+def run_agent_from_signals(signals: list[dict], run_date: str) -> dict:
+    """Run the agent on a pre-built work list (Phase 2 of the pre-trade pipeline).
+
+    Unlike run_agent(), this does not read signal_log.csv — it receives the
+    work list directly from pending_signals.json. Each item must have exactly
+    the keys {ticker, model_signal, confidence, shap_values}.
+
+    Args:
+        signals: list of dicts from pending_signals.json.
+        run_date: ISO date string for metadata.
+
+    Returns:
+        Artifact dict with the same shape as run_agent(). run_status is
+        "PRETRADE" (no signal_log to determine halt state).
+    """
+    run_started = datetime.now(timezone.utc)
+    run_started_at = run_started.isoformat().replace("+00:00", "Z")
+    agent_version = _git_short_sha()
+
+    decisions = [process_ticker(item) for item in signals]
+
+    run_duration = (datetime.now(timezone.utc) - run_started).total_seconds()
+    return {
+        "run_date": run_date,
+        "agent_version": agent_version,
+        "llm_model": GROQ_MODEL,
+        "run_started_at": run_started_at,
+        "run_duration_seconds": float(run_duration),
+        "run_status": "PRETRADE",
+        "halt_details": [],
+        "decisions": decisions,
+        "run_error": None,
+    }
+
+
 def run_agent(signal_log_path: str, run_date: str) -> dict:
     """Run the agent end-to-end for run_date and return the artifact dict.
 
