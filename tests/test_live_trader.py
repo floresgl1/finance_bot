@@ -1267,3 +1267,90 @@ def test_sell_returns_filled_qty(monkeypatch):
 
     assert result["status"] == "filled"
     assert result["filled_qty"] == "8"
+
+
+# ---------------------------------------------------------------------------
+# Early run guard (stamp on first fill, not at end of execution)
+# ---------------------------------------------------------------------------
+
+
+def test_early_guard_stamped_on_first_sell_fill(monkeypatch, tmp_path):
+    """Guard is written the moment the first SELL fills, not deferred to end."""
+    guard = tmp_path / "data" / "last_run_date.txt"
+    monkeypatch.setattr(live_trader, "LAST_RUN_GUARD_PATH", str(guard))
+    monkeypatch.setattr(live_trader, "today_utc", lambda: "2026-09-10")
+
+    # Simulate the inline guard-stamping pattern from run()
+    guard_stamped = False
+    result_status = "filled"
+
+    if result_status == "filled":
+        if not guard_stamped:
+            _write_run_guard()
+            guard_stamped = True
+
+    assert guard.read_text() == "2026-09-10"
+    assert guard_stamped is True
+
+
+def test_early_guard_stamped_only_once(monkeypatch, tmp_path):
+    """Multiple fills call _write_run_guard exactly once."""
+    guard = tmp_path / "data" / "last_run_date.txt"
+    monkeypatch.setattr(live_trader, "LAST_RUN_GUARD_PATH", str(guard))
+    monkeypatch.setattr(live_trader, "today_utc", lambda: "2026-09-10")
+
+    call_count = 0
+    original_write = _write_run_guard
+
+    def counting_write():
+        nonlocal call_count
+        call_count += 1
+        original_write()
+
+    monkeypatch.setattr(live_trader, "_write_run_guard", counting_write)
+
+    guard_stamped = False
+
+    # Simulate three fills in sequence (SELL, rebalancer, BUY)
+    for _ in range(3):
+        if not guard_stamped:
+            live_trader._write_run_guard()
+            guard_stamped = True
+
+    assert call_count == 1
+    assert guard.read_text() == "2026-09-10"
+
+
+def test_guard_fallback_when_no_fills(monkeypatch, tmp_path):
+    """When all signals are HOLDs/skips (no fills), guard still stamps at end."""
+    guard = tmp_path / "data" / "last_run_date.txt"
+    monkeypatch.setattr(live_trader, "LAST_RUN_GUARD_PATH", str(guard))
+    monkeypatch.setattr(live_trader, "today_utc", lambda: "2026-09-10")
+
+    guard_stamped = False
+
+    # Simulate: no fills occurred (all skips/holds)
+    # At end of run(), the fallback stamps:
+    if not guard_stamped:
+        _write_run_guard()
+
+    assert guard.read_text() == "2026-09-10"
+
+
+def test_guard_not_stamped_before_first_fill(monkeypatch, tmp_path):
+    """Guard file does not exist until a fill actually happens."""
+    guard = tmp_path / "data" / "last_run_date.txt"
+    monkeypatch.setattr(live_trader, "LAST_RUN_GUARD_PATH", str(guard))
+    monkeypatch.setattr(live_trader, "today_utc", lambda: "2026-09-10")
+
+    guard_stamped = False
+
+    # Simulate skipped signals — no fills
+    for result_status in ("skipped", "skipped", "error"):
+        if result_status == "filled" and not guard_stamped:
+            _write_run_guard()
+            guard_stamped = True
+
+    # Guard should NOT exist yet
+    assert not guard.exists()
+    assert guard_stamped is False

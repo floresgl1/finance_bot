@@ -1368,9 +1368,12 @@ def run() -> None:
             send_discord(f"⚠️ **Stop-loss backfill failed** for {ticker}: {exc}")
 
     print(f"  Checking take-profits on {len(owned)} open position(s)...")
+    guard_stamped = False                       # stamp on first confirmed fill
     exited, owned = check_position_limits(api, owned)
     if exited:
         print(f"  Exited (take-profit): {exited}")
+        _write_run_guard()
+        guard_stamped = True
         owned  = get_owned_tickers(api)
         equity = get_equity(api)
     else:
@@ -1488,6 +1491,9 @@ def run() -> None:
         log_signal(ticker, "SELL", price, actual_qty, confidence, actual_action, shap_values=r.get("shap_values"))
 
         if result["status"] == "filled":
+            if not guard_stamped:
+                _write_run_guard()
+                guard_stamped = True
             from signal_logger import log_exit, find_open_entry_order_id
             entry_order_id = find_open_entry_order_id(ticker) or "UNLINKED"
             log_exit(
@@ -1538,6 +1544,10 @@ def run() -> None:
         o["ticker"] for o in rebalancer_outcomes
         if o["status"] == "placed"
     ]
+
+    if not guard_stamped and rebalancer_tickers:
+        _write_run_guard()
+        guard_stamped = True
 
     owned  = get_owned_tickers(api)
     equity = get_equity(api)
@@ -1670,6 +1680,9 @@ def run() -> None:
             result = place_buy(api, ticker, qty)
             actual_qty = int(result.get("filled_qty") or qty)
             if result["status"] == "filled":
+                if not guard_stamped:
+                    _write_run_guard()
+                    guard_stamped = True
                 actual_action = "ADD_TO_POSITION" if is_add else "BUY"
             elif result["status"] == "unfilled":
                 actual_action = BUY_UNFILLED
@@ -1711,10 +1724,12 @@ def run() -> None:
 
     print("-" * 60)
 
-    # 6d. Stamp the daily run guard — execution is complete for today, so a
-    #     later safety-net run must skip. Written before the Discord post so a
-    #     failed post can never cause a re-trade. See _write_run_guard().
-    _write_run_guard()
+    # 6d. Stamp the daily run guard — if no fills occurred above (all signals
+    #     were skips/holds/errors), stamp now so a safety-net run still won't
+    #     re-enter the execution pass. When at least one fill happened the guard
+    #     was already stamped inline, making this a harmless no-op (idempotent).
+    if not guard_stamped:
+        _write_run_guard()
 
     # 7. Single post-execution Discord summary (after all trades complete)
     portfolio_value = get_equity(api)
