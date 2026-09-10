@@ -58,10 +58,14 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
     _sell_skip = set(sell_executed_tickers) if sell_executed_tickers else set()
     outcomes: list[dict] = []
 
+    # Deferred to avoid circular import (live_trader imports run_rebalancer).
+    from live_trader import _raise_if_infra
+
     # --- Fetch fresh portfolio state ----------------------------------------
     try:
         equity = float(api.get_account().equity)
     except Exception as exc:
+        _raise_if_infra(exc, "get_account", "REBALANCER")
         print(f"  [REBALANCER] Could not fetch equity: {exc} — skipping rebalancer")
         return outcomes
 
@@ -72,6 +76,7 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
     try:
         positions = api.list_positions()
     except Exception as exc:
+        _raise_if_infra(exc, "list_positions", "REBALANCER")
         print(f"  [REBALANCER] Could not fetch positions: {exc} — skipping rebalancer")
         return outcomes
 
@@ -171,6 +176,7 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
                 position_fresh = api.get_position(ticker)
                 entry_price_for_exit = float(position_fresh.avg_entry_price)
             except Exception as exc:
+                _raise_if_infra(exc, "get_position", ticker)
                 print(f"  [REBALANCER] Could not fetch avg_entry_price for {ticker}: {exc} — using current price as fallback")
                 entry_price_for_exit = float(price)
 
@@ -187,6 +193,7 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
             try:
                 equity = float(api.get_account().equity)
             except Exception as exc:
+                _raise_if_infra(exc, "get_account", ticker)
                 print(f"  [REBALANCER] Equity refresh failed after {ticker} trim: {exc}")
 
             outcomes.append({
@@ -200,6 +207,7 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
             })
 
         except Exception as exc:
+            _raise_if_infra(exc, "submit_order", ticker)
             print(f"  [REBALANCER] {ticker} trim order failed: {exc}")
             # Note: no log_exit() on order failure — no position closed, nothing to log.
             # The outcome dict below records the failure for Discord summary.

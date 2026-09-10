@@ -169,6 +169,10 @@ HALT_FLAG_PRESENT              = "HALT_FLAG_PRESENT"
 BUY_SKIPPED_HALT               = "BUY_SKIPPED_HALT"
 REBALANCER_SKIPPED_HALT        = "REBALANCER_SKIPPED_HALT"
 
+# Logged when an Alpaca API call fails with a non-recoverable infrastructure
+# error (5xx, 429, auth, network) and the session halts to avoid blind trading.
+ALPACA_INFRA_HALT = "ALPACA_INFRA_HALT"
+
 # Maximum fraction of total portfolio value allowed in any single position.
 # Used by capital_allocator.py to compute headroom before adding to a position.
 MAX_POSITION_PCT = 0.08
