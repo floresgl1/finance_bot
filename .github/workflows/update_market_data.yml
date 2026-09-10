@@ -1,10 +1,12 @@
 name: Update Market Data
 
-# Runs at 12:00 PM UTC on every weekday (Mon–Fri).
-# Can also be triggered manually from the Actions tab.
+# Primary run at 12:00 PM UTC Mon–Fri; backup at 12:30 in case GHA skips the
+# first schedule.  The workflow is idempotent — a second run just re-uploads
+# the same CSVs.  Can also be triggered manually from the Actions tab.
 on:
   schedule:
-    - cron: '0 12 * * 1-5'
+    - cron: '0 12 * * 1-5'    # primary
+    - cron: '30 12 * * 1-5'   # backup
   workflow_dispatch:
 
 jobs:
