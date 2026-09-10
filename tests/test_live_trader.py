@@ -31,6 +31,8 @@ from live_trader import (
     _write_run_guard,
     _read_peak_equity,
     _write_peak_equity,
+    _wait_for_fill,
+    _cancel_order_best_effort,
     check_portfolio_loss_limits,
     check_peak_drawdown,
     check_market_data_freshness,
@@ -680,15 +682,20 @@ def test_compute_buy_qty_never_negative():
 # ---------------------------------------------------------------------------
 
 
-def test_buy_attaches_a_stop_loss_child_at_the_configured_pct():
+def test_buy_attaches_a_stop_loss_child_at_the_configured_pct(monkeypatch):
     """Every BUY must ship with standing downside protection."""
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
     api = MagicMock()
     api.get_latest_trade.return_value.price = 200.0
     api.submit_order.return_value.id = "order-1"
+    api.get_order.return_value = _order("order-1", status="filled")
 
     result = place_buy(api, "AAPL", 10)
 
-    assert result["status"] == "placed"
+    assert result["status"] == "filled"
     kwargs = api.submit_order.call_args.kwargs
     assert kwargs["order_class"] == "oto"
     assert kwargs["time_in_force"] == "gtc"   # required for a standing child
@@ -718,13 +725,18 @@ def test_buy_error_is_captured_not_raised():
     assert "insufficient buying power" in result["reason"]
 
 
-def test_sell_submits_a_day_market_order():
+def test_sell_submits_a_day_market_order(monkeypatch):
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
     api = MagicMock()
     api.submit_order.return_value.id = "order-2"
+    api.get_order.return_value = _order("order-2", status="filled")
 
     result = place_sell(api, "AAPL", 10)
 
-    assert result == {"status": "placed", "order_id": "order-2"}
+    assert result == {"status": "filled", "order_id": "order-2"}
     kwargs = api.submit_order.call_args.kwargs
     assert kwargs["side"] == "sell"
     assert kwargs["type"] == "market"
@@ -856,3 +868,278 @@ def test_read_last_close_returns_none_when_missing(data_dir):
 def test_read_last_close_returns_none_on_malformed_csv(data_dir):
     (data_dir / "AAPL.csv").write_text("Date,NotClose\n2026-09-08,1\n")
     assert read_last_close("AAPL") is None
+
+
+# ---------------------------------------------------------------------------
+# Order fill verification — _wait_for_fill
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_fill_returns_on_filled(monkeypatch):
+    """Immediate fill on first poll."""
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    # time.time() must stay within the deadline
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    filled_order = _order("o1", status="filled")
+    api.get_order.return_value = filled_order
+
+    result = _wait_for_fill(api, "o1")
+    assert result is filled_order
+
+
+def test_wait_for_fill_returns_on_partially_filled(monkeypatch):
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    partial = _order("o1", status="partially_filled")
+    api.get_order.return_value = partial
+
+    assert _wait_for_fill(api, "o1") is partial
+
+
+def test_wait_for_fill_returns_none_on_rejected(monkeypatch):
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    api.get_order.return_value = _order("o1", status="rejected")
+
+    assert _wait_for_fill(api, "o1") is None
+
+
+def test_wait_for_fill_returns_none_on_timeout(monkeypatch):
+    """Clock expires before the order moves out of 'new'."""
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 5.0, 11.0])  # third tick is past the 10s deadline
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    api.get_order.return_value = _order("o1", status="new")
+
+    assert _wait_for_fill(api, "o1") is None
+
+
+def test_wait_for_fill_retries_after_poll_error(monkeypatch):
+    """A transient API error doesn't abort — the loop retries."""
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 1.0, 2.0, 3.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    filled = _order("o1", status="filled")
+    api.get_order.side_effect = [Exception("transient"), filled]
+
+    assert _wait_for_fill(api, "o1") is filled
+    assert api.get_order.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _cancel_order_best_effort
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_best_effort_swallows_errors():
+    api = MagicMock()
+    api.cancel_order.side_effect = Exception("already canceled")
+
+    # Must not raise
+    _cancel_order_best_effort(api, "o1")
+    api.cancel_order.assert_called_once_with("o1")
+
+
+# ---------------------------------------------------------------------------
+# place_buy — fill verification integration
+# ---------------------------------------------------------------------------
+
+
+def test_buy_returns_filled_on_immediate_fill(monkeypatch):
+    """Happy path: submit → poll → filled on first attempt."""
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    api.get_latest_trade.return_value.price = 200.0
+    api.submit_order.return_value.id = "order-1"
+    api.get_order.return_value = _order("order-1", status="filled")
+
+    result = place_buy(api, "AAPL", 10)
+
+    assert result["status"] == "filled"
+    assert result["order_id"] == "order-1"
+    api.submit_order.assert_called_once()
+
+
+def test_buy_retries_once_and_fills_on_second_attempt(monkeypatch):
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    # First attempt: times out. Second attempt: fills immediately.
+    # _wait_for_fill is called twice. We need time ticks for each.
+    # Attempt 1: start=0, poll=5, deadline check=11 (timeout)
+    # Attempt 2: start=12, poll=13 (filled before deadline)
+    ticks = iter([0.0, 5.0, 11.0, 12.0, 13.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    api.get_latest_trade.return_value.price = 200.0
+    order1 = MagicMock(); order1.id = "order-1"
+    order2 = MagicMock(); order2.id = "order-2"
+    api.submit_order.side_effect = [order1, order2]
+
+    new_order = _order("order-1", status="new")
+    filled_order = _order("order-2", status="filled")
+    api.get_order.side_effect = [new_order, filled_order]
+
+    result = place_buy(api, "AAPL", 10)
+
+    assert result["status"] == "filled"
+    assert result["order_id"] == "order-2"
+    assert api.submit_order.call_count == 2
+    api.cancel_order.assert_called_once_with("order-1")
+
+
+@patch.object(live_trader, "send_discord")
+def test_buy_unfilled_sends_discord_alert(mock_discord, monkeypatch):
+    """Both attempts time out → status='unfilled', Discord alert sent."""
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    # Both attempts time out
+    ticks = iter([0.0, 5.0, 11.0, 12.0, 17.0, 23.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    api.get_latest_trade.return_value.price = 200.0
+    order1 = MagicMock(); order1.id = "order-1"
+    order2 = MagicMock(); order2.id = "order-2"
+    api.submit_order.side_effect = [order1, order2]
+    api.get_order.return_value = _order("stuck", status="new")
+
+    result = place_buy(api, "AAPL", 10)
+
+    assert result["status"] == "unfilled"
+    mock_discord.assert_called_once()
+    assert "BUY UNFILLED" in mock_discord.call_args[0][0]
+
+
+def test_buy_submit_error_returns_error_without_retry(monkeypatch):
+    """If submit_order itself raises, don't retry."""
+    api = MagicMock()
+    api.get_latest_trade.return_value.price = 200.0
+    api.submit_order.side_effect = Exception("insufficient buying power")
+
+    result = place_buy(api, "AAPL", 10)
+
+    assert result["status"] == "error"
+    assert "insufficient buying power" in result["reason"]
+    api.submit_order.assert_called_once()
+
+
+def test_buy_still_attaches_stop_loss_child():
+    """Fill verification must not break the OTO stop-loss attachment."""
+    api = MagicMock()
+    api.get_latest_trade.return_value.price = 200.0
+    api.submit_order.return_value.id = "order-1"
+    api.get_order.return_value = _order("order-1", status="filled")
+
+    # Freeze time so _wait_for_fill succeeds immediately
+    with patch.object(live_trader.time, "time", side_effect=[0.0, 1.0]):
+        with patch.object(live_trader.time, "sleep", lambda _: None):
+            place_buy(api, "AAPL", 10)
+
+    kwargs = api.submit_order.call_args.kwargs
+    assert kwargs["order_class"] == "oto"
+    expected_stop = round(200.0 * (1.0 - config.STOP_LOSS_PCT), 2)
+    assert kwargs["stop_loss"] == {"stop_price": expected_stop}
+
+
+# ---------------------------------------------------------------------------
+# place_sell — fill verification integration
+# ---------------------------------------------------------------------------
+
+
+def test_sell_returns_filled_on_immediate_fill(monkeypatch):
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    api.submit_order.return_value.id = "order-2"
+    api.get_order.return_value = _order("order-2", status="filled")
+
+    result = place_sell(api, "AAPL", 10)
+
+    assert result["status"] == "filled"
+    assert result["order_id"] == "order-2"
+
+
+def test_sell_retries_once_and_fills_on_second_attempt(monkeypatch):
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 5.0, 11.0, 12.0, 13.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    order1 = MagicMock(); order1.id = "sell-1"
+    order2 = MagicMock(); order2.id = "sell-2"
+    api.submit_order.side_effect = [order1, order2]
+    api.get_order.side_effect = [
+        _order("sell-1", status="new"),
+        _order("sell-2", status="filled"),
+    ]
+
+    result = place_sell(api, "AAPL", 10)
+
+    assert result["status"] == "filled"
+    assert result["order_id"] == "sell-2"
+    api.cancel_order.assert_called_once_with("sell-1")
+
+
+@patch.object(live_trader, "send_discord")
+def test_sell_unfilled_sends_discord_alert(mock_discord, monkeypatch):
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 5.0, 11.0, 12.0, 17.0, 23.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    order1 = MagicMock(); order1.id = "sell-1"
+    order2 = MagicMock(); order2.id = "sell-2"
+    api.submit_order.side_effect = [order1, order2]
+    api.get_order.return_value = _order("stuck", status="new")
+
+    result = place_sell(api, "AAPL", 10)
+
+    assert result["status"] == "unfilled"
+    mock_discord.assert_called_once()
+    assert "SELL UNFILLED" in mock_discord.call_args[0][0]
+
+
+def test_sell_submits_day_market_order_with_fill_verification(monkeypatch):
+    """Fill verification must not change the order parameters."""
+    monkeypatch.setattr(live_trader.time, "sleep", lambda _: None)
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(live_trader.time, "time", lambda: next(ticks))
+
+    api = MagicMock()
+    api.submit_order.return_value.id = "order-2"
+    api.get_order.return_value = _order("order-2", status="filled")
+
+    place_sell(api, "AAPL", 10)
+
+    kwargs = api.submit_order.call_args.kwargs
+    assert kwargs["side"] == "sell"
+    assert kwargs["type"] == "market"
+    assert kwargs["time_in_force"] == "day"
+
+
+def test_sell_submit_error_returns_error_without_retry():
+    api = MagicMock()
+    api.submit_order.side_effect = Exception("position not found")
+
+    result = place_sell(api, "AAPL", 10)
+
+    assert result["status"] == "error"
+    assert "position not found" in result["reason"]
+    api.submit_order.assert_called_once()
