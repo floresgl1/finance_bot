@@ -1,0 +1,219 @@
+name: Pre-Trade Agent Run
+
+# Phase 2 of the three-phase pipeline. Runs at 14:15 UTC (weekdays only),
+# after generate_signals.py writes pending_signals.json on PA at 14:00,
+# and before live_trader.py executes at 15:00.
+#
+# Downloads pending_signals.json from PA, evaluates each signal via the
+# LLM agent (Groq + Tavily), then uploads two files back to PA:
+#   1. agent_decisions.json       — {ticker: verdict} map read by live_trader.py
+#   2. {date}_pretrade.json       — full run artifact for analysis
+#
+# Permissive: if this workflow fails entirely, live_trader.py defaults to
+# ABSTAIN for all tickers (trades anyway). A VETO in agent_decisions.json
+# blocks the corresponding trade.
+on:
+  schedule:
+    - cron: '15 14 * * 1-5'
+  workflow_dispatch:
+
+# Separate concurrency group from agent-daily so they can't block each other.
+concurrency:
+  group: agent-pretrade
+  cancel-in-progress: false
+
+jobs:
+  run-pretrade-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/swift
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ------------------------------------------------------------------
+      # Download pending_signals.json from PythonAnywhere.
+      # 404 is normal when generate_signals.py didn't run (weekend, no
+      # signals, PA task failure). The agent writes an empty decisions
+      # file so live_trader.py sees ABSTAIN for all.
+      # ------------------------------------------------------------------
+      - name: Download pending_signals.json from PythonAnywhere
+        id: download_signals
+        env:
+          PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+        run: |
+          python - <<'PYEOF'
+          import os
+          import sys
+
+          import requests
+
+          token    = os.environ["PYTHONANYWHERE_TOKEN"]
+          username = os.environ["PYTHONANYWHERE_USERNAME"]
+          remote   = f"/home/{username}/finance_bot/data/pending_signals.json"
+          local    = os.path.join("data", "pending_signals.json")
+
+          os.makedirs("data", exist_ok=True)
+
+          url  = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{remote}"
+          resp = requests.get(
+              url,
+              headers={"Authorization": f"Token {token}"},
+              timeout=30,
+          )
+
+          if resp.status_code == 404:
+              print("[WARN] pending_signals.json not found on PythonAnywhere.")
+              print("[WARN] Phase 1 may not have run. Agent will write empty decisions.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+                  gh.write("has_signals=false\n")
+              sys.exit(0)
+
+          resp.raise_for_status()
+
+          with open(local, "wb") as fh:
+              fh.write(resp.content)
+
+          print(f"[OK] Downloaded pending_signals.json ({len(resp.content):,} bytes)")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+              gh.write("has_signals=true\n")
+          PYEOF
+
+      # ------------------------------------------------------------------
+      # Run the pre-trade agent. continue-on-error so uploads still run.
+      # ------------------------------------------------------------------
+      - name: Run pre-trade agent
+        id: agent_run
+        continue-on-error: true
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python agent_pretrade_main.py
+
+      # ------------------------------------------------------------------
+      # Upload agent_decisions.json to PythonAnywhere.
+      # This is the critical file — live_trader.py reads it at 15:00.
+      # `if: always()` so even a partial run uploads what it has.
+      # ------------------------------------------------------------------
+      - name: Upload agent_decisions.json to PythonAnywhere
+        if: always()
+        env:
+          PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+        run: |
+          python - <<'PYEOF'
+          import os
+          import sys
+
+          import requests
+
+          token    = os.environ["PYTHONANYWHERE_TOKEN"]
+          username = os.environ["PYTHONANYWHERE_USERNAME"]
+          local    = os.path.join("data", "agent_decisions.json")
+          remote   = f"/home/{username}/finance_bot/data/agent_decisions.json"
+
+          if not os.path.exists(local):
+              print(f"[WARN] {local} not found — agent never wrote decisions.")
+              print("[WARN] live_trader.py will default to ABSTAIN for all tickers.")
+              sys.exit(0)
+
+          url = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{remote}"
+
+          try:
+              with open(local, "rb") as fh:
+                  resp = requests.post(
+                      url,
+                      headers={"Authorization": f"Token {token}"},
+                      files={"content": fh},
+                      timeout=60,
+                  )
+          except requests.exceptions.RequestException as exc:
+              print(f"[ERROR] Upload request failed: {exc}")
+              sys.exit(1)
+
+          if resp.status_code in (200, 201):
+              print(f"[OK] Uploaded {local} -> {remote}")
+          else:
+              print(f"[ERROR] Upload failed — HTTP {resp.status_code}: {resp.text.strip()}")
+              sys.exit(1)
+          PYEOF
+
+      # ------------------------------------------------------------------
+      # Upload the full pretrade run artifact for analysis.
+      # Not critical — live_trader.py does not read this file.
+      # ------------------------------------------------------------------
+      - name: Upload pretrade run JSON to PythonAnywhere
+        if: always()
+        env:
+          PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+        run: |
+          python - <<'PYEOF'
+          import datetime
+          import os
+          import sys
+
+          import requests
+
+          token    = os.environ["PYTHONANYWHERE_TOKEN"]
+          username = os.environ["PYTHONANYWHERE_USERNAME"]
+          run_date = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+          local    = os.path.join("data", "agent_runs", f"{run_date}_pretrade.json")
+          remote   = f"/home/{username}/finance_bot/data/agent_runs/{run_date}_pretrade.json"
+
+          if not os.path.exists(local):
+              print(f"[WARN] {local} not found — skipping upload.")
+              sys.exit(0)
+
+          url = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{remote}"
+
+          try:
+              with open(local, "rb") as fh:
+                  resp = requests.post(
+                      url,
+                      headers={"Authorization": f"Token {token}"},
+                      files={"content": fh},
+                      timeout=60,
+                  )
+          except requests.exceptions.RequestException as exc:
+              print(f"[ERROR] Upload request failed: {exc}")
+              sys.exit(1)
+
+          if resp.status_code in (200, 201):
+              print(f"[OK] Uploaded {local} -> {remote}")
+          else:
+              print(f"[ERROR] Upload failed — HTTP {resp.status_code}: {resp.text.strip()}")
+              sys.exit(1)
+          PYEOF
+
+      # ------------------------------------------------------------------
+      # Re-raise the agent's exit code so the workflow shows red on failure.
+      # ------------------------------------------------------------------
+      - name: Report agent exit status
+        if: always()
+        run: |
+          if [ "${{ steps.agent_run.outcome }}" = "failure" ]; then
+            echo "Pre-trade agent run reported failure"
+            exit 1
+          fi
