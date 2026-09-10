@@ -276,6 +276,23 @@ jobs:
         run: python pnl_report.py --discord
 
       # ------------------------------------------------------------------
+      # Post-trade analysis agent — LLM-powered pattern detection over
+      # the last 30 days of evaluated signals. Correlates SHAP feature
+      # drivers with WIN/LOSS outcomes to surface toxic combos, ticker
+      # underperformance, and confidence miscalibration. Read-only: it
+      # posts findings to Discord but never modifies any data.
+      #
+      # Reads the same signal_log.csv already downloaded above. Needs
+      # GROQ_API_KEY for the LLM call (same as the pre-trade agent).
+      # ------------------------------------------------------------------
+      - name: Run post-trade analysis agent
+        if: steps.download.outputs.has_data == 'true'
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python agent_posttrade.py --discord
+
+      # ------------------------------------------------------------------
       # Live performance vs buy-and-hold. Every other return figure in this
       # project is simulated; this one is the account's own equity curve
       # against holding the same basket over the same dates.
