@@ -87,6 +87,19 @@ CSV_INVALID_SKIP = "CSV_INVALID_SKIP"
 # validates BUY/SELL theses.
 AGENT_ELIGIBLE_ACTIONS = {"BUY", "ADD_TO_POSITION", "SELL"}
 
+# Logged when a BUY or SELL signal is blocked by the pre-trade news-validation
+# agent (agent_decisions.json carries a VETO for the ticker). Same pattern as
+# EARNINGS_VETO and SENTIMENT_VETO but applied after get_signals() returns,
+# before the execution loop.
+AGENT_VETO = "AGENT_VETO"
+
+# --- Pre-trade agent integration (three-phase pipeline) -------------------
+# Phase 1 (generate_signals.py, PA 14:00 UTC) writes surviving BUY/SELL
+# signals here so Phase 2 (agent_pretrade.yml, GHA 14:15 UTC) can evaluate
+# them. Phase 3 (live_trader.py, PA 15:00 UTC) reads agent decisions.
+PENDING_SIGNALS_PATH  = os.path.join(_REPO_ROOT, "data", "pending_signals.json")
+AGENT_DECISIONS_PATH  = os.path.join(_REPO_ROOT, "data", "agent_decisions.json")
+
 # Logged when capital_allocator receives a price of zero or negative, making share
 # sizing impossible.
 INVALID_PRICE_SKIP = "INVALID_PRICE_SKIP"
