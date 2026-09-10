@@ -1516,10 +1516,13 @@ def test_check_fill_after_cancel_infra_error_raises():
 # ---------------------------------------------------------------------------
 
 
-def _patch_get_signals_deps(monkeypatch, watchlist, predict_side_effect):
+def _patch_get_signals_deps(monkeypatch, watchlist, predict_side_effect,
+                            is_stale_fn=None):
     """Set up the mocks for get_signals() tests.
 
     predict_side_effect — a list of return values / exceptions, one per ticker.
+    is_stale_fn         — optional callable(ticker) -> (bool, int).  Defaults
+                          to (False, 0) for every ticker.
 
     get_signals() does deferred imports from ``predictor`` and ``features``
     inside the function body.  We inject a fake ``predictor`` module into
@@ -1530,9 +1533,12 @@ def _patch_get_signals_deps(monkeypatch, watchlist, predict_side_effect):
     import sys
     import types
 
+    if is_stale_fn is None:
+        is_stale_fn = lambda t: (False, 0)
+
     fake_predictor = types.ModuleType("predictor")
     fake_predictor.load_model = lambda: MagicMock()
-    fake_predictor.is_ticker_stale = lambda t: (False, 0)
+    fake_predictor.is_ticker_stale = is_stale_fn
     fake_predictor.get_recent_earnings_surprise = lambda t: None
     fake_predictor.apply_earnings_veto = lambda signal, surprise: (signal, "")
     fake_predictor.apply_sentiment_veto = lambda signal, score: (signal, "")
@@ -1698,3 +1704,94 @@ def test_partial_signal_errors_do_not_halt(monkeypatch, tmp_path):
     # The SIGNAL_ERROR discord alert should NOT have fired
     fatal_alerts = [m for m in discord_calls if "All" in m and "SIGNAL_ERROR" in m]
     assert fatal_alerts == []
+
+
+# ---------------------------------------------------------------------------
+# Scenario B — all tickers stale
+# ---------------------------------------------------------------------------
+
+def test_all_stale_sends_discord_warning_and_exits_zero(monkeypatch, tmp_path):
+    """When every ticker is stale, Discord gets a warning and exit code is 0."""
+    from live_trader import _run_execution
+
+    # --- stub out everything _run_execution calls before get_signals ---
+    monkeypatch.setattr(live_trader, "check_portfolio_loss_limits", lambda *a, **kw: (False, ""))
+    monkeypatch.setattr(live_trader, "check_peak_drawdown", lambda *a, **kw: (False, ""))
+    monkeypatch.setattr(live_trader, "_check_halt_flag", lambda: False)
+    monkeypatch.setattr(live_trader, "check_market_data_freshness", lambda: True)
+    monkeypatch.setattr(live_trader, "check_position_limits", lambda api, owned: ([], owned))
+    monkeypatch.setattr(live_trader, "get_owned_tickers", lambda api: {})
+    monkeypatch.setattr(live_trader, "get_equity", lambda api: 100_000.0)
+    monkeypatch.setattr(live_trader, "get_cooldown_tickers", lambda: set())
+
+    monkeypatch.setattr(config, "PORTFOLIO_SNAPSHOT_PATH", str(tmp_path / "snap.json"))
+    monkeypatch.setattr(config, "PEAK_EQUITY_PATH", str(tmp_path / "peak.json"))
+    monkeypatch.setattr(config, "LAST_RUN_GUARD_PATH", str(tmp_path / "guard.txt"))
+
+    # All tickers stale — predict_ticker is never called (stale check fires first)
+    _patch_get_signals_deps(
+        monkeypatch,
+        watchlist=["AAPL", "MSFT"],
+        predict_side_effect=[],          # not reached
+        is_stale_fn=lambda t: (True, 8),  # 8 days old — past STALE_DAYS
+    )
+    monkeypatch.setattr(live_trader, "read_last_close", lambda t: 150.0)
+
+    discord_calls = []
+    monkeypatch.setattr(live_trader, "send_discord", lambda msg: discord_calls.append(msg))
+    monkeypatch.setattr("signal_logger.log_signal", lambda *a, **kw: None)
+
+    api = MagicMock()
+    with pytest.raises(SystemExit) as exc_info:
+        _run_execution(api)
+
+    assert exc_info.value.code == 0
+    assert len(discord_calls) >= 1
+    assert "ALL_STALE" in discord_calls[-1]
+    assert "AAPL" in discord_calls[-1]
+    assert "MSFT" in discord_calls[-1]
+    assert "data_collector" in discord_calls[-1]
+
+
+def test_mixed_stale_and_errors_reports_both(monkeypatch, tmp_path):
+    """When some tickers are stale and the rest error, Scenario A fires
+    but the Discord message mentions the stale count too."""
+    from live_trader import _run_execution
+
+    monkeypatch.setattr(live_trader, "check_portfolio_loss_limits", lambda *a, **kw: (False, ""))
+    monkeypatch.setattr(live_trader, "check_peak_drawdown", lambda *a, **kw: (False, ""))
+    monkeypatch.setattr(live_trader, "_check_halt_flag", lambda: False)
+    monkeypatch.setattr(live_trader, "check_market_data_freshness", lambda: True)
+    monkeypatch.setattr(live_trader, "check_position_limits", lambda api, owned: ([], owned))
+    monkeypatch.setattr(live_trader, "get_owned_tickers", lambda api: {})
+    monkeypatch.setattr(live_trader, "get_equity", lambda api: 100_000.0)
+    monkeypatch.setattr(live_trader, "get_cooldown_tickers", lambda: set())
+
+    monkeypatch.setattr(config, "PORTFOLIO_SNAPSHOT_PATH", str(tmp_path / "snap.json"))
+    monkeypatch.setattr(config, "PEAK_EQUITY_PATH", str(tmp_path / "peak.json"))
+    monkeypatch.setattr(config, "LAST_RUN_GUARD_PATH", str(tmp_path / "guard.txt"))
+
+    # AAPL is stale, MSFT hits a prediction error
+    stale_map = {"AAPL": (True, 8), "MSFT": (False, 0)}
+    _patch_get_signals_deps(
+        monkeypatch,
+        watchlist=["AAPL", "MSFT"],
+        predict_side_effect=[_TickerError("model crash")],  # only MSFT reaches predict
+        is_stale_fn=lambda t: stale_map[t],
+    )
+    monkeypatch.setattr(live_trader, "read_last_close", lambda t: 100.0)
+
+    discord_calls = []
+    monkeypatch.setattr(live_trader, "send_discord", lambda msg: discord_calls.append(msg))
+    monkeypatch.setattr("signal_logger.log_signal", lambda *a, **kw: None)
+
+    api = MagicMock()
+    with pytest.raises(SystemExit) as exc_info:
+        _run_execution(api)
+
+    # Scenario A fires (exit 1) because there are error_sigs
+    assert exc_info.value.code == 1
+    assert any("SIGNAL_ERROR" in m for m in discord_calls)
+    # The message should mention the stale ticker count
+    error_msg = [m for m in discord_calls if "SIGNAL_ERROR" in m][-1]
+    assert "stale" in error_msg.lower()

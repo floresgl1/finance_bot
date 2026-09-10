@@ -1567,14 +1567,29 @@ def _run_execution(api: tradeapi.REST) -> None:
 
     if not signals and error_sigs:
         failed_tickers = ", ".join(r["ticker"] for r in error_sigs)
+        stale_note = (
+            f" ({len(stale_sigs)} additional ticker(s) stale)"
+            if stale_sigs else ""
+        )
         send_discord(
             f"🚨 **[SIGNAL_ERROR]** All {len(error_sigs)} ticker(s) failed during "
-            f"signal generation — no trades possible this session.\n"
+            f"signal generation — no trades possible this session.{stale_note}\n"
             f"Failed: {failed_tickers}\n"
             f"Check prediction pipeline (CSVs, features, model file)."
         )
         print(f"  [FATAL] All tickers failed signal generation: {failed_tickers}")
         sys.exit(1)
+
+    if not signals and stale_sigs:
+        stale_tickers = ", ".join(r["ticker"] for r in stale_sigs)
+        send_discord(
+            f"⚠️ **[ALL_STALE]** All {len(stale_sigs)} ticker(s) have stale data — "
+            f"no tradeable signals this session.\n"
+            f"Stale: {stale_tickers}\n"
+            f"Check data_collector.py ran successfully."
+        )
+        print(f"  [ALL_STALE] No tradeable signals — all tickers stale: {stale_tickers}")
+        sys.exit(0)
 
     # 4b. Agent veto layer (permissive — missing file = ABSTAIN all)
     agent_decisions = _load_agent_decisions()
