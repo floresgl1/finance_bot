@@ -89,6 +89,7 @@ from config import (
     BUY_UNFILLED,
     SELL_UNFILLED,
     ALPACA_INFRA_HALT,
+    SIGNAL_ERROR,
     today_utc,
 )
 
@@ -761,7 +762,20 @@ def get_signals(sentiment_df=None) -> list[dict]:
             })
         except Exception as exc:
             _raise_if_infra(exc, "get_signals", ticker)
-            print(f"  [SKIP] {ticker} — {exc}")
+            print(f"  [SIGNAL_ERROR] {ticker} — {exc}")
+            last_price = read_last_close(ticker)
+            results.append({
+                "ticker":        ticker,
+                "signal":        SIGNAL_ERROR,
+                "final_signal":  SIGNAL_ERROR,
+                "confidence":    0.0,
+                "current_price": last_price if last_price is not None else 0.0,
+                "sentiment":     0.0,
+                "note":          SIGNAL_ERROR,
+                "veto_reason":   None,
+                "shap_values":   {},
+                "error":         str(exc),
+            })
 
     return results
 
@@ -1543,6 +1557,24 @@ def _run_execution(api: tradeapi.REST) -> None:
     for r in stale_sigs:
         print(f"  [{r['final_signal']}] {r['ticker']} ({r['age_str']}) logged")
         _log_signal_early(r["ticker"], r["final_signal"], r["current_price"], 0, 0.0, r["final_signal"])
+
+    # Separate and log signal errors (per-ticker prediction failures)
+    error_sigs = [s for s in signals if s["final_signal"] == SIGNAL_ERROR]
+    signals    = [s for s in signals if s["final_signal"] != SIGNAL_ERROR]
+    for r in error_sigs:
+        print(f"  [SIGNAL_ERROR] {r['ticker']} — {r['error']} — logged")
+        _log_signal_early(r["ticker"], SIGNAL_ERROR, r["current_price"], 0, 0.0, SIGNAL_ERROR)
+
+    if not signals and error_sigs:
+        failed_tickers = ", ".join(r["ticker"] for r in error_sigs)
+        send_discord(
+            f"🚨 **[SIGNAL_ERROR]** All {len(error_sigs)} ticker(s) failed during "
+            f"signal generation — no trades possible this session.\n"
+            f"Failed: {failed_tickers}\n"
+            f"Check prediction pipeline (CSVs, features, model file)."
+        )
+        print(f"  [FATAL] All tickers failed signal generation: {failed_tickers}")
+        sys.exit(1)
 
     # 4b. Agent veto layer (permissive — missing file = ABSTAIN all)
     agent_decisions = _load_agent_decisions()

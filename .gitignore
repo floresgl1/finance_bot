@@ -9,5 +9,9 @@ myvenv/
 # version-controlled — they encode pipeline invariants worth sharing.
 .claude/*
 !.claude/agents/
-data/last_run_date.txtdata/edge_probe/
+data/last_run_date.txt
+data/edge_probe/
 data/edge_probe_results.json
+portfolio_snapshot.json
+HALT_FLAG.txt
+data/peak_equity.json

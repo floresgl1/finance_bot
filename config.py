@@ -85,6 +85,11 @@ STALE_SKIP = "STALE_SKIP"
 # Logged when a ticker's CSV is completely missing or its Close price cannot be read.
 CSV_INVALID_SKIP = "CSV_INVALID_SKIP"
 
+# Logged when predict_ticker (or its feature pipeline) raises a per-ticker exception
+# that is not an infrastructure error. The ticker is skipped for the session but the
+# failure is recorded in signal_log.csv, unlike the previous silent [SKIP] print.
+SIGNAL_ERROR = "SIGNAL_ERROR"
+
 # Gates which signal_log rows the news-validation agent will pick up. Only
 # rows whose actual_action represents a real model-driven trade attempt are
 # eligible — skip codes (NOT_OWNED, INSUFFICIENT_EQUITY, REBALANCER_TICKERS_SKIP,
