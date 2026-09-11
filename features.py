@@ -7,7 +7,7 @@ warm-up NaN rows before returning the final feature matrix.
 """
 
 import os
-from functools import lru_cache
+import time
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,13 @@ import ta
 from config import DATA_DIR, WATCHLIST
 
 MARKET_DATA_DIR = os.path.join(DATA_DIR, "market")
+
+# TTL cache for market close data.  5 minutes is short enough that a daily
+# CSV refresh is picked up promptly in the long-lived Streamlit dashboard,
+# and long enough that a single prediction pass (12 tickers sharing 4–5
+# market symbols) reads each file only once.
+MARKET_CACHE_TTL_SECONDS = 300
+_market_close_cache: dict[str, tuple[pd.Series, float]] = {}
 
 
 class StaleMarketDataError(Exception):
@@ -35,7 +42,6 @@ SECTOR_MAP = {
 }
 
 
-@lru_cache(maxsize=None)
 def _load_market_close(symbol: str) -> pd.Series:
     """
     Load and cache the full Close price series for a market symbol from
@@ -44,9 +50,18 @@ def _load_market_close(symbol: str) -> pd.Series:
     Raises FileNotFoundError immediately with a clear message if the CSV is
     missing — run market_data_collector.py to generate it.
 
-    Results are memoised so tickers sharing a sector ETF (e.g. all XLK stocks)
-    only trigger one file read per session.
+    Results are cached with a TTL (MARKET_CACHE_TTL_SECONDS, default 5 min)
+    so tickers sharing a sector ETF (e.g. all XLK stocks) only trigger one
+    file read per batch, while long-lived processes like the Streamlit
+    dashboard automatically pick up refreshed CSVs.
     """
+    now = time.monotonic()
+    cached = _market_close_cache.get(symbol)
+    if cached is not None:
+        series, cached_at = cached
+        if now - cached_at < MARKET_CACHE_TTL_SECONDS:
+            return series
+
     filename = f"{symbol}.csv"
     path = os.path.join(MARKET_DATA_DIR, filename)
 
@@ -84,7 +99,19 @@ def _load_market_close(symbol: str) -> pd.Series:
             f"behind today (>3 bday tolerance). Layer 1 pipeline gate should have caught this."
         )
 
+    _market_close_cache[symbol] = (close, now)
     return close
+
+
+def _cache_clear():
+    """Drop all cached market close data.  Provided for test isolation and
+    manual cache invalidation — mirrors the old @lru_cache interface."""
+    _market_close_cache.clear()
+
+
+# Attach as an attribute so existing callers (_load_market_close.cache_clear())
+# keep working without changes.
+_load_market_close.cache_clear = _cache_clear
 
 
 def _download_close(symbol: str, start: str, end: str) -> pd.Series:

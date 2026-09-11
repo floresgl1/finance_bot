@@ -229,6 +229,35 @@ def test_market_close_is_memoised(data_env):
     assert first is second
 
 
+def test_ttl_cache_re_reads_after_expiry(data_env, monkeypatch):
+    """After MARKET_CACHE_TTL_SECONDS, the cache must re-read the CSV so
+    a long-lived process (Streamlit) picks up refreshed data (Finding 3)."""
+    first = _load_market_close("SPY")
+
+    # Overwrite the CSV with different data
+    today = date.today()
+    new_rows = _price_rows(today, rows=120)
+    new_rows["Close"] = 999.99
+    new_rows.to_csv(data_env / "market" / "SPY.csv", index=False)
+
+    # Within TTL: should still return the cached (old) series
+    second = _load_market_close("SPY")
+    assert second is first
+
+    # Advance time past the TTL by patching time.monotonic
+    import time
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(
+        time, "monotonic",
+        lambda: real_monotonic() + features.MARKET_CACHE_TTL_SECONDS + 1,
+    )
+
+    # After TTL: should re-read and return the new data
+    third = _load_market_close("SPY")
+    assert third is not first
+    assert third.iloc[-1] == pytest.approx(999.99)
+
+
 def test_tz_aware_market_csv_is_normalised(data_env):
     """CSVs written with a UTC index must not break the merge."""
     rows = _price_rows(date.today())
