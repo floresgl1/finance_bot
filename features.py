@@ -228,20 +228,26 @@ def add_features(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     vix_close    = vix_raw.reindex(df.index, method="ffill")
 
     # --- Market context: SPY ---
-    df["SPY_Return"]   = spy_close.pct_change(periods=7)
-    spy_return_20d     = spy_close.pct_change(periods=20)
+    # NOTE: "periods" counts trading rows, not calendar days. Weekend and
+    # holiday rows are absent, so periods=7 ≈ 9–11 calendar days depending
+    # on the week.  The model trains on this definition so the mismatch is
+    # internally consistent — but SHAP explanations and any external
+    # comparison against calendar-day returns should account for the wider
+    # window.  (Same caveat applies to Sector_Return_5d and VIX_Change.)
+    df["SPY_Return"]   = spy_close.pct_change(periods=7)   # ~7 trading days
+    spy_return_20d     = spy_close.pct_change(periods=20)   # ~20 trading days
     df["Rel_Strength"] = df["Return_20d"] - spy_return_20d
 
     # --- Sector momentum ---
-    df["Sector_Return_5d"]  = sector_close.pct_change(periods=5)
-    df["Sector_Return_20d"] = sector_close.pct_change(periods=20)
-    # Positive = stock outperforming its sector over 20 days
+    df["Sector_Return_5d"]  = sector_close.pct_change(periods=5)   # ~5 trading days ≈ 7 calendar
+    df["Sector_Return_20d"] = sector_close.pct_change(periods=20)  # ~20 trading days
+    # Positive = stock outperforming its sector over ~20 trading days
     df["Stock_vs_Sector"]   = df["Return_20d"] - df["Sector_Return_20d"]
 
     # --- VIX fear index ---
     df["VIX_Level"]  = vix_close
-    # Rising VIX = increasing market fear; 5-day window captures short-term spikes
-    df["VIX_Change"] = vix_close.pct_change(periods=5)
+    # Rising VIX = increasing market fear; ~5 trading days captures short-term spikes
+    df["VIX_Change"] = vix_close.pct_change(periods=5)     # ~5 trading days ≈ 7 calendar
 
     # Replace inf values with NaN so dropna can catch them
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -302,21 +308,37 @@ def _add_sentiment_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """
     Attempt to merge daily sentiment scores for `ticker` into `df`.
 
-    Reads data/sentiment_TICKER.csv, merges on Date, forward-fills gaps,
-    then falls back to 0.0 for any remaining NaN.  If the CSV doesn't exist
-    both columns are filled with 0.0 and the function returns silently.
+    Reads data/sentiment/sentiment_scores.csv (produced by
+    sentiment_collector.py), filters to rows for this ticker, and merges
+    on Date.  Forward-fills gaps, then falls back to 0.0 for any remaining
+    NaN.  If the CSV doesn't exist or has no rows for this ticker, both
+    columns are filled with 0.0 and the function returns silently.
+
+    NOTE: sent_score_daily and sent_rolling_20d are NOT in FEATURE_COLUMNS
+    and are therefore not used by the model.  They are computed here for
+    dashboard display and future feature experiments.
     """
-    sent_path = os.path.join(DATA_DIR, f"sentiment_{ticker}.csv")
+    sent_path = os.path.join(DATA_DIR, "sentiment", "sentiment_scores.csv")
 
     if os.path.exists(sent_path):
-        sent = pd.read_csv(sent_path, parse_dates=["Date"])
-        sent = sent.set_index("Date")[["sent_score_daily"]]
-        sent_idx = pd.to_datetime(sent.index)
-        if sent_idx.tz is not None:
-            sent.index = sent_idx.tz_convert(None)
-        else:
-            sent.index = sent_idx.tz_localize(None)
-        df = df.join(sent, how="left")
+        try:
+            all_sent = pd.read_csv(sent_path)
+            ticker_sent = all_sent[all_sent["Ticker"] == ticker].copy()
+
+            if not ticker_sent.empty:
+                ticker_sent["Date"] = pd.to_datetime(ticker_sent["Date"])
+                ticker_sent = ticker_sent.set_index("Date")[["sentiment_score"]]
+                ticker_sent = ticker_sent.rename(columns={"sentiment_score": "sent_score_daily"})
+                sent_idx = ticker_sent.index
+                if sent_idx.tz is not None:
+                    ticker_sent.index = sent_idx.tz_convert(None)
+                else:
+                    ticker_sent.index = sent_idx.tz_localize(None)
+                df = df.join(ticker_sent, how="left")
+            else:
+                df["sent_score_daily"] = float("nan")
+        except Exception:
+            df["sent_score_daily"] = float("nan")
     else:
         df["sent_score_daily"] = float("nan")
 
