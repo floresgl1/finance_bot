@@ -239,3 +239,60 @@ def test_tz_aware_market_csv_is_normalised(data_env):
     close = _load_market_close("SPY")
 
     assert close.index.tz is None
+
+
+# --- overlap trim (Finding 1) --------------------------------------------
+
+
+def test_overlap_trim_removes_leading_rows_when_market_starts_later(data_env, capsys):
+    """When a market series starts later than the ticker, the ticker's
+    early rows are trimmed to the overlap window rather than silently
+    dropped by dropna after reindex introduces leading NaN."""
+    today = date.today()
+
+    # Ticker has 200 rows of history
+    ticker_rows = _price_rows(today, rows=200)
+    ticker_rows.to_csv(data_env / "AAPL.csv", index=False)
+
+    # SPY starts much later — only 80 rows (overlaps the last ~80 trading days)
+    short_spy = _price_rows(today, rows=80)
+    short_spy.to_csv(data_env / "market" / "SPY.csv", index=False)
+    _load_market_close.cache_clear()
+
+    df = load_and_process("AAPL")
+
+    # The result should be shorter because early rows were trimmed
+    # (not because dropna silently ate them).  The exact count depends
+    # on indicator warm-up, but it must be < 200 minus warm-up.
+    assert len(df) > 0
+
+    # The trim message should appear in stdout
+    captured = capsys.readouterr()
+    assert "OVERLAP_TRIM" in captured.out
+    assert "AAPL" in captured.out
+
+
+def test_no_overlap_trim_when_market_starts_earlier(data_env, capsys):
+    """When all market series cover the full ticker range, no trim fires."""
+    today = date.today()
+    _price_rows(today, rows=120).to_csv(data_env / "AAPL.csv", index=False)
+
+    # Market CSVs (from data_env fixture) already have 120 rows — same range
+    df = load_and_process("AAPL")
+
+    assert len(df) > 0
+    captured = capsys.readouterr()
+    assert "OVERLAP_TRIM" not in captured.out
+
+
+def test_overlap_trim_no_remaining_rows_raises(data_env):
+    """If the ticker's data ends before the market series begin, the trim
+    leaves zero rows and add_features raises rather than returning empty."""
+    today = date.today()
+
+    # Ticker ends 2 years ago — no overlap with market CSVs (which end today)
+    old_ticker = _price_rows(today - timedelta(days=730), rows=60)
+    old_ticker.to_csv(data_env / "AAPL.csv", index=False)
+
+    with pytest.raises(ValueError, match="no rows remain after overlap trim"):
+        load_and_process("AAPL")
