@@ -24,6 +24,16 @@ from sentiment import get_sentiment_all
 
 EARNINGS_DIR = os.path.join(os.path.dirname(__file__), "data", "earnings")
 
+
+class NaNFeatureError(ValueError):
+    """Raised when the latest feature row contains NaN values.
+
+    Carries ``status_code = 422`` so live_trader's infra-error classifier
+    treats it as a per-ticker error (the ticker is skipped and logged as
+    SIGNAL_ERROR) rather than halting the entire session.
+    """
+    status_code = 422
+
 # Ensure the terminal can render the star / warning emoji on Windows.
 #
 # reconfigure() mutates the existing stream rather than replacing it. The
@@ -115,6 +125,14 @@ def predict_ticker(ticker: str, model_bundle: dict) -> dict:
 
     current_price = float(latest["Close"])
     X = latest[FEATURE_COLUMNS].values.reshape(1, -1)
+
+    # Guard: refuse to predict on incomplete data (Finding 8).
+    nan_mask = np.isnan(X[0])
+    if nan_mask.any():
+        bad = [col for col, is_nan in zip(FEATURE_COLUMNS, nan_mask) if is_nan]
+        raise NaNFeatureError(
+            f"{ticker}: {len(bad)} NaN feature(s) — {', '.join(bad)}"
+        )
 
     proba    = model.predict_proba(X)[0]
     top_idx  = int(np.argmax(proba))
