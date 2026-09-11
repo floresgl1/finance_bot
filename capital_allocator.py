@@ -7,7 +7,7 @@ Confidence and headroom checks are performed internally.
 
 Confidence tiers
 ----------------
-    confidence < ADD_TO_POSITION_CONFIDENCE (0.40)  → CONFIDENCE_SKIP
+    confidence < ADD_TO_POSITION_CONFIDENCE_SMALL (0.40)  → CONFIDENCE_SKIP
     0.40 ≤ confidence < 0.50                        → small  (SMALL_POSITION_PCT  = 3 %)
     0.50 ≤ confidence < 0.65                        → normal (NORMAL_POSITION_PCT = 5 %)
     confidence ≥ 0.65                               → large  (LARGE_POSITION_PCT  = 7 %)
@@ -35,7 +35,6 @@ import math
 
 from config import (
     MAX_POSITION_PCT,
-    ADD_TO_POSITION_CONFIDENCE,
     ADD_TO_POSITION_CONFIDENCE_SMALL,
     ADD_TO_POSITION_CONFIDENCE_NORMAL,
     ADD_TO_POSITION_CONFIDENCE_LARGE,
@@ -88,8 +87,11 @@ def check_add_to_position(
     -------
     dict with keys:
         shares_to_buy    — int, shares to purchase (0 if allocation is blocked)
-        skip_reason      — "CONFIDENCE_SKIP" if below ADD_TO_POSITION_CONFIDENCE,
-                           "INVALID_HEADROOM" if headroom ≤ 0, else ""
+        skip_reason      — "CONFIDENCE_SKIP" if below ADD_TO_POSITION_CONFIDENCE_SMALL,
+                           "ANOMALOUS_WEIGHT" if current_weight > 1.0,
+                           "INVALID_HEADROOM" if headroom ≤ 0,
+                           "INSUFFICIENT_EQUITY" if allocated amount < 1 share,
+                           else ""
         headroom         — float, MAX_POSITION_PCT − current_weight
         current_weight   — float, fraction of portfolio currently in this position
         allocation_tier  — str, "small" / "normal" / "large" (empty if skipped)
@@ -112,7 +114,18 @@ def check_add_to_position(
             "allocation_tier": "",
         }
 
-    if confidence_normalized < ADD_TO_POSITION_CONFIDENCE:
+    # Finding 18: clamp supra-1.0 values so a caller bug (e.g. passing raw
+    # confidence 85.0 instead of 0.85) doesn't silently allocate as "large".
+    if confidence_normalized > 1.0:
+        print(
+            f"  [CONFIDENCE_CLAMP] {ticker}: confidence_normalized="
+            f"{confidence_normalized:.2f} clamped to 1.0"
+        )
+        confidence_normalized = 1.0
+
+    # Finding 15: use ADD_TO_POSITION_CONFIDENCE_SMALL so the constant
+    # actually controls the small-tier floor.
+    if confidence_normalized < ADD_TO_POSITION_CONFIDENCE_SMALL:
         return {
             "shares_to_buy":   0,
             "skip_reason":     "CONFIDENCE_SKIP",
@@ -134,6 +147,21 @@ def check_add_to_position(
     current_weight         = current_position_value / portfolio_value
     headroom               = MAX_POSITION_PCT - current_weight
 
+    # Finding 16: flag anomalous weight (possible stale equity snapshot)
+    # separately from a routine cap-reached skip.
+    if current_weight > 1.0:
+        print(
+            f"  [ANOMALOUS_WEIGHT] {ticker}: current_weight={current_weight:.2f} "
+            f"(portfolio_value={portfolio_value:.0f}) — possible stale equity snapshot"
+        )
+        return {
+            "shares_to_buy":   0,
+            "skip_reason":     "ANOMALOUS_WEIGHT",
+            "headroom":        headroom,
+            "current_weight":  current_weight,
+            "allocation_tier": "",
+        }
+
     if headroom <= 0:
         return {
             "shares_to_buy":   0,
@@ -147,6 +175,14 @@ def check_add_to_position(
     buy_pct               = min(tier_pct, headroom)
     buy_amount            = buy_pct * portfolio_value
     shares_to_buy         = math.floor(buy_amount / price)
+
+    # Finding 17: surface the root cause when allocated amount < one share.
+    if shares_to_buy == 0:
+        print(
+            f"  [INSUFFICIENT_EQUITY] {ticker}: buy_amount=${buy_amount:.2f} "
+            f"< price=${price:.2f} (tier={tier_label}, buy_pct={buy_pct:.1%}, "
+            f"portfolio=${portfolio_value:.0f})"
+        )
 
     return {
         "shares_to_buy":   shares_to_buy,
