@@ -1795,3 +1795,43 @@ def test_mixed_stale_and_errors_reports_both(monkeypatch, tmp_path):
     # The message should mention the stale ticker count
     error_msg = [m for m in discord_calls if "SIGNAL_ERROR" in m][-1]
     assert "stale" in error_msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# Finding 8 — NaN feature guard in predict_ticker
+# ---------------------------------------------------------------------------
+
+class _NaNFeatureError(Exception):
+    """Mirrors predictor.NaNFeatureError for testing (status_code = 422)."""
+    status_code = 422
+
+
+def test_nan_feature_produces_signal_error(monkeypatch, tmp_path):
+    """A NaNFeatureError from predict_ticker flows through get_signals()
+    as a SIGNAL_ERROR entry — the ticker is skipped and logged."""
+    from live_trader import get_signals
+
+    _patch_get_signals_deps(
+        monkeypatch,
+        watchlist=["AAPL"],
+        predict_side_effect=[_NaNFeatureError("AAPL: 2 NaN feature(s) — VIX_Level, VIX_Change")],
+    )
+    monkeypatch.setattr(live_trader, "read_last_close", lambda t: 175.0)
+    monkeypatch.setattr(live_trader, "get_cooldown_tickers", lambda: set())
+
+    results = get_signals()
+
+    assert len(results) == 1
+    r = results[0]
+    assert r["ticker"] == "AAPL"
+    assert r["final_signal"] == "SIGNAL_ERROR"
+    assert "NaN" in r["error"]
+    assert r["current_price"] == 175.0
+
+
+def test_nan_feature_error_does_not_halt_session(monkeypatch, tmp_path):
+    """A NaNFeatureError is per-ticker (status_code=422), so _raise_if_infra
+    lets it through instead of halting as an infra error."""
+    from live_trader import _is_infra_error
+    exc = _NaNFeatureError("AAPL: 1 NaN feature(s) — Volatility")
+    assert _is_infra_error(exc) is False

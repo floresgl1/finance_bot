@@ -7,7 +7,7 @@ warm-up NaN rows before returning the final feature matrix.
 """
 
 import os
-from functools import lru_cache
+import time
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,13 @@ import ta
 from config import DATA_DIR, WATCHLIST
 
 MARKET_DATA_DIR = os.path.join(DATA_DIR, "market")
+
+# TTL cache for market close data.  5 minutes is short enough that a daily
+# CSV refresh is picked up promptly in the long-lived Streamlit dashboard,
+# and long enough that a single prediction pass (12 tickers sharing 4–5
+# market symbols) reads each file only once.
+MARKET_CACHE_TTL_SECONDS = 300
+_market_close_cache: dict[str, tuple[pd.Series, float]] = {}
 
 
 class StaleMarketDataError(Exception):
@@ -35,7 +42,6 @@ SECTOR_MAP = {
 }
 
 
-@lru_cache(maxsize=None)
 def _load_market_close(symbol: str) -> pd.Series:
     """
     Load and cache the full Close price series for a market symbol from
@@ -44,9 +50,18 @@ def _load_market_close(symbol: str) -> pd.Series:
     Raises FileNotFoundError immediately with a clear message if the CSV is
     missing — run market_data_collector.py to generate it.
 
-    Results are memoised so tickers sharing a sector ETF (e.g. all XLK stocks)
-    only trigger one file read per session.
+    Results are cached with a TTL (MARKET_CACHE_TTL_SECONDS, default 5 min)
+    so tickers sharing a sector ETF (e.g. all XLK stocks) only trigger one
+    file read per batch, while long-lived processes like the Streamlit
+    dashboard automatically pick up refreshed CSVs.
     """
+    now = time.monotonic()
+    cached = _market_close_cache.get(symbol)
+    if cached is not None:
+        series, cached_at = cached
+        if now - cached_at < MARKET_CACHE_TTL_SECONDS:
+            return series
+
     filename = f"{symbol}.csv"
     path = os.path.join(MARKET_DATA_DIR, filename)
 
@@ -84,7 +99,19 @@ def _load_market_close(symbol: str) -> pd.Series:
             f"behind today (>3 bday tolerance). Layer 1 pipeline gate should have caught this."
         )
 
+    _market_close_cache[symbol] = (close, now)
     return close
+
+
+def _cache_clear():
+    """Drop all cached market close data.  Provided for test isolation and
+    manual cache invalidation — mirrors the old @lru_cache interface."""
+    _market_close_cache.clear()
+
+
+# Attach as an attribute so existing callers (_load_market_close.cache_clear())
+# keep working without changes.
+_load_market_close.cache_clear = _cache_clear
 
 
 def _download_close(symbol: str, start: str, end: str) -> pd.Series:
@@ -112,6 +139,49 @@ def add_features(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     """
     df = df.copy()
 
+    # ------------------------------------------------------------------
+    # 1. Load market series and trim to the overlap window (Finding 1).
+    #
+    # reindex(method="ffill") cannot fill *leading* NaN — if a market
+    # series starts later than the ticker, those rows become NaN and are
+    # silently dropped by the final dropna().  Instead, we find the latest
+    # start date across all four series and trim the ticker DataFrame to
+    # the overlap window *before* computing any features.  This way every
+    # row we create can be fully populated, and the operator sees exactly
+    # how many rows were removed and why.
+    # ------------------------------------------------------------------
+    sector_etf = SECTOR_MAP.get(ticker, "SPY")
+
+    spy_raw    = _download_close("SPY", "", "")
+    sector_raw = _download_close(sector_etf, "", "")
+    vix_raw    = _download_close("^VIX", "", "")
+
+    overlap_start = max(
+        df.index.min(),
+        spy_raw.index.min(),
+        sector_raw.index.min(),
+        vix_raw.index.min(),
+    )
+
+    rows_before = len(df)
+    df = df[df.index >= overlap_start]
+    rows_trimmed = rows_before - len(df)
+
+    if rows_trimmed > 0:
+        print(
+            f"  [OVERLAP_TRIM] {ticker}: trimmed {rows_trimmed} leading row(s) "
+            f"(data before {overlap_start.date()}) to align with market series"
+        )
+
+    if df.empty:
+        raise ValueError(
+            f"{ticker}: no rows remain after overlap trim — ticker data ends "
+            f"before market series begin at {overlap_start.date()}"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Compute technical indicators on the trimmed DataFrame.
+    # ------------------------------------------------------------------
     close = df["Close"]
     high  = df["High"]
     low   = df["Low"]
@@ -146,28 +216,29 @@ def add_features(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     df["Return_20d"] = close.pct_change(periods=20)
     df["Return_60d"] = close.pct_change(periods=60)
 
-    # Date bounds used for all external data downloads
-    start = df.index.min().strftime("%Y-%m-%d")
-    end   = df.index.max().strftime("%Y-%m-%d")
+    # ------------------------------------------------------------------
+    # 3. Align market series onto the (now-trimmed) ticker index.
+    #
+    # Because we trimmed df to the overlap window, every market series
+    # has data at or before df.index.min(), so ffill always has a prior
+    # value — no leading NaN.
+    # ------------------------------------------------------------------
+    spy_close    = spy_raw.reindex(df.index, method="ffill")
+    sector_close = sector_raw.reindex(df.index, method="ffill")
+    vix_close    = vix_raw.reindex(df.index, method="ffill")
 
     # --- Market context: SPY ---
-    spy_close = _download_close("SPY", start, end).reindex(df.index, method="ffill")
     df["SPY_Return"]   = spy_close.pct_change(periods=7)
     spy_return_20d     = spy_close.pct_change(periods=20)
     df["Rel_Strength"] = df["Return_20d"] - spy_return_20d
 
     # --- Sector momentum ---
-    # Use the ticker's mapped sector ETF; fall back to SPY for unknown symbols.
-    sector_etf   = SECTOR_MAP.get(ticker, "SPY")
-    sector_close = _download_close(sector_etf, start, end).reindex(df.index, method="ffill")
-
     df["Sector_Return_5d"]  = sector_close.pct_change(periods=5)
     df["Sector_Return_20d"] = sector_close.pct_change(periods=20)
     # Positive = stock outperforming its sector over 20 days
     df["Stock_vs_Sector"]   = df["Return_20d"] - df["Sector_Return_20d"]
 
     # --- VIX fear index ---
-    vix_close = _download_close("^VIX", start, end).reindex(df.index, method="ffill")
     df["VIX_Level"]  = vix_close
     # Rising VIX = increasing market fear; 5-day window captures short-term spikes
     df["VIX_Change"] = vix_close.pct_change(periods=5)

@@ -638,6 +638,24 @@ def _load_agent_decisions() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Sentiment loading (duplicated from generate_signals.py to keep modules
+# independent — generate_signals is Phase 1, live_trader is Phase 3)
+# ---------------------------------------------------------------------------
+def _load_sentiment_df():
+    """Load sentiment scores CSV if it exists. Returns None if unavailable."""
+    import pandas as pd
+    sentiment_path = os.path.join(
+        os.path.dirname(__file__), "data", "sentiment", "sentiment_scores.csv"
+    )
+    if not os.path.exists(sentiment_path):
+        return None
+    try:
+        return pd.read_csv(sentiment_path)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Signal generation (reuses predictor.py logic, returns data instead of printing)
 # ---------------------------------------------------------------------------
 def get_signals(sentiment_df=None) -> list[dict]:
@@ -1544,7 +1562,12 @@ def _run_execution(api: tradeapi.REST) -> None:
         print("  No take-profits triggered.")
 
     # 4. Get today's signals
-    signals = get_signals()
+    sentiment_df = _load_sentiment_df()
+    if sentiment_df is not None:
+        print(f"  Loaded sentiment data: {len(sentiment_df)} rows")
+    else:
+        print("  No sentiment data available — sentiment veto will be skipped")
+    signals = get_signals(sentiment_df=sentiment_df)
     if not signals:
         print("  No signals generated. Exiting.")
         sys.exit(0)
