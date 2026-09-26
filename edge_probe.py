@@ -1356,6 +1356,221 @@ def summarise_sell_info(results: dict, broad: bool) -> str:
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Volatility forecast probe -- Stage 1, pre-registered 2026-09-26
+# ---------------------------------------------------------------------------
+#
+# Findings A-M closed the direction question: nothing in this model beats
+# holding. This changes the question. Volatility clusters -- a calm week
+# tends to follow a calm week -- so it IS forecastable; the open question is
+# whether a model adds anything over the standard formula for it.
+#
+# Target: realised volatility over the NEXT 5 trading days, as the root mean
+# square of daily log returns t+1..t+5 (weekly, to match a weekly rebalance).
+#
+# Baselines the model must beat, both using only data up to day t:
+#   persistence -- RMS of the last 20 daily log returns
+#   EWMA        -- RiskMetrics, variance_{t+1} = 0.94 * variance_t + 0.06 * r_t^2,
+#                  held flat over the 5 days. The real opponent.
+#
+# **DESIGN DECISION -- scored with QLIKE on variances.**
+# QLIKE(h, rv2) = rv2/h - log(rv2/h) - 1. Realised volatility over 5 days is a
+# noisy proxy for the true volatility; QLIKE (like MSE) still ranks forecasts
+# correctly under that noise, and it penalises under-forecasting risk harder
+# than over-forecasting it, which is the right bias for sizing.
+#
+# **DESIGN DECISION -- fixed model, no tuning.** XGBRegressor with the
+# project's existing XGB_PARAMS tree settings, trained on log realised
+# volatility pooled across tickers, 3 years before each window with a 5-day
+# label embargo. Predictions are exp(pred) times one scale factor fitted on
+# the training rows, because exp() of a log-space mean under-forecasts
+# variance. The factor comes from training data only.
+#
+# Pass criteria agreed with the user BEFORE the first run, evaluated on
+# BROAD_WINDOWS only: the model beats EWMA on mean QLIKE in >= 7 of 10 windows
+# AND the mean per-window improvement over EWMA is >= 5%.
+
+VOL_HORIZON = 5
+VOL_EWMA_LAMBDA = 0.94
+VOL_INFO_MIN_WINDOWS = 7
+VOL_INFO_MIN_IMPROVEMENT = 0.05
+
+VOL_FEATURES = ["rv_5", "rv_20", "rv_60", "range_vol_20", "ret_5", "ret_20", "ewma_vol"]
+
+
+def _ewma_variance(log_ret: pd.Series, lam: float = VOL_EWMA_LAMBDA) -> pd.Series:
+    """RiskMetrics variance forecast for day t+1, known at the close of day t.
+
+    Seeded with the mean square of the first 20 returns. Each value uses only
+    returns up to and including its own date.
+    """
+    r2 = (log_ret ** 2).to_numpy()
+    out = np.full(len(r2), np.nan)
+    valid = ~np.isnan(r2)
+    idx = np.flatnonzero(valid)
+    if len(idx) < 20:
+        return pd.Series(out, index=log_ret.index)
+    var = float(np.mean(r2[idx[:20]]))
+    for i in idx[20:]:
+        var = lam * var + (1.0 - lam) * r2[i]
+        out[i] = var
+    return pd.Series(out, index=log_ret.index)
+
+
+def vol_frame(prices: pd.DataFrame, horizon: int = VOL_HORIZON) -> pd.DataFrame:
+    """Volatility features, baselines and the forward target from OHLC prices.
+
+    Every feature and baseline at row t uses data up to t; only `target_rv`
+    looks forward (days t+1..t+horizon).
+    """
+    close = prices["Close"].astype(float)
+    r = np.log(close).diff()
+    r2 = r ** 2
+
+    out = pd.DataFrame(index=prices.index)
+    for n in (5, 20, 60):
+        out[f"rv_{n}"] = np.sqrt(r2.rolling(n).mean())
+    # Parkinson range estimator: uses each day's high-low span, which sees
+    # intraday moves a close-to-close return misses.
+    hl = np.log(prices["High"].astype(float) / prices["Low"].astype(float)) ** 2
+    out["range_vol_20"] = np.sqrt(hl.rolling(20).mean() / (4.0 * np.log(2.0)))
+    out["ret_5"] = np.log(close / close.shift(5))
+    out["ret_20"] = np.log(close / close.shift(20))
+    out["ewma_vol"] = np.sqrt(_ewma_variance(r))
+
+    # sum over t+1..t+horizon of r^2, via a reversed rolling window.
+    fwd_sq = r2[::-1].rolling(horizon).sum()[::-1].shift(-1)
+    out["target_rv"] = np.sqrt(fwd_sq / horizon)
+    return out
+
+
+def qlike(forecast_var: np.ndarray, realised_var: np.ndarray) -> float:
+    """Mean QLIKE loss. Lower is better; 0 is a perfect forecast."""
+    ratio = realised_var / forecast_var
+    return float(np.mean(ratio - np.log(ratio) - 1.0))
+
+
+def _load_prices(ticker: str) -> pd.DataFrame:
+    df = pd.read_csv(os.path.join(PROBE_DIR, f"{ticker}.csv"))
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    df.index = df.index.tz_localize(None).normalize()
+    return df
+
+
+def score_vol_window(train: pd.DataFrame, test: pd.DataFrame, cols: list[str]) -> dict:
+    """Fit on `train`, score model and both baselines on `test` with QLIKE."""
+    from xgboost import XGBRegressor
+
+    params = {k: XGB_PARAMS[k] for k in ("n_estimators", "learning_rate", "max_depth", "subsample")
+              if k in XGB_PARAMS}
+    model = XGBRegressor(**params, random_state=42)
+    model.fit(train[cols], np.log(train["target_rv"]))
+
+    # One scale factor, fitted on training rows only: the QLIKE-optimal
+    # multiplier for a variance forecast h is mean(realised / h).
+    train_var = np.exp(2 * model.predict(train[cols]))
+    scale = float(np.mean(train["target_rv"].to_numpy() ** 2 / train_var))
+
+    realised = test["target_rv"].to_numpy() ** 2
+    model_var = scale * np.exp(2 * model.predict(test[cols]))
+    return {
+        "rows": int(len(test)),
+        "model": qlike(model_var, realised),
+        "ewma": qlike(test["ewma_vol"].to_numpy() ** 2, realised),
+        "persistence": qlike(test["rv_20"].to_numpy() ** 2, realised),
+        "scale": scale,
+    }
+
+
+def vol_info_verdict(windows: dict) -> dict:
+    """Apply the pre-registered Stage 1 criteria to per-window QLIKE scores."""
+    scored = [w for w in windows.values() if w.get("model") is not None]
+    improvements = [1.0 - w["model"] / w["ewma"] for w in scored]
+    wins = sum(1 for w in scored if w["model"] < w["ewma"])
+    mean_imp = float(np.mean(improvements)) if improvements else None
+    passed = (
+        wins >= VOL_INFO_MIN_WINDOWS
+        and mean_imp is not None
+        and round(mean_imp, 10) >= VOL_INFO_MIN_IMPROVEMENT
+    )
+    return {
+        "windows_scored": len(scored),
+        "windows_model_beats_ewma": wins,
+        "mean_improvement_vs_ewma": mean_imp,
+        "min_windows": VOL_INFO_MIN_WINDOWS,
+        "min_improvement": VOL_INFO_MIN_IMPROVEMENT,
+        "passed": bool(passed),
+    }
+
+
+def run_vol_info_probe(windows: dict | None = None, lookback_years: int = 3) -> dict:
+    """Walk-forward volatility forecasts: model vs EWMA vs persistence."""
+    windows = windows or BROAD_WINDOWS
+    per_ticker = _build_per_ticker(1.0)
+    if not per_ticker:
+        return {}
+
+    frames = []
+    for ticker, feats in per_ticker.items():
+        vf = vol_frame(_load_prices(ticker))
+        f = feats[FEATURE_COLUMNS].join(vf, how="inner")
+        f["ticker"] = ticker
+        frames.append(f)
+    data = pd.concat(frames).sort_index()
+    cols = FEATURE_COLUMNS + VOL_FEATURES
+    data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=cols + ["target_rv"])
+    data = data[data["target_rv"] > 0]
+
+    results = {}
+    for name, (start_s, end_s) in windows.items():
+        start, end = pd.Timestamp(start_s), pd.Timestamp(end_s)
+        embargo = start - pd.tseries.offsets.BDay(VOL_HORIZON)
+        train = data[(data.index >= start - pd.DateOffset(years=lookback_years))
+                     & (data.index < embargo)]
+        test = data[(data.index >= start) & (data.index <= end)]
+        if len(train) < 500 or test.empty:
+            print(f"  {name}: {len(train)} training rows, {len(test)} test rows, skipping")
+            continue
+        results[name] = score_vol_window(train, test, cols)
+
+    return results
+
+
+def summarise_vol_info(results: dict, broad: bool) -> str:
+    """ASCII table plus the verdict. No verdict off the full broad set."""
+    out = [
+        f"  {'window':<22}{'rows':>7}{'model':>9}{'EWMA':>9}{'persist':>9}"
+        f"{'vs EWMA':>10}  model wins?",
+        "  " + "-" * 76,
+    ]
+    for name, r in results.items():
+        imp = 1.0 - r["model"] / r["ewma"]
+        out.append(
+            f"  {name:<22}{r['rows']:>7}{r['model']:>9.4f}{r['ewma']:>9.4f}"
+            f"{r['persistence']:>9.4f}{imp * 100:>9.1f}%  {'yes' if r['model'] < r['ewma'] else 'no'}"
+        )
+
+    v = vol_info_verdict(results)
+    mean = (f"{v['mean_improvement_vs_ewma'] * 100:.1f}%"
+            if v["mean_improvement_vs_ewma"] is not None else "n/a")
+    out += [
+        "",
+        "  QLIKE: lower is better.",
+        f"  Model beats EWMA in {v['windows_model_beats_ewma']} of {v['windows_scored']} "
+        f"windows (need >= {v['min_windows']})",
+        f"  Mean improvement over EWMA: {mean} (need >= {v['min_improvement'] * 100:.0f}%)",
+    ]
+    if not broad:
+        out.append("  NO VERDICT: the criteria were pre-registered on --broad only.")
+    elif v["windows_scored"] < len(BROAD_WINDOWS):
+        out.append(f"  NO VERDICT: only {v['windows_scored']} of {len(BROAD_WINDOWS)} "
+                   f"windows scored; the criteria assume all of them. Fix the data and re-run.")
+    else:
+        out.append(f"  STAGE 1: {'PASS' if v['passed'] else 'FAIL'}")
+    return "\n".join(out)
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure the model against trivial baselines and sweep training history.",
@@ -1397,6 +1612,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Compare how a position is closed: on any non-BUY (the old "
              "simulator), on SELL only (what the bot does), on SELL or a stop, "
              "at the label horizon, or all three.",
+    )
+    parser.add_argument(
+        "--vol-info", action="store_true",
+        help="Volatility Stage 1: does a model forecast next-5-day realised "
+             "volatility better than EWMA (QLIKE)? Pre-registered pass "
+             "criteria; verdict only with --broad.",
     )
     parser.add_argument(
         "--sell-info", action="store_true",
@@ -1571,6 +1792,22 @@ def main(argv: list[str] | None = None) -> int:
             "policies": run_exit_probe(windows=window_set),
         }
         print(summarise_exits(results["policies"]))
+    elif args.vol_info:
+        print(f"\n=== Volatility forecast probe, Stage 1 ({window_label}) ===")
+        print("  Next-5-day realised volatility: model vs EWMA vs persistence,")
+        print("  one model per window with a label embargo, scored with QLIKE.")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "vol_info",
+            "window_set": window_label,
+            "windows": run_vol_info_probe(windows=window_set),
+        }
+        results["verdict"] = vol_info_verdict(results["windows"])
+        results["verdict"]["complete"] = (
+            window_set is BROAD_WINDOWS
+            and results["verdict"]["windows_scored"] == len(BROAD_WINDOWS)
+        )
+        print(summarise_vol_info(results["windows"], broad=window_set is BROAD_WINDOWS))
     elif args.sell_info:
         print(f"\n=== SELL information probe, Stage 1 ({window_label}) ===")
         print("  One model per window, trained with a label embargo; forward")

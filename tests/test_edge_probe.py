@@ -936,3 +936,111 @@ def test_a_run_with_missing_windows_gives_no_verdict():
     text = edge_probe.summarise_sell_info({}, broad=True)
     assert "NO VERDICT" in text
     assert "FAIL" not in text
+
+
+# ---------------------------------------------------------------------------
+# Volatility forecast probe (Stage 1)
+# ---------------------------------------------------------------------------
+
+
+def _ohlc(n=120, seed=0):
+    rng = np.random.default_rng(seed)
+    close = 100 * np.exp(np.cumsum(rng.normal(0, 0.02, n)))
+    idx = pd.date_range("2020-01-01", periods=n, freq="B")
+    return pd.DataFrame({"Close": close, "High": close * 1.01, "Low": close * 0.99}, index=idx)
+
+
+def test_features_and_baselines_never_look_ahead():
+    """Changing prices after day t must not change anything known at day t."""
+    prices = _ohlc()
+    t = 80
+    shocked = prices.copy()
+    shocked.iloc[t + 1:, :] *= 3.0          # a huge move after t
+
+    a = edge_probe.vol_frame(prices).iloc[: t + 1]
+    b = edge_probe.vol_frame(shocked).iloc[: t + 1]
+
+    known = edge_probe.VOL_FEATURES          # includes ewma_vol and rv_20 (the baselines)
+    pd.testing.assert_frame_equal(a[known], b[known])
+
+
+def test_target_is_exactly_the_next_five_days():
+    prices = _ohlc()
+    vf = edge_probe.vol_frame(prices)
+    r = np.log(prices["Close"]).diff()
+    t = 50
+    expected = np.sqrt(np.mean(r.iloc[t + 1: t + 6] ** 2))
+    assert vf["target_rv"].iloc[t] == pytest.approx(expected)
+    assert vf["target_rv"].iloc[-5:].isna().all()   # no full forward window
+
+
+def test_target_at_t_ignores_day_t_itself():
+    prices = _ohlc()
+    t = 50
+    shocked = prices.copy()
+    shocked.iloc[t, shocked.columns.get_loc("Close")] *= 1.5   # moves r_t and r_{t+1}
+    a, b = edge_probe.vol_frame(prices), edge_probe.vol_frame(shocked)
+    # r_t changes, but the target for t-1 covers t..t+4 and the target for t
+    # covers t+1..t+5; only the latter includes r_{t+1}. The target at t-6
+    # covers t-5..t-1 and must be untouched.
+    assert a["target_rv"].iloc[t - 6] == pytest.approx(b["target_rv"].iloc[t - 6])
+
+
+def test_ewma_follows_the_riskmetrics_recursion():
+    r = pd.Series([0.01] * 20 + [0.05, -0.02])
+    var = edge_probe._ewma_variance(r, lam=0.94)
+    seed = 0.01 ** 2
+    v20 = 0.94 * seed + 0.06 * 0.05 ** 2
+    v21 = 0.94 * v20 + 0.06 * 0.02 ** 2
+    assert var.iloc[20] == pytest.approx(v20)
+    assert var.iloc[21] == pytest.approx(v21)
+    assert var.iloc[:20].isna().all()
+
+
+def test_qlike_is_zero_for_a_perfect_forecast_and_punishes_underforecasting_more():
+    realised = np.array([0.0004, 0.0009])
+    assert edge_probe.qlike(realised, realised) == pytest.approx(0.0)
+    under = edge_probe.qlike(realised / 2, realised)
+    over = edge_probe.qlike(realised * 2, realised)
+    assert under > over > 0
+
+
+def _vol_windows(pairs):
+    return {f"w{i}": {"model": m, "ewma": e} for i, (m, e) in enumerate(pairs)}
+
+
+@pytest.mark.parametrize("pairs, passed", [
+    ([(0.90, 1.0)] * 7 + [(1.02, 1.0)] * 3, True),    # 7 wins, mean 6.4%
+    ([(0.95, 1.0)] * 10, True),                         # exactly 5% passes (>=)
+    ([(0.90, 1.0)] * 6 + [(1.00, 1.0)] * 4, False),     # only 6 wins
+    ([(0.96, 1.0)] * 10, False),                        # every window, but 4% < 5%
+])
+def test_vol_verdict_applies_the_pre_registered_criteria(pairs, passed):
+    assert edge_probe.vol_info_verdict(_vol_windows(pairs))["passed"] is passed
+
+
+def test_vol_run_with_missing_windows_gives_no_verdict():
+    text = edge_probe.summarise_vol_info({}, broad=True)
+    assert "NO VERDICT" in text
+    assert "FAIL" not in text
+
+
+def test_vol_criteria_are_the_ones_agreed_before_the_run():
+    assert edge_probe.VOL_HORIZON == 5
+    assert edge_probe.VOL_EWMA_LAMBDA == 0.94
+    assert edge_probe.VOL_INFO_MIN_WINDOWS == 7
+    assert edge_probe.VOL_INFO_MIN_IMPROVEMENT == 0.05
+
+
+def test_model_that_knows_the_regime_beats_ewma():
+    """Sanity check of the scoring path: when volatility is set by a feature
+    the model can see, it must beat EWMA, which only sees past returns."""
+    rng = np.random.default_rng(1)
+    n = 4000
+    regime = rng.integers(0, 2, n)                     # visible feature
+    vol = np.where(regime == 1, 0.04, 0.01)
+    target = np.abs(rng.normal(vol, vol * 0.1))
+    frame = pd.DataFrame({"regime": regime, "target_rv": target,
+                          "ewma_vol": 0.025, "rv_20": 0.025})
+    r = edge_probe.score_vol_window(frame.iloc[:3000], frame.iloc[3000:], ["regime"])
+    assert r["model"] < r["ewma"]
