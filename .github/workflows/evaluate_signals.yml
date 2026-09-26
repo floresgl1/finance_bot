@@ -1,13 +1,34 @@
 name: Evaluate Signals
 
-# Daily run: 3:10 PM UTC Mon–Fri (just before market close).
-# Weekly run: 3:15 PM UTC Fridays only — posts win-rate / RoR summary to Discord.
+# Daily run: 21:30 UTC Mon–Fri, after the US close in both EDT (20:00 UTC)
+# and EST (21:00 UTC). Fridays run the same daily job, then the weekly summary.
 # Can also be triggered manually from the Actions tab.
+#
+# **DESIGN DECISION — run after the close, never during a session.**
+# This job downloads signal_log.csv from PythonAnywhere, edits it, and uploads
+# the whole file back. It used to run at 15:10 UTC, while live_trader.py (15:00
+# UTC) was still appending rows: exits were logged as late as 17:16 UTC. Any
+# row written between the download and the upload was silently overwritten.
+# After the close, market_is_open() makes the trader exit before writing
+# anything, so the log cannot change underneath this job.
+#
+# It also fixes outcome scoring: yfinance's bar for *today* is intraday until
+# the close, so rows due today were being scored against a mid-session price.
+#
+# Two further guards, because a schedule is not a lock:
+#   - concurrency: one run at a time. The old Friday pair of crons started two
+#     copies that downloaded and uploaded the log at the same time.
+#   - the upload re-reads the file on PA and refuses to overwrite it if it
+#     changed since the download (optimistic concurrency).
 on:
   schedule:
-    - cron: '10 15 * * 1-5'   # daily evaluation Mon–Fri
-    - cron: '15 15 * * 5'     # weekly summary Fridays only (15:15, Fri)
+    - cron: '30 21 * * 1-4'   # daily evaluation Mon–Thu
+    - cron: '30 21 * * 5'     # Friday: daily evaluation, then weekly summary
   workflow_dispatch:
+
+concurrency:
+  group: signal-log-sync
+  cancel-in-progress: false
 
 jobs:
   evaluate-signals:
@@ -39,6 +60,7 @@ jobs:
         run: |
           python - <<'PYEOF'
           import csv
+          import hashlib
           import os
           import sys
 
@@ -77,9 +99,13 @@ jobs:
           with open(local, "wb") as fh:
               fh.write(resp.content)
 
-          print(f"[OK] Downloaded signal_log.csv ({len(resp.content):,} bytes)")
+          # Fingerprint of the file as downloaded. The upload step compares
+          # PA's current copy against it before overwriting.
+          digest = hashlib.sha256(resp.content).hexdigest()
+          print(f"[OK] Downloaded signal_log.csv ({len(resp.content):,} bytes, sha256 {digest[:12]})")
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write("has_data=true\n")
+              gh.write(f"sha256={digest}\n")
           PYEOF
 
       # ------------------------------------------------------------------
@@ -119,8 +145,11 @@ jobs:
         env:
           PYTHONANYWHERE_TOKEN: ${{ secrets.PYTHONANYWHERE_TOKEN }}
           PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DOWNLOADED_SHA256: ${{ steps.download.outputs.sha256 }}
         run: |
           python - <<'PYEOF'
+          import hashlib
           import os
           import sys
 
@@ -132,12 +161,39 @@ jobs:
           local    = os.path.join("data", "signal_log.csv")
 
           url = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{remote}"
+          headers = {"Authorization": f"Token {token}"}
+
+          # Refuse to overwrite rows written on PA since the download. The
+          # upload replaces the whole file, so anything appended meanwhile
+          # would be lost. Failing leaves PA's copy intact; the next run
+          # redoes this run's outcome scoring and stop reconciliation.
+          try:
+              current = requests.get(url, headers=headers, timeout=30)
+              current.raise_for_status()
+          except requests.exceptions.RequestException as exc:
+              print(f"[ERROR] Could not re-read PA copy before upload: {exc}")
+              sys.exit(1)
+
+          if hashlib.sha256(current.content).hexdigest() != os.environ["DOWNLOADED_SHA256"]:
+              msg = (
+                  "signal_log.csv changed on PythonAnywhere while evaluate_signals.yml "
+                  "was running. Upload skipped so no rows are overwritten; "
+                  "the next run will redo this evaluation."
+              )
+              print(f"[ERROR] {msg}")
+              hook = os.environ.get("DISCORD_WEBHOOK_URL")
+              if hook:
+                  try:
+                      requests.post(hook, json={"content": f"**Log sync skipped** - {msg}"}, timeout=10)
+                  except requests.exceptions.RequestException:
+                      pass
+              sys.exit(1)
 
           try:
               with open(local, "rb") as fh:
                   resp = requests.post(
                       url,
-                      headers={"Authorization": f"Token {token}"},
+                      headers=headers,
                       files={"content": fh},
                       timeout=60,
                   )
@@ -153,14 +209,14 @@ jobs:
           PYEOF
 
   # ============================================================
-  # Weekly summary — Fridays only at 3:10 PM UTC
+  # Weekly summary — Fridays only, after the daily evaluation
   # Runs after evaluate-signals completes. Posts win rate and
   # rate of return vs SPY to Discord.
   # ============================================================
   weekly-summary:
     needs: evaluate-signals
     runs-on: ubuntu-latest
-    if: github.event.schedule == '15 15 * * 5' || github.event_name == 'workflow_dispatch'
+    if: github.event.schedule == '30 21 * * 5' || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout repository
