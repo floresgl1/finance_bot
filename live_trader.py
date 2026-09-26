@@ -1026,8 +1026,14 @@ def _buy_position_id(ticker: str, is_add: bool, entry_order_id: str | None) -> s
 # ---------------------------------------------------------------------------
 def get_cooldown_tickers() -> set[str]:
     """
-    Read signal_log.csv once and return the set of tickers that had a
-    STOP_LOSS_SELL logged within the past STOP_LOSS_COOLDOWN_DAYS calendar days.
+    Read signal_log.csv once and return the set of tickers with a stop-loss
+    exit logged within the past STOP_LOSS_COOLDOWN_DAYS calendar days.
+
+    Two row shapes count: STOP_LOSS_SELL ENTRY rows (the old in-script stop
+    guard) and STOP_LOSS_FILL EXIT rows (standing Alpaca stops, backfilled by
+    reconcile_stops.py). The log alone is not enough — reconcile_stops.py runs
+    after the session, so a stop that fired this morning is not in it yet.
+    get_recent_stop_fill_tickers() covers that from Alpaca.
     """
     import csv as _csv
     from datetime import date as _date
@@ -1042,7 +1048,12 @@ def get_cooldown_tickers() -> set[str]:
     try:
         with open(SIGNAL_LOG_PATH, newline="") as fh:
             for row in _csv.DictReader(fh):
-                if row["actual_action"] != "STOP_LOSS_SELL":
+                stopped_out = (
+                    row.get("actual_action") == "STOP_LOSS_SELL"
+                    or (row.get("row_type") == "EXIT"
+                        and row.get("exit_reason") == "STOP_LOSS_FILL")
+                )
+                if not stopped_out:
                     continue
                 try:
                     log_date = _date.fromisoformat(row["date"])
@@ -1053,6 +1064,40 @@ def get_cooldown_tickers() -> set[str]:
     except OSError:
         pass
     return tickers
+
+
+def get_recent_stop_fill_tickers(api) -> set[str]:
+    """
+    Tickers whose standing stop filled within STOP_LOSS_COOLDOWN_DAYS, per Alpaca.
+
+    **DESIGN DECISION:**
+    Asks the broker rather than the log. Since stop-losses became standing
+    OTO orders they fill on Alpaca's side, nothing writes STOP_LOSS_SELL any
+    more, and the STOP_LOSS_FILL rows reconcile_stops.py backfills arrive only
+    after the session. Reading the log alone left the cooldown permanently
+    empty: a ticker could be re-bought the session after it stopped out.
+
+    Infra errors halt the session like every other Alpaca call. Any other
+    failure degrades to the log-based check with an alert, rather than
+    blocking every BUY.
+    """
+    from datetime import timedelta
+    from config import STOP_LOSS_COOLDOWN_DAYS
+    from reconcile_stops import fetch_filled_stops
+
+    since = datetime.now(timezone.utc).date() - timedelta(days=STOP_LOSS_COOLDOWN_DAYS)
+    try:
+        fills = fetch_filled_stops(api, since)
+    except Exception as exc:
+        _raise_if_infra(exc, "list_orders", "STOP_COOLDOWN")
+        print(f"  [COOLDOWN] Could not list recent stop fills: {exc} - using the log only")
+        send_discord(
+            f"⚠️ **Stop-loss cooldown degraded** — could not list recent stop fills "
+            f"from Alpaca ({exc}). Using the signal log only, which misses stops "
+            f"reconcile_stops.py has not recorded yet."
+        )
+        return set()
+    return {f["ticker"] for f in fills}
 
 
 # ---------------------------------------------------------------------------
@@ -1801,7 +1846,7 @@ def _run_execution(api: tradeapi.REST) -> None:
     print("-" * 60 + "\n")
 
     # 6c. BUY + HOLD pass
-    cooldown_tickers = get_cooldown_tickers()
+    cooldown_tickers = get_cooldown_tickers() | get_recent_stop_fill_tickers(api)
 
     for r in buy_sigs + hold_sigs:
         ticker     = r["ticker"]
@@ -1833,7 +1878,7 @@ def _run_execution(api: tradeapi.REST) -> None:
                 })
                 continue
 
-            # Skip if a STOP_LOSS_SELL was logged for this ticker within the past 7 calendar days
+            # Skip if this ticker stopped out within STOP_LOSS_COOLDOWN_DAYS (log or Alpaca)
             if ticker in cooldown_tickers:
                 print(f"  Signal: BUY {ticker}{note_str} — skipped (COOLDOWN_SKIP)")
                 log_signal(ticker, "BUY", price, 0, confidence, "COOLDOWN_SKIP")

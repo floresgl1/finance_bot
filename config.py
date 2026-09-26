@@ -53,8 +53,9 @@ XGB_PARAMS = {
 # Random chance for 3 classes is 0.33; 0.45 requires meaningful conviction.
 CONFIDENCE_THRESHOLD = 0.35
 
-# Number of calendar days after a STOP_LOSS_SELL during which a BUY on the
-# same ticker is blocked (logged as COOLDOWN_SKIP).
+# Number of calendar days after a stop-loss exit during which a BUY on the
+# same ticker is blocked (logged as COOLDOWN_SKIP). Stop fills are read from
+# Alpaca and from the log (STOP_LOSS_FILL / legacy STOP_LOSS_SELL).
 STOP_LOSS_COOLDOWN_DAYS = 7
 
 # Standing stop-loss (OTO) configuration

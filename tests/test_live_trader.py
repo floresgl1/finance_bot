@@ -894,6 +894,98 @@ def test_malformed_date_row_is_skipped_not_fatal(signal_log):
     assert get_cooldown_tickers() == {"MSFT"}
 
 
+def test_reconciled_stop_fill_puts_ticker_in_cooldown(signal_log):
+    """Standing stops are logged as STOP_LOSS_FILL EXIT rows, not STOP_LOSS_SELL."""
+    recent = (date.today() - timedelta(days=2)).isoformat()
+    _write_log(signal_log, [
+        {"date": recent, "ticker": "AAPL", "row_type": "EXIT", "exit_reason": "STOP_LOSS_FILL"},
+        {"date": recent, "ticker": "MSFT", "row_type": "EXIT", "exit_reason": "REBALANCE_TRIM"},
+    ])
+
+    assert get_cooldown_tickers() == {"AAPL"}
+
+
+def _stop_order(symbol, *, status="filled", side="sell", order_type="stop"):
+    o = MagicMock()
+    o.id, o.symbol, o.side, o.type, o.status = f"stop-{symbol}", symbol, side, order_type, status
+    o.filled_qty, o.filled_avg_price = "10", "90.0"
+    o.filled_at = datetime.now(timezone.utc).isoformat()
+    return o
+
+
+def test_alpaca_stop_fills_put_tickers_in_cooldown():
+    """A stop that fired this morning is in Alpaca before it is in the log."""
+    api = MagicMock()
+    api.list_orders.return_value = [
+        _stop_order("AAPL"),
+        _stop_order("MSFT", status="canceled"),       # cancelled before a SELL: not a stop-out
+        _stop_order("NVDA", side="buy", order_type="market"),
+    ]
+
+    assert live_trader.get_recent_stop_fill_tickers(api) == {"AAPL"}
+    since = api.list_orders.call_args.kwargs["after"]
+    assert since == (datetime.now(timezone.utc).date()
+                     - timedelta(days=config.STOP_LOSS_COOLDOWN_DAYS)).isoformat()
+
+
+def test_alpaca_cooldown_ticker_level_error_degrades_with_alert(monkeypatch):
+    alerts = []
+    monkeypatch.setattr(live_trader, "send_discord", alerts.append)
+    err = Exception("unprocessable")
+    err.status_code = 422
+    api = MagicMock()
+    api.list_orders.side_effect = err
+
+    assert live_trader.get_recent_stop_fill_tickers(api) == set()
+    assert "cooldown degraded" in alerts[0]
+
+
+def test_alpaca_cooldown_infra_error_halts():
+    import requests
+    api = MagicMock()
+    api.list_orders.side_effect = requests.exceptions.ConnectionError("down")
+
+    with pytest.raises(live_trader.AlpacaInfraError):
+        live_trader.get_recent_stop_fill_tickers(api)
+
+
+def test_buy_pass_skips_a_ticker_that_stopped_out_this_morning(monkeypatch, tmp_path):
+    """End to end: empty log, Alpaca reports today's stop fill -> COOLDOWN_SKIP."""
+    from live_trader import _run_execution
+
+    monkeypatch.setattr(live_trader, "check_portfolio_loss_limits", lambda *a, **kw: (False, ""))
+    monkeypatch.setattr(live_trader, "check_peak_drawdown", lambda *a, **kw: (False, ""))
+    monkeypatch.setattr(live_trader, "check_position_limits", lambda api, owned: ([], owned))
+    monkeypatch.setattr(live_trader, "get_owned_tickers", lambda api: {})
+    monkeypatch.setattr(live_trader, "get_equity", lambda api: 100_000.0)
+    monkeypatch.setattr(live_trader, "get_cooldown_tickers", lambda: set())
+    monkeypatch.setattr(live_trader, "get_recent_stop_fill_tickers", lambda api: {"AAPL"})
+    monkeypatch.setattr(live_trader, "_load_agent_decisions", lambda: {})
+    monkeypatch.setattr(live_trader, "run_rebalancer", lambda api, skip: [])
+    monkeypatch.setattr(live_trader, "send_discord", lambda msg: None)
+    monkeypatch.setattr(live_trader, "get_signals", lambda sentiment_df=None: [{
+        "ticker": "AAPL", "final_signal": "BUY", "confidence": 70.0,
+        "current_price": 100.0, "shap_values": {},
+    }])
+    monkeypatch.setattr(config, "PORTFOLIO_SNAPSHOT_PATH", str(tmp_path / "snap.json"))
+    monkeypatch.setattr(config, "PEAK_EQUITY_PATH", str(tmp_path / "peak.json"))
+    monkeypatch.setattr(config, "LAST_RUN_GUARD_PATH", str(tmp_path / "guard.txt"))
+    monkeypatch.setattr(live_trader, "LAST_RUN_GUARD_PATH", str(tmp_path / "guard.txt"))
+    monkeypatch.setattr(live_trader, "_read_portfolio_snapshot", lambda: {})
+    monkeypatch.setattr(live_trader, "_write_portfolio_snapshot", lambda snap: None)
+    logged = []
+    monkeypatch.setattr("signal_logger.log_signal", lambda *a, **kw: logged.append(a))
+    place_buy = MagicMock()
+    monkeypatch.setattr(live_trader, "place_buy", place_buy)
+
+    api = MagicMock()
+    api.list_positions.return_value = []
+    _run_execution(api)
+
+    place_buy.assert_not_called()
+    assert ("AAPL", "BUY", 100.0, 0, 70.0, "COOLDOWN_SKIP") in logged
+
+
 # ---------------------------------------------------------------------------
 # read_last_close
 # ---------------------------------------------------------------------------
