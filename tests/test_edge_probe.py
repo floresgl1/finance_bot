@@ -1044,3 +1044,120 @@ def test_model_that_knows_the_regime_beats_ewma():
                           "ewma_vol": 0.025, "rv_20": 0.025})
     r = edge_probe.score_vol_window(frame.iloc[:3000], frame.iloc[3000:], ["regime"])
     assert r["model"] < r["ewma"]
+
+
+# ---------------------------------------------------------------------------
+# Volatility-sized basket
+# ---------------------------------------------------------------------------
+
+
+def _px(rows):
+    idx = pd.date_range("2024-01-01", periods=len(rows), freq="B")
+    return pd.DataFrame(rows, index=idx, columns=["A", "B"], dtype=float)
+
+
+def test_flat_prices_lose_only_the_entry_cost():
+    px = _px([[10, 20]] * 6)
+    v = edge_probe.simulate_weights(px, lambda i: np.array([0.5, 0.5]), None, 0.001)
+    assert v.iloc[-1] == pytest.approx(0.999)
+
+
+def test_hold_drifts_and_rebalancing_resets_to_target():
+    # A doubles, B flat. Held: 0.5*2 + 0.5 = 1.5. Rebalanced on day 2 back to
+    # 50/50 at a cost; after that A's further move only hits half the book.
+    px = _px([[10, 10], [20, 10], [20, 10], [40, 10]])
+    equal = lambda i: np.array([0.5, 0.5])
+    hold = edge_probe.simulate_weights(px, equal, None, 0.0)
+    reb = edge_probe.simulate_weights(px, equal, 2, 0.0)
+    assert hold.iloc[1] == pytest.approx(1.5)
+    assert hold.iloc[3] == pytest.approx(2.5)          # 0.5*4 + 0.5
+    assert reb.iloc[2] == pytest.approx(1.5)           # rebalance keeps value
+    assert reb.iloc[3] == pytest.approx(1.5 * (0.5 * 2 + 0.5))   # 2.25
+
+
+def test_rebalancing_pays_slippage_on_value_traded():
+    px = _px([[10, 10], [20, 10], [20, 10]])
+    reb = edge_probe.simulate_weights(px, lambda i: np.array([0.5, 0.5]), 2, 0.01)
+    # Day 2 value before trading: 0.99 * 1.5 = 1.485, positions 0.99 / 0.495.
+    # Target 0.7425 each; traded |0.7425-0.99| + |0.7425-0.495| = 0.495.
+    assert reb.iloc[2] == pytest.approx(1.485 - 0.01 * 0.495)
+
+
+def test_inverse_vol_weights_favour_the_calmer_name():
+    w = edge_probe.inverse_vol_weights(pd.Series({"A": 0.01, "B": 0.02}))
+    assert w["A"] == pytest.approx(2 / 3)
+    assert w.sum() == pytest.approx(1.0)
+
+
+def test_inverse_vol_weights_keep_a_name_without_sigma():
+    w = edge_probe.inverse_vol_weights(pd.Series({"A": 0.01, "B": np.nan}))
+    assert w.sum() == pytest.approx(1.0)
+    assert w["B"] > 0
+
+
+def test_max_drawdown_is_the_largest_peak_to_trough_fall():
+    v = pd.Series([1.0, 1.2, 0.9, 1.1, 0.6, 1.5])
+    assert edge_probe.max_drawdown_pct(v) == pytest.approx(50.0)
+
+
+def test_rebalance_uses_the_previous_days_sigma(monkeypatch):
+    """Weights at a rebalance must not see that day's volatility."""
+    idx = pd.date_range("2024-01-01", periods=12, freq="B")
+    close = pd.DataFrame({"A": 10.0, "B": 10.0}, index=idx)
+    sigma = pd.DataFrame({"A": 0.01, "B": 0.01}, index=idx)
+    sigma.loc[idx[5], "B"] = 1.0        # a spike ON the rebalance day
+
+    frames = {}
+    for t in close:
+        frames[t] = pd.DataFrame({"Close": close[t], "High": close[t], "Low": close[t]})
+        frames[t].attrs["ticker"] = t
+    monkeypatch.setattr(edge_probe, "WATCHLIST", ["A", "B"])
+    monkeypatch.setattr(edge_probe, "_load_prices", lambda t: frames[t])
+    monkeypatch.setattr(edge_probe, "vol_frame",
+                        lambda p: pd.DataFrame({"ewma_vol": sigma[p.attrs["ticker"]]}))
+    seen = []
+    real = edge_probe.inverse_vol_weights
+    monkeypatch.setattr(edge_probe, "inverse_vol_weights",
+                        lambda s: (seen.append(s.copy()), real(s))[1])
+
+    edge_probe.run_vol_sizing_probe({"w": (str(idx[0].date()), str(idx[-1].date()))})
+
+    day5 = [s for s in seen if s.name == idx[5]][0]
+    assert day5["B"] == pytest.approx(0.01)   # day 4's sigma, not the spike
+
+
+def _vs_windows(rows):
+    return {f"w{i}": {"hold": {"return": hr, "max_dd": hd},
+                      "equal, weekly": {"return": cr, "max_dd": cd},
+                      "EWMA-sized": {"return": er, "max_dd": ed}}
+            for i, (hr, hd, cr, cd, er, ed) in enumerate(rows)}
+
+
+def test_verdict_passes_only_when_all_three_criteria_hold():
+    good = [(10, 20, 10, 19, 9, 15)] * 10            # 25% smaller DD, 1pp cost
+    assert edge_probe.vol_sizing_verdict(_vs_windows(good))["passed"] is True
+
+
+@pytest.mark.parametrize("rows, failed", [
+    ([(10, 20, 10, 19, 7, 15)] * 10, "criterion_1"),                      # 3pp return cost
+    ([(10, 20, 10, 19, 9, 17)] * 10, "criterion_1"),                      # only 15% smaller
+    ([(10, 20, 10, 19, 9, 15)] * 6 + [(10, 20, 10, 19, 9, 21)] * 4,       # 6 of 10 vs hold
+     "criterion_2"),
+    ([(10, 20, 10, 14, 9, 15)] * 10, "criterion_3"),                      # rebalancing did it
+])
+def test_verdict_names_the_failing_criterion(rows, failed):
+    v = edge_probe.vol_sizing_verdict(_vs_windows(rows))
+    assert v["passed"] is False
+    assert v[failed] is False
+
+
+def test_vol_sizing_incomplete_run_gives_no_verdict():
+    text = edge_probe.summarise_vol_sizing({}, broad=True)
+    assert "NO VERDICT" in text and "FAIL" not in text
+
+
+def test_vol_sizing_criteria_are_the_ones_agreed_before_the_run():
+    assert edge_probe.VOL_SIZING_REBALANCE_DAYS == 5
+    assert edge_probe.VOL_SIZING_MIN_DD_REDUCTION == 0.20
+    assert edge_probe.VOL_SIZING_MAX_RETURN_COST_PP == 2.0
+    assert edge_probe.VOL_SIZING_MIN_WINDOWS == 7

@@ -1571,6 +1571,202 @@ def summarise_vol_info(results: dict, broad: bool) -> str:
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Volatility-sized basket -- pre-registered 2026-09-26
+# ---------------------------------------------------------------------------
+#
+# Finding N: a model does not forecast volatility better than EWMA. The
+# question left is whether weighting the basket by EWMA volatility -- no model
+# at all -- gives a smoother ride than equal-weight holding.
+#
+# Three arms, all fully invested in the whole watchlist:
+#   hold             equal weight, bought once, never rebalanced
+#   equal, weekly    equal weight, rebalanced every 5 trading days (CONTROL)
+#   EWMA-sized       weights proportional to 1 / EWMA volatility, rebalanced
+#                    every 5 trading days
+#
+# **DESIGN DECISION -- the control arm.** Weekly rebalancing changes a
+# portfolio on its own (it trims winners, adds to losers, and pays slippage),
+# so any difference between EWMA-sized and hold could be the rebalancing
+# rather than the volatility weights. The weekly equal-weight arm separates
+# the two.
+#
+# **DESIGN DECISION -- no lookahead.** A rebalance at day t's close uses EWMA
+# volatility as of day t-1. Costs are backtest.SLIPPAGE on every unit of value
+# traded; backtest.COMMISSION's flat $1 is ignored because this simulator
+# works in fractions of the portfolio, not dollars.
+#
+# Pass criteria agreed with the user BEFORE the first run, BROAD_WINDOWS only:
+#   1. mean max drawdown >= 20% smaller than hold, giving up <= 2pp mean return
+#   2. smaller max drawdown than hold in >= 7 of 10 windows
+#   3. smaller max drawdown than the weekly equal-weight control in >= 7 of 10
+
+VOL_SIZING_REBALANCE_DAYS = 5
+VOL_SIZING_MIN_DD_REDUCTION = 0.20
+VOL_SIZING_MAX_RETURN_COST_PP = 2.0
+VOL_SIZING_MIN_WINDOWS = 7
+
+VOL_SIZING_ARMS = ("hold", "equal, weekly", "EWMA-sized")
+
+
+def inverse_vol_weights(sigma: pd.Series) -> pd.Series:
+    """Weights proportional to 1/sigma, summing to 1.
+
+    A name without a usable sigma falls back to the mean inverse-sigma of the
+    others rather than dropping out, so the book stays fully invested.
+    """
+    inv = 1.0 / sigma.where(sigma > 0)
+    inv = inv.fillna(inv.mean()) if inv.notna().any() else pd.Series(1.0, index=sigma.index)
+    return inv / inv.sum()
+
+
+def simulate_weights(prices: pd.DataFrame, target_weights, rebalance_every: int | None,
+                     slippage: float) -> pd.Series:
+    """Portfolio value (starts at 1.0) for a weight-targeting policy.
+
+    prices: dates x tickers closes. target_weights(i) -> weights for day i.
+    Buys the targets at day 0's close; with rebalance_every set, trades back
+    to target at the close of every rebalance_every-th day after that. Every
+    trade pays `slippage` on the value traded.
+    """
+    px = prices.ffill().to_numpy(dtype=float)
+    n_days, _ = px.shape
+    w0 = np.asarray(target_weights(0), dtype=float)
+    # Entry: the whole 1.0 is bought, so slippage is paid on all of it.
+    holdings = (1.0 - slippage) * w0 / px[0]
+    values = np.empty(n_days)
+    values[0] = float(holdings @ px[0])
+
+    for i in range(1, n_days):
+        v = float(holdings @ px[i])
+        if rebalance_every and i % rebalance_every == 0:
+            target = np.asarray(target_weights(i), dtype=float) * v
+            traded = np.abs(target - holdings * px[i]).sum()
+            v -= slippage * traded
+            holdings = (target / target.sum()) * v / px[i]
+        values[i] = float(holdings @ px[i])
+    return pd.Series(values, index=prices.index)
+
+
+def max_drawdown_pct(values: pd.Series) -> float:
+    """Largest peak-to-trough fall, as a positive percentage."""
+    peak = values.cummax()
+    return float(((peak - values) / peak).max() * 100.0)
+
+
+def vol_sizing_verdict(windows: dict) -> dict:
+    """Apply the three pre-registered criteria to per-window arm results."""
+    rows = list(windows.values())
+    n = len(rows)
+    if not n:
+        return {"windows_scored": 0, "passed": False}
+
+    def mean(arm, key):
+        return float(np.mean([r[arm][key] for r in rows]))
+
+    hold_dd, ewma_dd = mean("hold", "max_dd"), mean("EWMA-sized", "max_dd")
+    dd_reduction = 1.0 - ewma_dd / hold_dd if hold_dd > 0 else 0.0
+    return_cost = mean("hold", "return") - mean("EWMA-sized", "return")
+    beats_hold = sum(1 for r in rows if r["EWMA-sized"]["max_dd"] < r["hold"]["max_dd"])
+    beats_control = sum(1 for r in rows
+                        if r["EWMA-sized"]["max_dd"] < r["equal, weekly"]["max_dd"])
+
+    c1 = (round(dd_reduction, 10) >= VOL_SIZING_MIN_DD_REDUCTION
+          and round(return_cost, 10) <= VOL_SIZING_MAX_RETURN_COST_PP)
+    c2 = beats_hold >= VOL_SIZING_MIN_WINDOWS
+    c3 = beats_control >= VOL_SIZING_MIN_WINDOWS
+    return {
+        "windows_scored": n,
+        "mean_max_dd": {arm: mean(arm, "max_dd") for arm in VOL_SIZING_ARMS},
+        "mean_return": {arm: mean(arm, "return") for arm in VOL_SIZING_ARMS},
+        "dd_reduction_vs_hold": dd_reduction,
+        "return_cost_pp": return_cost,
+        "windows_dd_below_hold": beats_hold,
+        "windows_dd_below_control": beats_control,
+        "criterion_1": bool(c1),
+        "criterion_2": bool(c2),
+        "criterion_3": bool(c3),
+        "passed": bool(c1 and c2 and c3),
+    }
+
+
+def run_vol_sizing_probe(windows: dict | None = None) -> dict:
+    """Simulate the three arms over every window."""
+    import backtest as bt
+
+    windows = windows or BROAD_WINDOWS
+    closes, sigmas = {}, {}
+    for ticker in WATCHLIST:
+        try:
+            prices = _load_prices(ticker)
+        except Exception as exc:
+            print(f"  {ticker}: FAILED {exc}")
+            continue
+        closes[ticker] = prices["Close"].astype(float)
+        sigmas[ticker] = vol_frame(prices)["ewma_vol"]
+    close_df = pd.DataFrame(closes).sort_index()
+    # Lag one day: the weights traded at day t's close use sigma known at t-1.
+    sigma_df = pd.DataFrame(sigmas).sort_index().shift(1)
+
+    results = {}
+    for name, (start_s, end_s) in windows.items():
+        start, end = pd.Timestamp(start_s), pd.Timestamp(end_s)
+        px = close_df[(close_df.index >= start) & (close_df.index <= end)].dropna(how="all")
+        if len(px) < 2 * VOL_SIZING_REBALANCE_DAYS:
+            print(f"  {name}: only {len(px)} price rows, skipping")
+            continue
+        sig = sigma_df.reindex(px.index)
+        k = px.shape[1]
+        equal = lambda i: np.full(k, 1.0 / k)
+        ewma = lambda i: inverse_vol_weights(sig.iloc[i]).to_numpy()
+
+        arms = {
+            "hold": simulate_weights(px, equal, None, bt.SLIPPAGE),
+            "equal, weekly": simulate_weights(px, equal, VOL_SIZING_REBALANCE_DAYS, bt.SLIPPAGE),
+            "EWMA-sized": simulate_weights(px, ewma, VOL_SIZING_REBALANCE_DAYS, bt.SLIPPAGE),
+        }
+        results[name] = {
+            arm: {"return": float((v.iloc[-1] - 1.0) * 100.0), "max_dd": max_drawdown_pct(v)}
+            for arm, v in arms.items()
+        }
+    return results
+
+
+def summarise_vol_sizing(results: dict, broad: bool) -> str:
+    """ASCII table plus the three criteria. No verdict off the full broad set."""
+    head = "".join(f"{a:>24}" for a in VOL_SIZING_ARMS)
+    out = [f"  {'window':<22}{head}", f"  {'':<22}" + "".join(
+        f"{'return':>12}{'max DD':>12}" for _ in VOL_SIZING_ARMS), "  " + "-" * 94]
+    for name, r in results.items():
+        cells = "".join(f"{r[a]['return']:>11.2f}%{r[a]['max_dd']:>11.2f}%" for a in VOL_SIZING_ARMS)
+        out.append(f"  {name:<22}{cells}")
+
+    v = vol_sizing_verdict(results)
+    if v["windows_scored"]:
+        out += [
+            "",
+            f"  1. Mean max DD {v['mean_max_dd']['EWMA-sized']:.2f}% vs hold "
+            f"{v['mean_max_dd']['hold']:.2f}%: {v['dd_reduction_vs_hold'] * 100:.1f}% smaller "
+            f"(need >= {VOL_SIZING_MIN_DD_REDUCTION * 100:.0f}%); return given up "
+            f"{v['return_cost_pp']:+.2f}pp (need <= {VOL_SIZING_MAX_RETURN_COST_PP:.0f}pp)"
+            f"  -> {'pass' if v['criterion_1'] else 'fail'}",
+            f"  2. Smaller max DD than hold in {v['windows_dd_below_hold']} of "
+            f"{v['windows_scored']} (need >= {VOL_SIZING_MIN_WINDOWS})"
+            f"  -> {'pass' if v['criterion_2'] else 'fail'}",
+            f"  3. Smaller max DD than weekly equal-weight in {v['windows_dd_below_control']} of "
+            f"{v['windows_scored']} (need >= {VOL_SIZING_MIN_WINDOWS})"
+            f"  -> {'pass' if v['criterion_3'] else 'fail'}",
+        ]
+    if not broad:
+        out.append("  NO VERDICT: the criteria were pre-registered on --broad only.")
+    elif v["windows_scored"] < len(BROAD_WINDOWS):
+        out.append(f"  NO VERDICT: only {v['windows_scored']} of {len(BROAD_WINDOWS)} "
+                   f"windows scored; the criteria assume all of them. Fix the data and re-run.")
+    else:
+        out.append(f"  VOLATILITY SIZING: {'PASS' if v['passed'] else 'FAIL'}")
+    return "\n".join(out)
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure the model against trivial baselines and sweep training history.",
@@ -1612,6 +1808,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Compare how a position is closed: on any non-BUY (the old "
              "simulator), on SELL only (what the bot does), on SELL or a stop, "
              "at the label horizon, or all three.",
+    )
+    parser.add_argument(
+        "--vol-sizing", action="store_true",
+        help="Equal-weight hold vs weekly equal-weight vs EWMA inverse-vol "
+             "weights on drawdown. Pre-registered criteria; verdict only "
+             "with --broad.",
     )
     parser.add_argument(
         "--vol-info", action="store_true",
@@ -1792,6 +1994,22 @@ def main(argv: list[str] | None = None) -> int:
             "policies": run_exit_probe(windows=window_set),
         }
         print(summarise_exits(results["policies"]))
+    elif args.vol_sizing:
+        print(f"\n=== Volatility-sized basket ({window_label}) ===")
+        print("  Hold vs weekly equal-weight (control) vs EWMA inverse-vol weights,")
+        print("  fully invested, rebalanced every 5 trading days, sigma lagged a day.")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "vol_sizing",
+            "window_set": window_label,
+            "windows": run_vol_sizing_probe(windows=window_set),
+        }
+        results["verdict"] = vol_sizing_verdict(results["windows"])
+        results["verdict"]["complete"] = (
+            window_set is BROAD_WINDOWS
+            and results["verdict"]["windows_scored"] == len(BROAD_WINDOWS)
+        )
+        print(summarise_vol_sizing(results["windows"], broad=window_set is BROAD_WINDOWS))
     elif args.vol_info:
         print(f"\n=== Volatility forecast probe, Stage 1 ({window_label}) ===")
         print("  Next-5-day realised volatility: model vs EWMA vs persistence,")
