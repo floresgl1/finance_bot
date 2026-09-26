@@ -954,6 +954,45 @@ The pre-registered consequence: **ML adds nothing over the formula.** The one
 question left open is whether sizing the basket by EWMA volatility — no model
 at all — beats equal-weight holding on drawdown.
 
+## O. Volatility sizing smooths the ride, but not enough to pay for it (2026-09-26)
+
+N left one idea with no model in it: weight the basket by EWMA volatility.
+`edge_probe.py --vol-sizing --broad` runs three fully-invested arms through a
+weight-targeting simulator (0.1% slippage on value traded, EWMA sigma lagged a
+day): equal-weight hold; equal weight rebalanced weekly (the control, because
+rebalancing changes a portfolio on its own); and 1/EWMA-volatility weights
+rebalanced weekly.
+
+**Pass criteria agreed before the first run:** (1) mean max drawdown at least
+20% smaller than hold while giving up no more than 2pp of mean return;
+(2) smaller max drawdown than hold in at least 7 of 10 windows; (3) smaller max
+drawdown than the weekly equal-weight control in at least 7 of 10.
+
+| Window | hold ret | hold DD | weekly ret | weekly DD | EWMA ret | EWMA DD |
+|---|---|---|---|---|---|---|
+| late 2019 bull | 24.25% | 4.62% | 23.26% | 4.51% | 19.78% | 4.60% |
+| covid crash 2020 | −5.41% | 31.06% | −4.63% | 31.29% | −3.00% | 29.07% |
+| covid recovery 2020 | 69.86% | 14.08% | 56.94% | 12.81% | 47.86% | 12.41% |
+| bull 2021 | 32.64% | 9.21% | 32.81% | 9.90% | 30.95% | 8.01% |
+| bear 2022 | −28.91% | 34.29% | −32.72% | 37.22% | −27.82% | 32.66% |
+| recovery 2023 | 75.41% | 13.44% | 66.31% | 11.61% | 45.86% | 11.17% |
+| bull 2024 | 43.50% | 13.71% | 38.86% | 13.07% | 31.10% | 9.94% |
+| choppy 2025 | 21.43% | 22.95% | 24.98% | 22.63% | 21.62% | 20.10% |
+| rally 2025-26 | 20.44% | 7.45% | 15.34% | 7.79% | 8.97% | 7.02% |
+| recent 2026 | 3.62% | 6.35% | 5.44% | 6.43% | 7.94% | 6.54% |
+
+**FAIL on criterion 1:** mean max drawdown 14.15% vs 15.72%, only **9.9%**
+smaller, while giving up **7.36pp** of mean return. Criteria 2 and 3 pass
+(9 and 8 of 10): the smoothing is real, consistent, and comes from the weights
+rather than the rebalancing. It is also small and expensive. Inverse-volatility
+weights hold more of the calm names and less of the volatile ones, and over
+2019-2026 the volatile names are where the basket's return came from
+(recovery 2023: hold 75.41%, EWMA-sized 45.86%).
+
+Findings M, N and O together: on this 12-name basket over this decade, nothing
+tested — the model's direction calls, its SELLs, a model's volatility
+forecasts, or formula-based volatility weights — beats holding it.
+
 ## Where this leaves things
 
 **The strategy does not beat buy-and-hold**, on every measurement taken: six
@@ -1090,6 +1129,7 @@ python edge_probe.py --tiers --broad            # position sizes (finding K)
 python edge_probe.py --exits --broad            # exit policy    (finding L)
 python edge_probe.py --sell-info --broad        # SELL -> forward return (finding M)
 python edge_probe.py --vol-info --broad         # model vs EWMA volatility (finding N)
+python edge_probe.py --vol-sizing --broad       # EWMA-weighted basket vs hold (finding O)
 python edge_probe.py --exposure --window 2026-03-05 2026-09-04
                                                 # simulate one exact period
 ```
