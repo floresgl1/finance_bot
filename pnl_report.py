@@ -68,6 +68,10 @@ KNOWN_EXIT_REASONS = (
 # Their presence is what tells the report whether the stop-loss tail is covered.
 STOP_LOSS_FILL = "STOP_LOSS_FILL"
 
+# Exits that sell the whole position. A position whose last exit is one of
+# these is closed; one ending in a trim is still open.
+FULL_CLOSE_EXIT_REASONS = ("TAKE_PROFIT", "MODEL_SELL")
+
 
 # ---------------------------------------------------------------------------
 # Loading
@@ -215,36 +219,117 @@ def confidence_tier(confidence: float) -> str:
     return "small (<0.50)"
 
 
-def attach_confidence(exits: pd.DataFrame, entries: pd.DataFrame) -> pd.DataFrame:
-    """Join each EXIT to its originating ENTRY via entry_order_id.
+def _present(series: pd.Series) -> pd.Series:
+    return series.notna() & (series.astype(str).str.strip() != "")
 
-    Unlinked exits (UNLINKED, or pre-migration blanks) keep a NaN confidence
-    and land in the 'unknown' tier rather than being dropped — they are still
-    real money.
+
+def attach_confidence(exits: pd.DataFrame, entries: pd.DataFrame) -> pd.DataFrame:
+    """Give each EXIT the confidence of the BUY that opened its position.
+
+    **DESIGN DECISION:**
+    Joined through position_id, not entry_order_id. entry_order_id links one
+    exit to one BUY, but a position spans several BUYs and several partial
+    exits, so that join orphaned every exit after the first trim and linked
+    others to BUYs of an earlier, closed position. The opening BUY's
+    confidence is used because that is the decision that created the trade
+    and set its size; adds carry their own confidence, and averaging them
+    would describe no decision the model actually made.
+
+    A position with no opening BUY in the log (held before the log began)
+    stays unknown rather than borrowing an add's confidence. Exits with no
+    position_id — logs not yet run through backfill_positions.py — fall back
+    to the entry_order_id join. Unlinked exits land in the 'unknown' tier
+    rather than being dropped — they are still real money.
     """
     if exits.empty:
         return exits
 
     joined = exits.copy()
-    if entries.empty or "entry_order_id" not in entries.columns:
-        joined["confidence"] = pd.NA
-    else:
-        lookup = (
+    joined["confidence"] = float("nan")
+
+    has_pid = "position_id" in joined.columns and _present(joined["position_id"])
+    if not entries.empty and "position_id" in entries.columns and "position_id" in joined.columns:
+        openers = entries[
+            _present(entries["position_id"])
+            & (entries.get("actual_action", pd.Series(index=entries.index, dtype=str)) == "BUY")
+        ]
+        by_position = (
+            openers.drop_duplicates("position_id", keep="first")
+            .set_index("position_id")["confidence"]
+        )
+        joined.loc[has_pid, "confidence"] = joined.loc[has_pid, "position_id"].map(by_position)
+
+    fallback = ~has_pid if isinstance(has_pid, pd.Series) else pd.Series(True, index=joined.index)
+    if not entries.empty and "entry_order_id" in entries.columns and fallback.any():
+        by_order = (
             entries.dropna(subset=["entry_order_id"])
             .drop_duplicates("entry_order_id", keep="last")
             .set_index("entry_order_id")["confidence"]
         )
-        joined["confidence"] = joined["entry_order_id"].map(lookup)
+        joined.loc[fallback, "confidence"] = joined.loc[fallback, "entry_order_id"].map(by_order)
 
     joined["confidence_tier"] = joined["confidence"].apply(confidence_tier)
     return joined
+
+
+def position_pnl(exits: pd.DataFrame) -> pd.DataFrame:
+    """Realized P&L per position: every trim and the final sale, together.
+
+    Counting exits counts trims as trades. The rebalancer trims an over-weight
+    position several times before it closes, so per-exit win rate and
+    expectancy mostly describe trim sizes. This is the per-trade view.
+    """
+    if exits.empty or "position_id" not in exits.columns:
+        return pd.DataFrame()
+    linked = exits[_present(exits["position_id"])].sort_values("date", kind="stable")
+    if linked.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for position_id, group in linked.groupby("position_id", sort=False):
+        rows.append({
+            "position_id": position_id,
+            "ticker": group["ticker"].iloc[0],
+            "first_exit": group["date"].min(),
+            "last_exit": group["date"].max(),
+            "exits": int(len(group)),
+            "total_pnl": float(group["realized_pnl"].sum()),
+            "closed": group["exit_reason"].iloc[-1] in FULL_CLOSE_EXIT_REASONS,
+        })
+    return pd.DataFrame(rows)
+
+
+def summarize_positions(exits: pd.DataFrame) -> dict | None:
+    """Headline per-position figures over closed positions, or None."""
+    positions = position_pnl(exits)
+    unlinked = int((~_present(exits["position_id"])).sum()) if (
+        not exits.empty and "position_id" in exits.columns
+    ) else int(len(exits))
+    if positions.empty:
+        return None
+
+    closed = positions[positions["closed"]]
+    pnl = closed["total_pnl"]
+    wins, losses = int((pnl > 0).sum()), int((pnl < 0).sum())
+    decided = wins + losses
+    return {
+        "closed": int(len(closed)),
+        "open": int((~positions["closed"]).sum()),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": (wins / decided * 100) if decided else 0.0,
+        "avg_pnl": float(pnl.mean()) if len(pnl) else 0.0,
+        "avg_exits": float(closed["exits"].mean()) if len(closed) else 0.0,
+        "unlinked_exits": unlinked,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
 def _money(value: float) -> str:
-    return f"${value:,.2f}"
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.2f}"
 
 
 def _table(df: pd.DataFrame, key: str, key_width: int = 20) -> list[str]:
@@ -324,6 +409,23 @@ def format_report(exits: pd.DataFrame, entries: pd.DataFrame, since: str | None 
         out.append("  BY CONFIDENCE TIER  (does confidence predict dollars?)")
         out.extend(_table(by_tier, "confidence_tier"))
 
+    ps = summarize_positions(exits)
+    if ps is not None:
+        out.append("")
+        out.append("  BY POSITION  (a trim is part of a trade, not a trade)")
+        out.append(f"    Closed positions    : {ps['closed']}  ({ps['open']} still open)")
+        out.append(
+            f"    Win rate            : {ps['win_rate']:.1f}%  "
+            f"({ps['wins']}W / {ps['losses']}L)"
+        )
+        out.append(f"    Avg P&L / position  : {_money(ps['avg_pnl'])}")
+        out.append(f"    Avg exits / position: {ps['avg_exits']:.1f}")
+        if ps["unlinked_exits"]:
+            out.append(
+                f"    NOTE: {ps['unlinked_exits']} exit(s) have no position_id and are "
+                f"excluded here. Run backfill_positions.py."
+            )
+
     out.append("")
     out.append(_blind_spot_note(exits))
     return "\n".join(out)
@@ -389,6 +491,15 @@ def format_discord(exits: pd.DataFrame, entries: pd.DataFrame) -> str:
                 f"· `{row['exit_reason']}` — {_money(row['total_pnl'])} "
                 f"over {row['trades']} ({row['win_rate']:.0f}% win)"
             )
+
+    ps = summarize_positions(exits)
+    if ps is not None:
+        lines.append("")
+        lines.append(
+            f"**By position:** {ps['closed']} closed ({ps['open']} open) · "
+            f"win rate {ps['win_rate']:.0f}% · {_money(ps['avg_pnl'])}/position · "
+            f"{ps['avg_exits']:.1f} exits each"
+        )
 
     lines.append("")
     recovered = int((exits["exit_reason"] == STOP_LOSS_FILL).sum())

@@ -434,3 +434,151 @@ def test_discord_summary_on_empty_log():
     message = format_discord(pd.DataFrame(), pd.DataFrame())
 
     assert "no closed trades" in message.lower()
+
+
+# --- position_id: confidence and per-position P&L --------------------------
+#
+# Shapes taken from the live log: AAPL bought once then exited five times
+# (four trims + a take-profit); under entry_order_id only the first trim
+# linked, so four exits fell into the 'unknown' tier.
+
+import pnl_report
+from pnl_report import position_pnl, summarize_positions
+
+
+def _pos_exit(pid, date, pnl, reason="REBALANCE_TRIM", ticker="AAPL"):
+    row = _exit_row(date=date, ticker=ticker, entry_order_id="UNLINKED",
+                    exit_reason=reason, realized_pnl=pnl)
+    row["position_id"] = pid
+    return row
+
+
+def _opener(pid, confidence, action="BUY", ticker="AAPL", date="2026-06-25"):
+    row = _entry_row(date=date, ticker=ticker, entry_order_id=pid, confidence=confidence)
+    row["actual_action"] = action
+    row["position_id"] = pid
+    return row
+
+
+def _aapl_position():
+    return [
+        _opener("p1", 70.0),
+        _pos_exit("p1", "2026-06-26", -42.25),
+        _pos_exit("p1", "2026-06-30", 93.58),
+        _pos_exit("p1", "2026-07-01", 143.58),
+        _pos_exit("p1", "2026-07-02", 67.85),
+        _pos_exit("p1", "2026-07-16", 1423.83, reason="TAKE_PROFIT"),
+    ]
+
+
+def test_every_exit_of_a_position_gets_the_openers_confidence(log):
+    _write_log(log, _aapl_position())
+
+    joined = attach_confidence(load_exits(str(log)), load_entries(str(log)))
+
+    assert set(joined["confidence_tier"]) == {"large (>=0.65)"}
+
+
+def test_adds_do_not_override_the_opening_confidence(log):
+    _write_log(log, [
+        _opener("p1", 70.0),
+        _opener("p1", 40.0, action="ADD_TO_POSITION", date="2026-06-27"),
+        _pos_exit("p1", "2026-07-16", 500.0, reason="TAKE_PROFIT"),
+    ])
+
+    joined = attach_confidence(load_exits(str(log)), load_entries(str(log)))
+
+    assert joined["confidence"].iloc[0] == 70.0
+
+
+def test_position_held_before_the_log_stays_unknown(log):
+    """Only adds in the log: no opening decision to attribute to."""
+    _write_log(log, [
+        _opener("bf-NVDA-2026-03-23", 43.4, action="ADD_TO_POSITION", ticker="NVDA"),
+        _pos_exit("bf-NVDA-2026-03-23", "2026-04-27", 1285.58, reason="TAKE_PROFIT", ticker="NVDA"),
+    ])
+
+    joined = attach_confidence(load_exits(str(log)), load_entries(str(log)))
+
+    assert list(joined["confidence_tier"]) == ["unknown"]
+
+
+def test_exits_without_position_id_fall_back_to_entry_order_id(log):
+    _write_log(log, [
+        _opener("p1", 70.0),
+        _pos_exit("p1", "2026-07-01", 10.0, reason="MODEL_SELL"),
+        _entry_row(entry_order_id="e9", confidence=42.0, ticker="MSFT"),
+        _exit_row(entry_order_id="e9", ticker="MSFT", realized_pnl=-5.0),
+    ])
+
+    joined = attach_confidence(load_exits(str(log)), load_entries(str(log)))
+
+    tiers = dict(zip(joined["ticker"], joined["confidence_tier"]))
+    assert tiers == {"AAPL": "large (>=0.65)", "MSFT": "small (<0.50)"}
+
+
+def test_position_pnl_sums_trims_and_the_final_sale(log):
+    _write_log(log, _aapl_position())
+
+    positions = position_pnl(load_exits(str(log)))
+
+    assert len(positions) == 1
+    row = positions.iloc[0]
+    assert row["exits"] == 5
+    assert row["total_pnl"] == pytest.approx(1686.59)
+    assert bool(row["closed"]) is True
+
+
+def test_position_ending_in_a_trim_is_open(log):
+    _write_log(log, [_pos_exit("p1", "2026-07-01", 10.0), _pos_exit("p1", "2026-07-02", 5.0)])
+
+    assert bool(position_pnl(load_exits(str(log))).iloc[0]["closed"]) is False
+
+
+def test_summary_counts_positions_not_exits(log):
+    _write_log(log, _aapl_position() + [
+        _pos_exit("p2", "2026-07-03", -30.0, ticker="MSFT"),
+        _pos_exit("p2", "2026-07-05", -70.0, reason="MODEL_SELL", ticker="MSFT"),
+        _pos_exit("p3", "2026-07-06", 12.0, ticker="JPM"),                 # still open
+        _exit_row(date="2026-07-07", ticker="XOM", realized_pnl=5.0),      # no position_id
+    ])
+
+    ps = summarize_positions(load_exits(str(log)))
+
+    assert (ps["closed"], ps["open"]) == (2, 1)
+    assert (ps["wins"], ps["losses"]) == (1, 1)
+    assert ps["avg_pnl"] == pytest.approx((1686.59 - 100.0) / 2)
+    assert ps["avg_exits"] == pytest.approx(3.5)
+    assert ps["unlinked_exits"] == 1
+
+
+def test_summary_is_none_before_any_position_ids(log):
+    _write_log(log, [_exit_row()])
+
+    assert summarize_positions(load_exits(str(log))) is None
+
+
+def test_reports_show_the_position_view(log):
+    _write_log(log, _aapl_position())
+    exits, entries = load_exits(str(log)), load_entries(str(log))
+
+    console = format_report(exits, entries)
+    discord = format_discord(exits, entries)
+
+    assert "BY POSITION" in console
+    assert "Closed positions    : 1  (0 still open)" in console
+    assert "**By position:** 1 closed (0 open)" in discord
+
+
+def test_reports_omit_the_position_view_without_ids(log):
+    _write_log(log, [_exit_row()])
+    exits, entries = load_exits(str(log)), load_entries(str(log))
+
+    assert "BY POSITION" not in format_report(exits, entries)
+    assert "By position" not in format_discord(exits, entries)
+
+
+def test_negative_money_puts_the_sign_before_the_dollar():
+    """Was rendering 'avg loss $-141.48' in the weekly Discord post."""
+    assert pnl_report._money(-141.48) == "-$141.48"
+    assert pnl_report._money(1234.5) == "$1,234.50"

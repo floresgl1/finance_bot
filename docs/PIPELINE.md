@@ -723,6 +723,21 @@ Unlinked exits (`entry_order_id == "UNLINKED"`, or pre-migration blanks) are
 bucketed as `unknown` confidence rather than dropped. They are still real money
 and must not vanish from the totals.
 
+**DESIGN DECISION — confidence through position_id (2026-09-25).**
+Each exit takes the confidence of the BUY (`actual_action == "BUY"`) that
+opened its position, not of the ENTRY its `entry_order_id` points at. That
+join orphaned every exit after a position's first trim and credited others to
+BUYs of earlier, closed positions. Adds are ignored: they carry their own
+confidence, and an average would describe no decision the model made. A
+position with no opening BUY in the log stays `unknown`. Exits with no
+`position_id` fall back to the old join.
+
+**BY POSITION** groups every trim and the final sale into one trade. Per-exit
+figures count trims as trades (123 of 185 exits in the 2026-09-25 report were
+trims), so they mostly describe trim sizes. A position is closed when its last
+exit is TAKE_PROFIT or MODEL_SELL, the two exits that sell the whole position.
+Win rate and average P&L use closed positions only.
+
 **Stop-loss coverage** depends on `reconcile_stops.py` having run. The report
 inspects its own data for `STOP_LOSS_FILL` rows and states which case it is
 looking at, rather than asserting coverage it cannot verify — without them,
