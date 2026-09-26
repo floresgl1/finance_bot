@@ -66,6 +66,7 @@ STOP_LOSS_POLL_INTERVAL_S  = 0.2    # seconds between status polls when awaiting
 # Order fill verification
 FILL_TIMEOUT_S       = 10    # max seconds to wait for a submitted order to fill
 FILL_POLL_INTERVAL_S = 1.0   # seconds between status polls when awaiting fill
+ORDER_CANCEL_CONFIRM_TIMEOUT_S = 10  # max seconds to wait for Alpaca to confirm a cancel before any retry
 
 # New signal-logger action codes introduced by OTO stop-loss integration
 CANCEL_STOP_FAILED = "CANCEL_STOP_FAILED"

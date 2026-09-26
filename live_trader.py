@@ -85,6 +85,7 @@ from config import (
     AGENT_VETO,
     AGENT_DECISIONS_PATH,
     FILL_TIMEOUT_S,
+    ORDER_CANCEL_CONFIRM_TIMEOUT_S,
     FILL_POLL_INTERVAL_S,
     BUY_UNFILLED,
     SELL_UNFILLED,
@@ -890,57 +891,22 @@ def _submit_buy(api: tradeapi.REST, ticker: str, qty: int) -> dict:
 
 
 def place_buy(api: tradeapi.REST, ticker: str, qty: int) -> dict:
-    """Submit an OTO buy, poll for fill, retry once if unfilled.
+    """Submit an OTO buy, confirm the fill, retry once only if nothing filled.
 
     The stop_price is computed from the most recent trade price at submission time, so
     the logged entry estimate and the submitted stop are visible in the same line for
     drift inspection.
 
-    Returns ``{"status": "filled", "order_id": ...}`` on confirmed fill,
-    ``{"status": "unfilled", "order_id": ...}`` after both attempts fail (a Discord
-    alert is sent), or the usual ``"skipped"`` / ``"error"`` dicts.
+    Returns ``{"status": "filled", "order_id", "filled_qty"}`` (with
+    ``"partial": True`` when only part filled), ``{"status": "unfilled", ...}``
+    when nothing filled or the order state is unknown (a Discord alert is
+    sent), or the usual ``"skipped"`` / ``"error"`` dicts. See _place_with_retry.
     """
     if qty <= 0:
         print(f"  [SKIP] {ticker} — insufficient equity for even 1 share")
         return {"status": "skipped", "reason": "insufficient equity"}
 
-    for attempt in (1, 2):
-        try:
-            result = _submit_buy(api, ticker, qty)
-        except Exception as exc:
-            _raise_if_infra(exc, "submit_buy", ticker)
-            print(f"  [ERROR] {ticker} BUY submit failed: {exc}")
-            return {"status": "error", "reason": str(exc)}
-
-        order_id = result["order_id"]
-        filled_order = _wait_for_fill(api, order_id)
-        if filled_order is not None:
-            print(f"  [FILL]  {ticker} order {order_id} — {filled_order.status}")
-            return {"status": "filled", "order_id": order_id,
-                    "filled_qty": getattr(filled_order, "filled_qty", None)}
-
-        # Not filled — cancel the pending order before a possible retry.
-        _cancel_order_best_effort(api, order_id)
-
-        # Guard against the race where the order filled between our last
-        # poll and the cancel attempt. Without this check, the retry would
-        # double the position.
-        late_fill = _check_fill_after_cancel(api, order_id)
-        if late_fill is not None:
-            return {"status": "filled", "order_id": order_id,
-                    "filled_qty": getattr(late_fill, "filled_qty", None)}
-
-        if attempt == 1:
-            print(f"  [RETRY] {ticker} order {order_id} not filled — retrying once")
-
-    # Both attempts failed.
-    send_discord(
-        f"🚨 **BUY UNFILLED** — {ticker} x{qty}\n"
-        f"Two submission attempts timed out without a fill.\n"
-        f"Last order id: {order_id}\n"
-        f"Manual review required."
-    )
-    return {"status": "unfilled", "order_id": order_id}
+    return _place_with_retry(api, ticker, qty, lambda: _submit_buy(api, ticker, qty), "BUY")
 
 
 def _submit_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
@@ -957,44 +923,11 @@ def _submit_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
 
 
 def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
-    """Submit a market sell, poll for fill, retry once if unfilled.
+    """Submit a market sell, confirm the fill, retry once only if nothing filled.
 
-    Returns ``{"status": "filled", "order_id": ...}`` on confirmed fill,
-    ``{"status": "unfilled", "order_id": ...}`` after both attempts fail (a Discord
-    alert is sent), or the usual ``"error"`` dict.
+    Same result shape as place_buy. See _place_with_retry.
     """
-    for attempt in (1, 2):
-        try:
-            result = _submit_sell(api, ticker, qty)
-        except Exception as exc:
-            _raise_if_infra(exc, "submit_sell", ticker)
-            print(f"  [ERROR] {ticker} SELL submit failed: {exc}")
-            return {"status": "error", "reason": str(exc)}
-
-        order_id = result["order_id"]
-        filled_order = _wait_for_fill(api, order_id)
-        if filled_order is not None:
-            print(f"  [FILL]  {ticker} order {order_id} — {filled_order.status}")
-            return {"status": "filled", "order_id": order_id,
-                    "filled_qty": getattr(filled_order, "filled_qty", None)}
-
-        _cancel_order_best_effort(api, order_id)
-
-        late_fill = _check_fill_after_cancel(api, order_id)
-        if late_fill is not None:
-            return {"status": "filled", "order_id": order_id,
-                    "filled_qty": getattr(late_fill, "filled_qty", None)}
-
-        if attempt == 1:
-            print(f"  [RETRY] {ticker} order {order_id} not filled — retrying once")
-
-    send_discord(
-        f"🚨 **SELL UNFILLED** — {ticker} x{qty}\n"
-        f"Two submission attempts timed out without a fill.\n"
-        f"Last order id: {order_id}\n"
-        f"Manual review required."
-    )
-    return {"status": "unfilled", "order_id": order_id}
+    return _place_with_retry(api, ticker, qty, lambda: _submit_sell(api, ticker, qty), "SELL")
 
 
 # ---------------------------------------------------------------------------
@@ -1275,32 +1208,45 @@ def cancel_standing_stops(api, ticker: str) -> tuple[bool, list[str]]:
 # ---------------------------------------------------------------------------
 # Order fill verification
 # ---------------------------------------------------------------------------
-_FILL_TERMINAL = frozenset({"filled", "partially_filled"})
-_FILL_FAILED   = frozenset({"rejected", "canceled", "expired", "suspended"})
+# Statuses after which an order cannot fill any more shares. partially_filled
+# is deliberately absent: the rest of the order is still working.
+_ORDER_FINAL = frozenset({
+    "filled", "canceled", "expired", "rejected", "done_for_day", "replaced",
+})
 
 
-def _wait_for_fill(api, order_id: str) -> object | None:
-    """Poll ``api.get_order(order_id)`` until the order reaches a fill state.
+def _order_filled_qty(order) -> float:
+    """filled_qty as a float. Alpaca sends a string; anything else counts as 0."""
+    raw = getattr(order, "filled_qty", None)
+    if isinstance(raw, (int, float, str)):
+        try:
+            return float(raw)
+        except ValueError:
+            return 0.0
+    return 0.0
 
-    Returns the Alpaca order object on fill/partial fill, or ``None`` on
-    timeout or terminal failure (rejected / canceled / expired).
+
+def _wait_for_final(api, order_id: str, timeout_s: float, interval_s: float) -> object | None:
+    """Poll until the order reaches a final status; ``None`` on timeout.
+
+    A final order can fill nothing more, so its filled_qty is the truth. An
+    order that is still working — new, accepted, partially_filled,
+    pending_cancel — can, which is why a timeout returns None instead of the
+    last status seen.
     """
-    deadline = time.time() + FILL_TIMEOUT_S
+    deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
             order = api.get_order(order_id)
         except Exception as exc:
             _raise_if_infra(exc, "get_order_fill_poll")
             print(f"  [FILL_POLL] order {order_id} — status poll error: {exc}")
-            time.sleep(FILL_POLL_INTERVAL_S)
+            time.sleep(interval_s)
             continue
-        if order.status in _FILL_TERMINAL:
+        if order.status in _ORDER_FINAL:
             return order
-        if order.status in _FILL_FAILED:
-            print(f"  [FILL_POLL] order {order_id} — terminal failure: {order.status}")
-            return None
-        time.sleep(FILL_POLL_INTERVAL_S)
-    print(f"  [FILL_POLL] order {order_id} — timed out after {FILL_TIMEOUT_S}s")
+        time.sleep(interval_s)
+    print(f"  [FILL_POLL] order {order_id} — still working after {timeout_s}s")
     return None
 
 
@@ -1312,23 +1258,75 @@ def _cancel_order_best_effort(api, order_id: str) -> None:
         print(f"  [FILL_CANCEL] order {order_id} — cancel failed (swallowed): {exc}")
 
 
-def _check_fill_after_cancel(api, order_id: str) -> object | None:
-    """One final status check after cancelling an order.
+def _place_with_retry(api, ticker: str, qty: float, submit, label: str) -> dict:
+    """Submit an order, confirm how much filled, and retry once only if nothing did.
 
-    If the order filled between our last poll and the cancel attempt, the
-    cancel failed silently but the position is open. Retrying without
-    checking would double the position. Returns the order object if it
-    filled, ``None`` otherwise.
+    **DESIGN DECISION — retry only after Alpaca confirms the order is dead.**
+    A cancel request is asynchronous. The old code sent it, looked once, and
+    retried unless the order already read filled — but an order reading
+    pending_cancel or accepted can still fill. Both orders filling doubled a
+    BUY, or sent a second full-quantity SELL (a short, on an account that
+    allows them). Now, after cancelling, the order is polled until it reaches
+    a final status. Only a final order with zero shares filled is retried. If
+    the cancel is never confirmed, nothing is retried and a human is alerted:
+    a missed trade is recoverable, a doubled one is not.
+
+    **DESIGN DECISION — a partial fill is a fill, of what actually filled.**
+    partially_filled used to count as done, and the rest of the order kept
+    filling untracked. Now it is waited out; on timeout the remainder is
+    cancelled and the result carries the confirmed filled_qty. The remainder
+    is not re-submitted.
     """
-    try:
-        order = api.get_order(order_id)
-        if order.status in _FILL_TERMINAL:
-            print(f"  [FILL_RACE] order {order_id} — filled after cancel ({order.status})")
-            return order
-    except Exception as exc:
-        _raise_if_infra(exc, "get_order_post_cancel")
-        print(f"  [FILL_RACE] order {order_id} — post-cancel check failed: {exc}")
-    return None
+    order_id = None
+    for attempt in (1, 2):
+        try:
+            order_id = submit()["order_id"]
+        except Exception as exc:
+            _raise_if_infra(exc, f"submit_{label.lower()}", ticker)
+            print(f"  [ERROR] {ticker} {label} submit failed: {exc}")
+            return {"status": "error", "reason": str(exc)}
+
+        order = _wait_for_final(api, order_id, FILL_TIMEOUT_S, FILL_POLL_INTERVAL_S)
+        if order is None:
+            _cancel_order_best_effort(api, order_id)
+            order = _wait_for_final(
+                api, order_id, ORDER_CANCEL_CONFIRM_TIMEOUT_S, STOP_LOSS_POLL_INTERVAL_S
+            )
+        if order is None:
+            send_discord(
+                f"🚨 **{label} STATE UNKNOWN** — {ticker} x{qty}\n"
+                f"Order {order_id} did not fill and its cancel was not confirmed. "
+                f"Not retrying, because it may still fill. Manual review required."
+            )
+            return {"status": "unfilled", "order_id": order_id,
+                    "reason": "cancel not confirmed; not retried"}
+
+        if order.status == "filled":
+            print(f"  [FILL]  {ticker} order {order_id} — filled")
+            return {"status": "filled", "order_id": order_id,
+                    "filled_qty": getattr(order, "filled_qty", None)}
+
+        filled = _order_filled_qty(order)
+        if filled > 0:
+            send_discord(
+                f"⚠️ **{label} PARTIALLY FILLED** — {ticker}: {filled:g} of {qty} "
+                f"(order {order_id} {order.status}). The remainder was not re-submitted."
+            )
+            return {"status": "filled", "order_id": order_id,
+                    "filled_qty": filled, "partial": True}
+
+        # Final with nothing filled: a retry cannot double the position.
+        print(f"  [FILL_POLL] order {order_id} — {order.status} with nothing filled")
+        if attempt == 1:
+            print(f"  [RETRY] {ticker} order {order_id} not filled — retrying once")
+
+    send_discord(
+        f"🚨 **{label} UNFILLED** — {ticker} x{qty}\n"
+        f"Two submission attempts ended without a fill.\n"
+        f"Last order id: {order_id}\n"
+        f"Manual review required."
+    )
+    return {"status": "unfilled", "order_id": order_id}
 
 
 # ---------------------------------------------------------------------------
@@ -1396,7 +1394,7 @@ def check_position_limits(
                     entry_price    = entry_price,
                     exit_price     = current_price,
                     exit_reason    = "TAKE_PROFIT",
-                    shares         = qty,
+                    shares         = float(result.get("filled_qty") or qty),
                     position_id    = find_position_id(ticker),
                 )
                 exited.append(ticker)
