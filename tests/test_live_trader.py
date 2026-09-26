@@ -459,9 +459,19 @@ def _touch(path, when: datetime):
     os.utime(path, (ts, ts))
 
 
+def _written_earlier_today(now: datetime) -> datetime:
+    """A write time before `now` that is still today in UTC.
+
+    `now - 30min` is yesterday between 00:00 and 00:30 UTC, which the gate
+    correctly rejects — that made a fresh-file test fail whenever CI ran then.
+    """
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(now - timedelta(minutes=30), today_start)
+
+
 def test_fresh_files_pass_the_gate(data_dir):
     now = datetime.now(timezone.utc)
-    written = now - timedelta(minutes=30)
+    written = _written_earlier_today(now)
     _touch(data_dir / "AAPL.csv", written)
     _touch(data_dir / "market" / "SPY.csv", written)
 
@@ -469,6 +479,26 @@ def test_fresh_files_pass_the_gate(data_dir):
 
     assert is_fresh is True
     assert reason == ""
+    assert failed == []
+
+
+def test_fresh_files_pass_the_gate_just_after_midnight(data_dir, monkeypatch):
+    """Pins the clock to 00:20 UTC, the time the flaky CI run failed at."""
+    frozen = datetime(2026, 9, 26, 0, 20, tzinfo=timezone.utc)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz else frozen.replace(tzinfo=None)
+
+    monkeypatch.setattr(live_trader, "datetime", _FrozenDatetime)
+    written = _written_earlier_today(frozen)
+    _touch(data_dir / "AAPL.csv", written)
+    _touch(data_dir / "market" / "SPY.csv", written)
+
+    is_fresh, reason, failed = check_market_data_freshness(frozen)
+
+    assert is_fresh is True, reason
     assert failed == []
 
 
