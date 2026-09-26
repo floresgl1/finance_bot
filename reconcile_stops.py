@@ -20,8 +20,13 @@ drift out of sync with the log it describes; the log is already the thing that
 round-trips.
 
 **DESIGN DECISION:**
-Entry price comes from `api.get_order(entry_order_id).filled_avg_price` — the
-actual fill of the original BUY — rather than the ENTRY row's `price`, which is
+Entry price is the position's cost basis: the quantity-weighted
+`filled_avg_price` of every BUY sharing the stop's position_id
+(`position_entry_price`). A position spans several BUYs, and the single BUY
+`find_open_entry_order_id` returns can belong to another position entirely.
+Only when that cannot be established does it fall back to
+`api.get_order(entry_order_id).filled_avg_price` — the actual fill of one
+BUY — rather than the ENTRY row's `price`, which is
 the signal-time estimate. The whole point of this module is to stop
 under-reporting losses; using the optimistic number would undercut it. When the
 order cannot be fetched the row is still written, using the ENTRY row's price
@@ -280,6 +285,50 @@ def resolve_position_id(api, ticker: str, filled_at: str,
     return (None, "")
 
 
+def position_entry_price(api, ticker: str, position_id: str | None,
+                         path: str = SIGNAL_LOG_PATH) -> tuple[float | None, str]:
+    """Quantity-weighted fill price of every BUY in the position, from Alpaca.
+
+    That is Alpaca's average cost for the position: sells do not change the
+    average, only buys do. Returns (None, note) when the position has no BUY
+    with an order id (opened before order ids were logged) or any of its BUYs
+    cannot be fetched — a partial average would be a wrong number, so the
+    caller falls back instead.
+    """
+    if not position_id or not os.path.exists(path):
+        return (None, "")
+    try:
+        df = pd.read_csv(path, dtype=str)
+    except Exception:
+        return (None, "")
+    if "position_id" not in df.columns:
+        return (None, "")
+
+    buys = df[
+        (df["ticker"] == ticker)
+        & (df["position_id"] == position_id)
+        & df["actual_action"].isin(["BUY", "ADD_TO_POSITION"])
+        & df["entry_order_id"].notna()
+        & (df["entry_order_id"] != "")
+    ]
+    if buys.empty:
+        return (None, "position has no BUY with an order id")
+
+    shares = cost = 0.0
+    for order_id in buys["entry_order_id"].drop_duplicates():
+        try:
+            order = api.get_order(order_id)
+            qty, price = float(order.filled_qty), float(order.filled_avg_price)
+        except Exception as exc:
+            return (None, f"could not fetch position BUY {order_id} ({exc})")
+        if qty > 0 and price > 0:
+            shares += qty
+            cost += qty * price
+    if shares <= 0:
+        return (None, "position BUYs report no fills")
+    return (round(cost / shares, 4), "")
+
+
 def entry_price_from_log(ticker: str, entry_order_id: str, path: str = SIGNAL_LOG_PATH) -> float | None:
     """Fall back to the signal-time price on the matching ENTRY row."""
     if not os.path.exists(path):
@@ -333,6 +382,18 @@ def reconcile(api, since: date, *, dry_run: bool = False,
         )
         if position_note:
             note = f"{note}; {position_note}" if note else position_note
+
+        # Prefer the position's own cost basis. resolve_entry's BUY comes from
+        # find_open_entry_order_id, which after trims and adds can be a
+        # different BUY of this position or one of an earlier, closed one —
+        # the two stop fills in the 2026-09-25 report both read as wins.
+        position_price, price_note = position_entry_price(
+            api, fill["ticker"], position_id, log_path
+        )
+        if position_price is not None:
+            entry_price = position_price
+        elif price_note:
+            note = f"{note}; {price_note}" if note else price_note
 
         if entry_price is None:
             entry_price = entry_price_from_log(fill["ticker"], entry_order_id, log_path)
