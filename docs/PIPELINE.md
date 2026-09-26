@@ -837,8 +837,14 @@ sessions cannot leak its position's id onto the next one.
 The column was appended last in `FIELDNAMES`. `_ensure_file()` migrates a log
 with exactly the old header in place (backup at
 `signal_log.csv.pre_position_id.bak`); any other header mismatch still raises.
-Rows written before the column existed stay blank until the one-off replay
-backfill. `entry_order_id` is still written and still means "an ENTRY row this
+Rows written before the column existed are filled by the one-off
+`backfill_positions.py`, which replays the log flat-to-flat and writes a
+**new** csv for review. It defers to the broker's view recorded at the time: an
+`actual_action == "BUY"` row means Alpaca reported the ticker flat (pre-April
+take-profits wrote no row, so share counts alone would keep those positions
+open), and `STOP_BACKFILL` rows resync the held quantity. Every such correction
+is printed as a flag; `--check-alpaca` also compares the replay's open
+positions with Alpaca's. `entry_order_id` is still written and still means "an ENTRY row this
 exit drew from" — nothing that reads it changed.
 
 **Runs:** daily in `evaluate_signals.yml`, after `outcome_tracker.py` and
