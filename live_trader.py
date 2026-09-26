@@ -1226,6 +1226,18 @@ def _order_filled_qty(order) -> float:
     return 0.0
 
 
+def _order_fill_price(order) -> float | None:
+    """filled_avg_price as a positive float, or None if Alpaca gave none."""
+    raw = getattr(order, "filled_avg_price", None)
+    if isinstance(raw, (int, float, str)):
+        try:
+            price = float(raw)
+        except ValueError:
+            return None
+        return price if price > 0 else None
+    return None
+
+
 def _wait_for_final(api, order_id: str, timeout_s: float, interval_s: float) -> object | None:
     """Poll until the order reaches a final status; ``None`` on timeout.
 
@@ -1304,7 +1316,8 @@ def _place_with_retry(api, ticker: str, qty: float, submit, label: str) -> dict:
         if order.status == "filled":
             print(f"  [FILL]  {ticker} order {order_id} — filled")
             return {"status": "filled", "order_id": order_id,
-                    "filled_qty": getattr(order, "filled_qty", None)}
+                    "filled_qty": getattr(order, "filled_qty", None),
+                    "filled_avg_price": _order_fill_price(order)}
 
         filled = _order_filled_qty(order)
         if filled > 0:
@@ -1313,7 +1326,8 @@ def _place_with_retry(api, ticker: str, qty: float, submit, label: str) -> dict:
                 f"(order {order_id} {order.status}). The remainder was not re-submitted."
             )
             return {"status": "filled", "order_id": order_id,
-                    "filled_qty": filled, "partial": True}
+                    "filled_qty": filled, "partial": True,
+                    "filled_avg_price": _order_fill_price(order)}
 
         # Final with nothing filled: a retry cannot double the position.
         print(f"  [FILL_POLL] order {order_id} — {order.status} with nothing filled")
@@ -1392,7 +1406,7 @@ def check_position_limits(
                     ticker         = ticker,
                     entry_order_id = entry_order_id,
                     entry_price    = entry_price,
-                    exit_price     = current_price,
+                    exit_price     = result.get("filled_avg_price") or current_price,
                     exit_reason    = "TAKE_PROFIT",
                     shares         = float(result.get("filled_qty") or qty),
                     position_id    = find_position_id(ticker),
@@ -1852,7 +1866,9 @@ def _run_execution(api: tradeapi.REST) -> None:
                 ticker         = ticker,
                 entry_order_id = entry_order_id,
                 entry_price    = entry_price_for_exit,
-                exit_price     = price,
+                # The fill, not `price`: that is the previous close from the
+                # ticker CSV, so P&L carried the overnight gap as if realised.
+                exit_price     = result.get("filled_avg_price") or price,
                 exit_reason    = "MODEL_SELL",
                 shares         = actual_qty,
                 position_id    = find_position_id(ticker),

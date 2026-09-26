@@ -154,74 +154,71 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
             })
             continue
 
-        # --- Place trim order (order fail edge case) ------------------------
+        # --- Place trim order, confirm the fill ------------------------------
+        # Through place_sell, so the EXIT row is written only for shares that
+        # actually sold, at the price they sold at. The trim used to be
+        # fire-and-forget: the row was written on submit, at the position's
+        # quoted price, whether or not the order ever filled.
+        from live_trader import place_sell
+        from signal_logger import log_exit, find_open_entry_order_id, find_position_id
+
+        # Avg entry price, read before the sell.
         try:
-            order = api.submit_order(
-                symbol        = ticker,
-                qty           = qty,
-                side          = "sell",
-                type          = "market",
-                time_in_force = "day",
-            )
-            print(f"  [REBALANCER] {ticker} trim placed — order id {order.id}")
-
-            # Log as EXIT row — rebalancer is an operational trim, not a model signal
-            from signal_logger import log_exit, find_open_entry_order_id, find_position_id
-            entry_order_id = find_open_entry_order_id(ticker) or "UNLINKED"
-
-            # Avg entry price from the position (captured above in this function's
-            # position-parsing block). Re-fetch from Alpaca for safety in case the
-            # earlier parse used current_price only.
-            try:
-                position_fresh = api.get_position(ticker)
-                entry_price_for_exit = float(position_fresh.avg_entry_price)
-            except Exception as exc:
-                _raise_if_infra(exc, "get_position", ticker)
-                print(f"  [REBALANCER] Could not fetch avg_entry_price for {ticker}: {exc} — using current price as fallback")
-                entry_price_for_exit = float(price)
-
-            log_exit(
-                ticker         = ticker,
-                entry_order_id = entry_order_id,
-                entry_price    = entry_price_for_exit,
-                exit_price     = price,
-                exit_reason    = "REBALANCE_TRIM",
-                shares         = qty,
-                position_id    = find_position_id(ticker),
-            )
-
-            # Refresh equity after each successful trim
-            try:
-                equity = float(api.get_account().equity)
-            except Exception as exc:
-                _raise_if_infra(exc, "get_account", ticker)
-                print(f"  [REBALANCER] Equity refresh failed after {ticker} trim: {exc}")
-
-            outcomes.append({
-                "ticker":   ticker,
-                "action":   "SELL",
-                "qty":      qty,
-                "price":    price,
-                "status":   "placed",
-                "order_id": order.id,
-                "reason":   "rebalance trim",
-            })
-
+            entry_price_for_exit = float(api.get_position(ticker).avg_entry_price)
         except Exception as exc:
-            _raise_if_infra(exc, "submit_order", ticker)
-            print(f"  [REBALANCER] {ticker} trim order failed: {exc}")
-            # Note: no log_exit() on order failure — no position closed, nothing to log.
-            # The outcome dict below records the failure for Discord summary.
+            _raise_if_infra(exc, "get_position", ticker)
+            print(f"  [REBALANCER] Could not fetch avg_entry_price for {ticker}: {exc} — using current price as fallback")
+            entry_price_for_exit = float(price)
+
+        result = place_sell(api, ticker, qty)
+        if result["status"] != "filled":
+            # Nothing sold, nothing to log. The stop cancelled above is
+            # re-attached by live_trader's post-rebalance stop check.
+            print(f"  [REBALANCER] {ticker} trim {result['status']}: {result.get('reason', '')}")
             outcomes.append({
                 "ticker":   ticker,
                 "action":   "SELL",
                 "qty":      qty,
                 "price":    price,
                 "status":   "error",
-                "order_id": "",
-                "reason":   str(exc),
+                "order_id": result.get("order_id", ""),
+                "reason":   result.get("reason") or f"trim {result['status']}",
             })
-            # Continue to next position
+            continue
+
+        sold       = float(result.get("filled_qty") or qty)
+        fill_price = result.get("filled_avg_price") or price
+        print(f"  [REBALANCER] {ticker} trim filled — {sold:g} sh @ ${fill_price:.2f}, order id {result['order_id']}")
+
+        # Log as EXIT row — rebalancer is an operational trim, not a model signal
+        log_exit(
+            ticker         = ticker,
+            entry_order_id = find_open_entry_order_id(ticker) or "UNLINKED",
+            entry_price    = entry_price_for_exit,
+            exit_price     = fill_price,
+            exit_reason    = "REBALANCE_TRIM",
+            shares         = sold,
+            position_id    = find_position_id(ticker),
+        )
+
+        # Refresh equity after each successful trim
+        try:
+            equity = float(api.get_account().equity)
+        except Exception as exc:
+            _raise_if_infra(exc, "get_account", ticker)
+            print(f"  [REBALANCER] Equity refresh failed after {ticker} trim: {exc}")
+
+        # "placed" means the trim executed; live_trader keys the BUY-pass skip
+        # list and the Discord summary on it.
+        outcomes.append({
+            "ticker":   ticker,
+            "action":   "SELL",
+            "qty":      sold,
+            "price":    fill_price,
+            "status":   "placed",
+            "order_id": result["order_id"],
+            "reason":   "rebalance trim",
+        })
 
     if not outcomes:
         print("  [REBALANCER] No positions required trimming.")
