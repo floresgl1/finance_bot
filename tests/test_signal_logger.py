@@ -110,3 +110,107 @@ def test_header_only_no_data(monkeypatch, tmp_path):
     monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(fake_csv))
 
     _ensure_file()
+
+
+# --- position_id ------------------------------------------------------------
+
+
+def _write_rows(path, fieldnames, rows):
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _read_rows(path):
+    with open(path, newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_legacy_header_is_migrated_not_rejected(monkeypatch, tmp_path):
+    """The live log predates position_id; the first run after deploy must not halt."""
+    fake_csv = tmp_path / "signal_log.csv"
+    _write_rows(str(fake_csv), signal_logger.LEGACY_FIELDNAMES, [
+        {"date": "2026-06-25", "ticker": "AAPL", "row_type": "ENTRY", "entry_order_id": "o1"},
+        {"date": "2026-06-26", "ticker": "AAPL", "row_type": "EXIT", "realized_pnl": "-42.25"},
+    ])
+    monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(fake_csv))
+
+    _ensure_file()
+
+    with open(str(fake_csv)) as fh:
+        assert next(csv.reader(fh)) == FIELDNAMES
+    rows = _read_rows(str(fake_csv))
+    assert [r["entry_order_id"] for r in rows] == ["o1", ""]
+    assert rows[1]["realized_pnl"] == "-42.25"
+    assert all(r["position_id"] == "" for r in rows)
+    assert os.path.exists(str(fake_csv) + ".pre_position_id.bak")
+
+
+def test_migration_refuses_rows_wider_than_the_header(monkeypatch, tmp_path):
+    fake_csv = tmp_path / "signal_log.csv"
+    with open(str(fake_csv), "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(signal_logger.LEGACY_FIELDNAMES)
+        w.writerow(["x"] * (len(signal_logger.LEGACY_FIELDNAMES) + 1))
+    monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(fake_csv))
+
+    with pytest.raises(ValueError, match="refusing to migrate"):
+        _ensure_file()
+    with open(str(fake_csv)) as fh:
+        assert next(csv.reader(fh)) == signal_logger.LEGACY_FIELDNAMES
+
+
+def test_log_signal_and_log_exit_write_position_id(monkeypatch, tmp_path):
+    fake_csv = tmp_path / "signal_log.csv"
+    monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(fake_csv))
+
+    signal_logger.log_signal("AAPL", "BUY", 100.0, 10, 60.0, "BUY",
+                             entry_order_id="o1", position_id="o1")
+    signal_logger.log_signal("AAPL", "HOLD", 100.0, 0, 40.0, "HOLD")
+    signal_logger.log_exit("AAPL", "o1", 100.0, 110.0, "REBALANCE_TRIM", 3, position_id="o1")
+
+    assert [r["position_id"] for r in _read_rows(str(fake_csv))] == ["o1", "", "o1"]
+
+
+def test_find_position_id_missing_log(monkeypatch, tmp_path):
+    monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(tmp_path / "nope.csv"))
+    assert signal_logger.find_position_id("AAPL") is None
+
+
+def test_find_position_id_none_for_pre_position_id_history(monkeypatch, tmp_path):
+    fake_csv = tmp_path / "signal_log.csv"
+    _write_rows(str(fake_csv), FIELDNAMES, [
+        {"date": "2026-04-08", "ticker": "NVDA", "row_type": "ENTRY", "entry_order_id": ""},
+    ])
+    monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(fake_csv))
+    assert signal_logger.find_position_id("NVDA") is None
+
+
+def test_find_position_id_survives_repeated_trims(monkeypatch, tmp_path):
+    """The AAPL case: one BUY, four trims, then a take-profit. Every exit links."""
+    fake_csv = tmp_path / "signal_log.csv"
+    rows = [{"date": "2026-06-25", "ticker": "AAPL", "row_type": "ENTRY",
+             "entry_order_id": "o1", "position_id": "o1"}]
+    for d in ("2026-06-26", "2026-06-30", "2026-07-01", "2026-07-02"):
+        rows.append({"date": d, "ticker": "AAPL", "row_type": "EXIT", "position_id": "o1"})
+    _write_rows(str(fake_csv), FIELDNAMES, rows)
+    monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(fake_csv))
+
+    assert signal_logger.find_position_id("AAPL") == "o1"
+
+
+def test_find_position_id_is_per_ticker_and_newest_wins(monkeypatch, tmp_path):
+    fake_csv = tmp_path / "signal_log.csv"
+    _write_rows(str(fake_csv), FIELDNAMES, [
+        {"date": "2026-06-24", "ticker": "NVDA", "position_id": "posA"},
+        {"date": "2026-08-04", "ticker": "NVDA", "position_id": "posB"},
+        {"date": "2026-08-05", "ticker": "MSFT", "position_id": "posM"},
+        # A reconciled stop for posA appended later but dated earlier must
+        # not make posA look current again.
+        {"date": "2026-08-03", "ticker": "NVDA", "row_type": "EXIT", "position_id": "posA"},
+    ])
+    monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(fake_csv))
+
+    assert signal_logger.find_position_id("NVDA") == "posB"
+    assert signal_logger.find_position_id("MSFT") == "posM"

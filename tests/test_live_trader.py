@@ -1835,3 +1835,37 @@ def test_nan_feature_error_does_not_halt_session(monkeypatch, tmp_path):
     from live_trader import _is_infra_error
     exc = _NaNFeatureError("AAPL: 1 NaN feature(s) — Volatility")
     assert _is_infra_error(exc) is False
+
+
+# --- position_id on BUY rows -------------------------------------------------
+
+
+def _log_with(tmp_path, monkeypatch, rows):
+    path = tmp_path / "signal_log.csv"
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=signal_logger.FIELDNAMES, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+    monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(path))
+
+
+def test_new_position_mints_its_own_order_id(tmp_path, monkeypatch):
+    # An older id for the ticker belongs to a closed position; Alpaca says
+    # we are flat, so it must not be reused.
+    _log_with(tmp_path, monkeypatch, [{"date": "2026-06-01", "ticker": "AAPL", "position_id": "old"}])
+    assert live_trader._buy_position_id("AAPL", False, "new-order") == "new-order"
+
+
+def test_add_reuses_the_open_position_id(tmp_path, monkeypatch):
+    _log_with(tmp_path, monkeypatch, [{"date": "2026-06-01", "ticker": "AAPL", "position_id": "pos1"}])
+    assert live_trader._buy_position_id("AAPL", True, "add-order") == "pos1"
+
+
+def test_add_to_a_pre_position_id_holding_starts_an_id(tmp_path, monkeypatch):
+    _log_with(tmp_path, monkeypatch, [])
+    assert live_trader._buy_position_id("AAPL", True, "add-order") == "add-order"
+
+
+def test_unfilled_buy_gets_no_position_id(tmp_path, monkeypatch):
+    _log_with(tmp_path, monkeypatch, [])
+    assert live_trader._buy_position_id("AAPL", False, None) is None

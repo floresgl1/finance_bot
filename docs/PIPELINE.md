@@ -809,6 +809,38 @@ every other exit path already uses.
 `log_exit()` gained an optional `exit_timestamp` parameter to support this;
 it defaults to now, so every existing caller is unchanged.
 
+**DESIGN DECISION — position_id by fill time.**
+Unlike the live exit paths, this job cannot take "the ticker's most recent
+position_id": it runs after the session, and the bot may already have bought
+the ticker again. `resolve_position_id()` picks the latest position opened
+before the stop filled. For a position opened the same day as the fill it
+compares the opening BUY's `filled_at` from Alpaca; if that fetch fails the id
+is left blank rather than guessed.
+
+### Position identity (`position_id`, added 2026-09-25)
+
+`entry_order_id` cannot link exits correctly. `find_open_entry_order_id()`
+treats a BUY as closed once *any* EXIT shares its id, but one Alpaca position
+spans several BUYs (open + adds) and several partial exits (trims). Measured on
+the live log: AAPL bought 78 shares once, then five exits; the first trim
+consumed the only ENTRY and the other four, including a $1,424 take-profit,
+logged `UNLINKED`. NVDA shows exits from one position linked to BUYs of an
+earlier, already-closed one, so the confidence-tier table in `pnl_report.py`
+mis-attributes dollars.
+
+`position_id` is the order id of the BUY that opened the position. A BUY whose
+ticker Alpaca reports as not held mints a new id; an add, trim, model SELL or
+take-profit reuses `find_position_id(ticker)`. Flatness is decided by the
+broker, not by counting shares in the log, so a stop that fired between
+sessions cannot leak its position's id onto the next one.
+
+The column was appended last in `FIELDNAMES`. `_ensure_file()` migrates a log
+with exactly the old header in place (backup at
+`signal_log.csv.pre_position_id.bak`); any other header mismatch still raises.
+Rows written before the column existed stay blank until the one-off replay
+backfill. `entry_order_id` is still written and still means "an ENTRY row this
+exit drew from" — nothing that reads it changed.
+
 **Runs:** daily in `evaluate_signals.yml`, after `outcome_tracker.py` and
 **before** the log is uploaded back to PythonAnywhere, so recovered rows persist.
 

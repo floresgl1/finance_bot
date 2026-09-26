@@ -46,6 +46,7 @@ Valid actual_action values:
 
 import csv
 import os
+import shutil
 from datetime import date, datetime, timedelta, timezone
 
 from config import DATA_DIR, PREDICTION_DAYS
@@ -73,7 +74,12 @@ FIELDNAMES = [
     "exit_reason",
     "shares",
     "realized_pnl",
+    "position_id",
 ]
+
+# Header written before position_id existed. _ensure_file() migrates a log
+# with exactly this header in place; any other mismatch still raises.
+LEGACY_FIELDNAMES = FIELDNAMES[:-1]
 
 
 def _ensure_file() -> None:
@@ -103,6 +109,10 @@ def _ensure_file() -> None:
                 f"before proceeding."
             )
 
+    if header == LEGACY_FIELDNAMES:
+        _migrate_add_position_id()
+        return
+
     if header != FIELDNAMES:
         raise ValueError(
             f"signal_log.csv header does not match FIELDNAMES.\n"
@@ -111,6 +121,39 @@ def _ensure_file() -> None:
             f"To fix: update the header of data/signal_log.csv on PA to "
             f"match FIELDNAMES."
         )
+
+
+def _migrate_add_position_id() -> None:
+    """Rewrite a pre-position_id log with a blank position_id column.
+
+    The live log on PA predates the column, and the strict header check would
+    otherwise halt the first run after deploy. Blank is correct for history:
+    existing rows are assigned position ids by the one-off backfill, not here.
+
+    A copy of the original is kept beside it, and the rewrite goes through a
+    temp file + os.replace so a crash mid-write cannot truncate the log.
+    """
+    backup = SIGNAL_LOG_PATH + ".pre_position_id.bak"
+    tmp = SIGNAL_LOG_PATH + ".tmp"
+
+    with open(SIGNAL_LOG_PATH, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+
+    # DictReader collects surplus fields under the None key. Writing those
+    # rows would silently drop data, so refuse instead.
+    if any(None in row for row in rows):
+        raise ValueError(
+            "signal_log.csv has rows with more fields than its header; "
+            "refusing to migrate it. Inspect data/signal_log.csv on PA."
+        )
+
+    shutil.copy2(SIGNAL_LOG_PATH, backup)
+    with open(tmp, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=FIELDNAMES, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, SIGNAL_LOG_PATH)
+    print(f"  [LOG] Added position_id column to {SIGNAL_LOG_PATH} (backup: {backup})")
 
 
 def log_signal(
@@ -123,6 +166,7 @@ def log_signal(
     shap_values: dict | None = None,
     today: date | None = None,
     entry_order_id: str | None = None,
+    position_id: str | None = None,
 ) -> None:
     """
     Append one ENTRY row to signal_log.csv.
@@ -142,6 +186,9 @@ def log_signal(
     entry_order_id : Alpaca order UUID from a successful BUY placement, used to
                      link ENTRY rows to future EXIT rows. Pass None for non-BUY
                      rows, skips, errors, or HOLDs.
+    position_id    : id of the position this BUY opened or added to — the
+                     order id of the BUY that opened it. Pass None for rows
+                     that moved no shares.
 
     All exit-related columns (exit_timestamp, exit_price, exit_reason, shares,
     realized_pnl) are left blank on ENTRY rows.
@@ -182,6 +229,7 @@ def log_signal(
         "exit_reason":     "",
         "shares":          "",
         "realized_pnl":    "",
+        "position_id":     position_id if position_id else "",
     }
 
     try:
@@ -204,6 +252,7 @@ def log_exit(
     shares: int | float,
     today: date | None = None,
     exit_timestamp: str | None = None,
+    position_id: str | None = None,
 ) -> None:
     """
     Append one EXIT row to signal_log.csv.
@@ -228,6 +277,9 @@ def log_exit(
                      reconciled row carries the moment the stop actually
                      fired rather than the moment it was discovered — which
                      is also what makes re-running the reconciler idempotent.
+    position_id    : id of the position these shares came out of. This, not
+                     entry_order_id, is the reliable link: one position spans
+                     several BUYs and several partial exits.
 
     ENTRY-only columns (model_signal, price, qty, confidence,
     evaluation_date, actual_action, outcome_price, result,
@@ -263,6 +315,7 @@ def log_exit(
         "exit_reason":     exit_reason,
         "shares":          int(shares),
         "realized_pnl":    realized_pnl,
+        "position_id":     position_id if position_id else "",
     }
 
     try:
@@ -321,3 +374,40 @@ def find_open_entry_order_id(ticker: str) -> str | None:
 
     entry_rows.sort(key=lambda r: r.get("date", ""), reverse=True)
     return entry_rows[0]["entry_order_id"]
+
+
+def find_position_id(ticker: str) -> str | None:
+    """
+    Return the position_id most recently recorded for `ticker`.
+
+    A position runs flat-to-flat: the BUY that opens it mints the id and every
+    later BUY and EXIT reuses it until the ticker goes flat again. So for an
+    exit placed *while the bot holds the ticker*, the most recent id is the id
+    of the position being sold.
+
+    Not valid for exits written after the fact: a new position may have been
+    opened since. reconcile_stops.py resolves those by fill time instead.
+
+    Returns None if the log does not exist or no row for the ticker carries an
+    id (positions opened before position_id existed).
+    """
+    if not os.path.exists(SIGNAL_LOG_PATH):
+        return None
+
+    try:
+        with open(SIGNAL_LOG_PATH, newline="") as fh:
+            rows = list(csv.DictReader(fh))
+    except OSError:
+        return None
+
+    candidates = [
+        (r.get("date", ""), idx, r["position_id"])
+        for idx, r in enumerate(rows)
+        if r.get("ticker") == ticker and r.get("position_id")
+    ]
+    if not candidates:
+        return None
+
+    # Latest date wins; file order breaks same-day ties. Rows are not purely
+    # date-ordered because reconciled stop exits are appended backdated.
+    return max(candidates)[2]
