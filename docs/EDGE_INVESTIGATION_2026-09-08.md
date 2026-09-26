@@ -869,6 +869,50 @@ investigation has been. The reason to do it is that it removes a component that
 is measurably worse than chance and replaces it with a knob pointed in the
 direction the evidence favours.
 
+## M. SELL carries no reliable return information (2026-09-26)
+
+L suggested one design no arm had tested: hold the basket by default and let
+the model only *sell*, since SELL was its one measurable edge. Before building
+that overlay, Stage 1 asked the narrow question it depends on: over the next
+label horizon, do names the model says SELL on actually do worse?
+
+`edge_probe.py --sell-info --broad`. One model per window, trained with a
+label embargo (the last horizon's rows before each window are dropped, since
+their labels read prices inside it). Forward 7-day returns compared **within
+each ticker** — SELL days vs other days of the same name, weighted by SELL-day
+count — so the result measures timing, not which tickers get flagged.
+
+**Pass criteria were agreed before the first run:** SELL days underperform in
+at least 7 of 10 windows AND the mean gap exceeds 0.2% (a round trip at 0.1%
+slippage a side).
+
+| Window | SELL days | other | SELL fwd | other fwd | within-ticker gap |
+|---|---|---|---|---|---|
+| late 2019 bull | 331 | 677 | 1.90% | 1.65% | +0.04% |
+| covid crash 2020 | 168 | 456 | −0.99% | 0.79% | **+2.20%** |
+| covid recovery 2020 | 589 | 1451 | 1.88% | 1.80% | **+1.37%** |
+| bull 2021 | 775 | 2249 | 1.47% | 0.56% | −0.60% |
+| bear 2022 | 586 | 1922 | −0.53% | −1.41% | −0.15% |
+| recovery 2023 | 1237 | 1763 | 1.76% | 1.12% | −0.97% |
+| bull 2024 | 1488 | 1536 | 1.26% | 0.67% | +0.63% |
+| choppy 2025 | 828 | 1728 | 0.90% | 0.72% | −0.01% |
+| rally 2025-26 | 393 | 1263 | 0.52% | 0.68% | +0.50% |
+| recent 2026 | 298 | 530 | 0.88% | 0.71% | −0.57% |
+
+**FAIL: 5 of 10 windows** — a coin flip. The mean gap (0.242%) clears the cost
+bar only because of the two covid windows; the other eight average **−0.14%**,
+i.e. SELL days did slightly *better*. That is exactly the single-regime result
+the 7-of-10 rule exists to reject.
+
+The pooled columns add a second point: in 7 of 10 windows the raw forward
+return on SELL days is *higher* than on other days. The model says SELL more
+on the stronger names; the within-ticker measure removes that composition
+effect, and what is left is noise.
+
+L's +0.0353 was a classification edge. Like E, it does not survive being
+scored on returns. The pre-registered consequence: **the SELL-overlay (Stage 2)
+is not built.** No component of this model has a return edge left to deploy.
+
 ## Where this leaves things
 
 **The strategy does not beat buy-and-hold**, on every measurement taken: six
@@ -1003,6 +1047,7 @@ python edge_probe.py --horizons 3 7 21 --broad  # ten windows, not four (finding
 python edge_probe.py --exposure --broad         # F, corrected
 python edge_probe.py --tiers --broad            # position sizes (finding K)
 python edge_probe.py --exits --broad            # exit policy    (finding L)
+python edge_probe.py --sell-info --broad        # SELL -> forward return (finding M)
 python edge_probe.py --exposure --window 2026-03-05 2026-09-04
                                                 # simulate one exact period
 ```

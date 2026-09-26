@@ -851,3 +851,88 @@ def test_exit_summary_is_ascii_only():
     })
 
     summarise_exits(results).encode("ascii")
+
+
+# ---------------------------------------------------------------------------
+# SELL information probe (Stage 1)
+# ---------------------------------------------------------------------------
+
+
+def _frame(signals, fwd):
+    idx = pd.date_range("2024-01-01", periods=len(signals), freq="B")
+    return pd.DataFrame({"Signal": signals, "fwd": fwd}, index=idx)
+
+
+def test_forward_returns_look_ahead_by_the_horizon():
+    close = pd.Series([100.0, 110.0, 121.0, 133.1])
+    fwd = edge_probe._forward_returns(close, 2)
+    assert fwd.iloc[0] == pytest.approx(0.21)
+    assert fwd.iloc[2:].isna().all()
+
+
+def test_sell_days_that_precede_losses_give_a_positive_gap():
+    frames = {"AAPL": _frame(["SELL", "SELL", "HOLD", "BUY"], [-0.02, -0.02, 0.01, 0.01])}
+    r = edge_probe.sell_gap(frames)
+    assert r["gap"] == pytest.approx(0.03)
+    assert (r["n_sell"], r["n_other"]) == (2, 2)
+
+
+def test_gap_measures_timing_not_which_tickers_get_flagged():
+    """The model flags a weak ticker a lot, but within each ticker SELL days
+    are no different from other days. The pooled comparison would show a big
+    'edge'; the within-ticker gap must be zero."""
+    frames = {
+        "WEAK":   _frame(["SELL", "SELL", "SELL", "HOLD"], [-0.01] * 4),
+        "STRONG": _frame(["SELL", "BUY", "BUY", "BUY"], [0.01] * 4),
+    }
+    r = edge_probe.sell_gap(frames)
+    assert r["gap"] == pytest.approx(0.0)
+    assert r["other_fwd_mean"] - r["sell_fwd_mean"] > 0.009   # the pooled illusion
+
+
+def test_ticker_needs_both_kinds_of_day_to_count():
+    frames = {
+        "ALLSELL": _frame(["SELL", "SELL"], [-0.05, -0.05]),
+        "AAPL":    _frame(["SELL", "HOLD"], [0.00, 0.01]),
+    }
+    r = edge_probe.sell_gap(frames)
+    assert r["tickers_scored"] == 1
+    assert r["gap"] == pytest.approx(0.01)
+
+
+def test_rows_without_a_forward_return_are_dropped():
+    frames = {"AAPL": _frame(["SELL", "HOLD", "SELL"], [-0.01, 0.01, np.nan])}
+    r = edge_probe.sell_gap(frames)
+    assert r["n_sell"] == 1
+
+
+def _windows(gaps):
+    return {f"w{i}": {"gap": g} for i, g in enumerate(gaps)}
+
+
+@pytest.mark.parametrize("gaps, passed", [
+    ([0.004] * 7 + [-0.001] * 3, True),     # 7 of 10, mean 0.25%
+    ([0.004] * 6 + [-0.001] * 4, False),    # only 6 windows
+    ([0.001] * 10, False),                  # every window, but mean 0.1% < cost
+    ([0.002] * 10, False),                  # exactly the cost is not enough
+])
+def test_verdict_applies_the_pre_registered_criteria(gaps, passed):
+    assert edge_probe.sell_info_verdict(_windows(gaps))["passed"] is passed
+
+
+def test_verdict_ignores_windows_without_a_gap():
+    v = edge_probe.sell_info_verdict({**_windows([0.004] * 7), "empty": {"gap": None}})
+    assert (v["windows_scored"], v["passed"]) == (7, True)
+
+
+def test_criteria_are_the_ones_agreed_before_the_run():
+    """Changing these after seeing results is the failure mode this test exists for."""
+    assert edge_probe.SELL_INFO_MIN_WINDOWS == 7
+    assert edge_probe.SELL_INFO_MIN_MEAN_GAP == 0.002
+
+
+def test_a_run_with_missing_windows_gives_no_verdict():
+    """A data failure scored zero windows and printed FAIL. It must say NO VERDICT."""
+    text = edge_probe.summarise_sell_info({}, broad=True)
+    assert "NO VERDICT" in text
+    assert "FAIL" not in text
