@@ -1991,3 +1991,179 @@ def test_add_to_a_pre_position_id_holding_starts_an_id(tmp_path, monkeypatch):
 def test_unfilled_buy_gets_no_position_id(tmp_path, monkeypatch):
     _log_with(tmp_path, monkeypatch, [])
     assert live_trader._buy_position_id("AAPL", False, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Standing stop coverage
+# ---------------------------------------------------------------------------
+#
+# Every sell path cancels a ticker's stops first. A trim leaves shares behind
+# and a failed sell leaves all of them; these tests pin that they are
+# re-protected in the same session, and that a halted bot still protects.
+
+from types import SimpleNamespace
+
+
+def _position(symbol="AAPL", qty="45", avg="200.0", **extra):
+    return SimpleNamespace(symbol=symbol, qty=qty, avg_entry_price=avg, **extra)
+
+
+def _open_stop():
+    return SimpleNamespace(side="sell", type="stop")
+
+
+@pytest.fixture
+def quiet(monkeypatch):
+    logged, alerts = [], []
+    monkeypatch.setattr("signal_logger.log_signal", lambda *a, **kw: logged.append(a))
+    monkeypatch.setattr(live_trader, "send_discord", alerts.append)
+    return logged, alerts
+
+
+def test_unprotected_position_gets_a_stop(quiet):
+    logged, _ = quiet
+    api = MagicMock()
+    api.list_positions.return_value = [_position(qty_available="45")]
+    api.list_orders.return_value = []
+
+    assert live_trader.ensure_standing_stops(api) == ["AAPL"]
+
+    kw = api.submit_order.call_args.kwargs
+    assert (kw["side"], kw["type"], kw["qty"], kw["time_in_force"]) == ("sell", "stop", 45.0, "gtc")
+    assert kw["stop_price"] == round(200.0 * (1 - config.STOP_LOSS_PCT), 2)
+    assert logged[0][5] == "STOP_BACKFILL"
+
+
+def test_position_with_a_stop_is_left_alone(quiet):
+    api = MagicMock()
+    api.list_positions.return_value = [_position(qty_available="0")]
+    api.list_orders.return_value = [_open_stop()]
+
+    assert live_trader.ensure_standing_stops(api) == []
+    api.submit_order.assert_not_called()
+
+
+def test_stop_after_a_pending_trim_covers_only_the_remaining_shares(quiet):
+    """45 held, 15 reserved by an unfilled trim: the stop must be for 30."""
+    api = MagicMock()
+    api.list_positions.return_value = [_position(qty="45", qty_available="30")]
+    api.list_orders.return_value = []
+
+    live_trader.ensure_standing_stops(api)
+
+    assert api.submit_order.call_args.kwargs["qty"] == 30.0
+
+
+def test_fully_reserved_position_gets_no_stop(quiet):
+    api = MagicMock()
+    api.list_positions.return_value = [_position(qty="45", qty_available="0")]
+    api.list_orders.return_value = []
+
+    assert live_trader.ensure_standing_stops(api) == []
+    api.submit_order.assert_not_called()
+
+
+def test_missing_qty_available_falls_back_to_qty(quiet):
+    api = MagicMock()
+    api.list_positions.return_value = [_position(qty="12")]
+    api.list_orders.return_value = []
+
+    live_trader.ensure_standing_stops(api)
+
+    assert api.submit_order.call_args.kwargs["qty"] == 12.0
+
+
+def test_rejected_stop_is_logged_and_alerted(quiet):
+    logged, alerts = quiet
+    api = MagicMock()
+    api.list_positions.return_value = [_position(qty_available="45")]
+    api.list_orders.return_value = []
+    api.submit_order.side_effect = Exception("insufficient qty available")
+
+    assert live_trader.ensure_standing_stops(api) == []
+    assert logged[0][5] == config.STOP_BACKFILL_FAILED
+    assert "backfill failed" in alerts[0]
+
+
+def test_list_positions_infra_error_halts(quiet):
+    import requests
+    api = MagicMock()
+    api.list_positions.side_effect = requests.exceptions.ConnectionError("down")
+
+    with pytest.raises(live_trader.AlpacaInfraError):
+        live_trader.ensure_standing_stops(api)
+
+
+def test_protect_before_exit_never_blocks_the_exit(quiet):
+    _, alerts = quiet
+    import requests
+    api = MagicMock()
+    api.list_positions.side_effect = requests.exceptions.ConnectionError("down")
+
+    live_trader._protect_before_exit(api)   # must not raise
+
+    assert "Could not verify standing stops" in alerts[-1]
+
+
+def _run_harness(monkeypatch, tmp_path):
+    monkeypatch.setattr(live_trader, "get_api", lambda: MagicMock())
+    monkeypatch.setattr(live_trader, "market_is_open", lambda api: True)
+    monkeypatch.setattr(live_trader, "send_discord", lambda msg: None)
+    monkeypatch.setattr("signal_logger.log_signal", lambda *a, **kw: None)
+    calls = []
+    monkeypatch.setattr(live_trader, "ensure_standing_stops", lambda api: calls.append("stops") or [])
+    return calls
+
+
+def test_halt_flag_exit_still_protects_positions(monkeypatch, tmp_path):
+    calls = _run_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(live_trader, "_check_halt_flag", lambda: (True, "halted"))
+
+    with pytest.raises(SystemExit) as exc:
+        live_trader.run()
+
+    assert exc.value.code == 1
+    assert calls == ["stops"]
+
+
+def test_stale_data_exit_still_protects_positions(monkeypatch, tmp_path):
+    calls = _run_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(live_trader, "_check_halt_flag", lambda: (False, ""))
+    monkeypatch.setattr(live_trader, "check_market_data_freshness",
+                        lambda start: (False, "AAPL.csv: missing", ["AAPL.csv"]))
+
+    with pytest.raises(SystemExit) as exc:
+        live_trader.run()
+
+    assert exc.value.code == 1
+    assert calls == ["stops"]
+
+
+def test_stops_are_rechecked_after_the_rebalancer(monkeypatch, tmp_path):
+    """Order matters: the second check must run after trims, before the BUY pass."""
+    from live_trader import _run_execution
+
+    events = []
+    monkeypatch.setattr(live_trader, "check_portfolio_loss_limits", lambda *a, **kw: (False, ""))
+    monkeypatch.setattr(live_trader, "check_peak_drawdown", lambda *a, **kw: (False, ""))
+    monkeypatch.setattr(live_trader, "check_position_limits", lambda api, owned: ([], owned))
+    monkeypatch.setattr(live_trader, "get_owned_tickers", lambda api: {})
+    monkeypatch.setattr(live_trader, "get_equity", lambda api: 100_000.0)
+    monkeypatch.setattr(live_trader, "get_cooldown_tickers", lambda: set())
+    monkeypatch.setattr(live_trader, "get_recent_stop_fill_tickers", lambda api: set())
+    monkeypatch.setattr(live_trader, "_load_agent_decisions", lambda: {})
+    monkeypatch.setattr(live_trader, "send_discord", lambda msg: None)
+    monkeypatch.setattr(live_trader, "ensure_standing_stops", lambda api: events.append("stops") or [])
+    monkeypatch.setattr(live_trader, "run_rebalancer", lambda api, skip: events.append("rebalance") or [])
+    monkeypatch.setattr(live_trader, "get_signals", lambda sentiment_df=None: [{
+        "ticker": "AAPL", "final_signal": "HOLD", "confidence": 40.0,
+        "current_price": 100.0, "shap_values": {},
+    }])
+    monkeypatch.setattr(live_trader, "LAST_RUN_GUARD_PATH", str(tmp_path / "guard.txt"))
+    monkeypatch.setattr(live_trader, "_read_portfolio_snapshot", lambda: {})
+    monkeypatch.setattr(live_trader, "_write_portfolio_snapshot", lambda snap: None)
+    monkeypatch.setattr("signal_logger.log_signal", lambda *a, **kw: None)
+
+    _run_execution(MagicMock())
+
+    assert events == ["stops", "rebalance", "stops"]

@@ -16,8 +16,11 @@ what Alpaca reported at the time, and the replay defers to them:
     actual_action "BUY"   — the bot saw the ticker as not held (an add is
                             logged as ADD_TO_POSITION), so the ticker was flat.
                             Opens a new position whatever the replay thinks.
-    actual_action "STOP_BACKFILL" — written at session start with the held
-                            quantity. Resyncs the running balance.
+    actual_action "STOP_BACKFILL" — written with the unreserved held quantity
+                            when a stop is (re)attached: at session start, and
+                            since 2026-09-26 also after the sell/rebalance
+                            passes, after that session's trim EXIT rows.
+                            Resyncs the running balance.
 
 Every correction is reported as a flag. A flag is not an error in the replay:
 it marks a place where the log is missing a trade, and the report is the

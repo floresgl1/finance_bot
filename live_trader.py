@@ -1101,6 +1101,105 @@ def get_recent_stop_fill_tickers(api) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Standing stop-loss coverage
+# ---------------------------------------------------------------------------
+def _unreserved_qty(position) -> float:
+    """Shares not already held for an open order.
+
+    The rebalancer submits its trim and moves on without waiting for the
+    fill, so right after a trim Alpaca still reports the pre-trim qty with
+    the trimmed shares reserved. A stop for the full qty would be rejected.
+    Falls back to qty when the field is absent.
+    """
+    raw = getattr(position, "qty_available", None)
+    try:
+        return float(raw) if raw is not None else float(position.qty)
+    except (TypeError, ValueError):
+        return float(position.qty)
+
+
+def ensure_standing_stops(api) -> list[str]:
+    """
+    Attach a standing GTC stop to every held position that has none.
+
+    Runs at session start, again after the sell and rebalance passes, and on
+    the halt-flag and stale-data exits. Every sell path cancels a ticker's
+    stops before selling; a trim leaves shares behind and a failed sell
+    leaves all of them, and those shares used to go unprotected until the
+    next session — or indefinitely while the halt flag kept sessions from
+    reaching this point. A stop is protective, not a trade, so it is placed
+    even when the bot is otherwise halted.
+
+    Returns the tickers a stop was placed for.
+    """
+    from signal_logger import log_signal as _log_backfill
+
+    try:
+        positions = api.list_positions()
+    except Exception as exc:
+        _raise_if_infra(exc, "list_positions", "STOP_BACKFILL")
+        print(f"    [BACKFILL ERROR] could not list positions: {exc}")
+        send_discord(f"⚠️ **Stop-loss backfill failed** — could not list positions: {exc}")
+        return []
+
+    protected = []
+    for position in positions:
+        ticker      = position.symbol
+        entry_price = float(position.avg_entry_price)
+        qty         = _unreserved_qty(position)
+
+        try:
+            existing = api.list_orders(status="open", symbols=[ticker])
+        except Exception as exc:
+            print(f"    [BACKFILL ERROR] {ticker} — could not list open orders: {exc}")
+            _log_backfill(ticker, "STOP_BACKFILL_FAILED", entry_price, qty, 0.0, STOP_BACKFILL_FAILED)
+            send_discord(f"⚠️ **Stop-loss backfill failed** for {ticker}: {exc}")
+            continue
+
+        has_stop = any(
+            o.side == "sell" and o.type in ("stop", "stop_limit")
+            for o in existing
+        )
+        if has_stop:
+            continue
+        if qty <= 0:
+            print(f"    [BACKFILL] {ticker} — every share is held for an open sell order; nothing to protect")
+            continue
+
+        stop_price = round(entry_price * (1.0 - STOP_LOSS_PCT), 2)
+        try:
+            api.submit_order(
+                symbol        = ticker,
+                qty           = qty,
+                side          = "sell",
+                type          = "stop",
+                stop_price    = stop_price,
+                time_in_force = "gtc",
+            )
+            print(f"    [BACKFILL] {ticker} standing stop @ ${stop_price:.2f} (entry ${entry_price:.2f})")
+            _log_backfill(ticker, "STOP_BACKFILL", entry_price, qty, 0.0, STOP_BACKFILL)
+            protected.append(ticker)
+        except Exception as exc:
+            print(f"    [BACKFILL ERROR] {ticker} — {exc}")
+            _log_backfill(ticker, "STOP_BACKFILL_FAILED", entry_price, qty, 0.0, STOP_BACKFILL_FAILED)
+            send_discord(f"⚠️ **Stop-loss backfill failed** for {ticker}: {exc}")
+    return protected
+
+
+def _protect_before_exit(api) -> None:
+    """Best-effort stop backfill on a halting exit; never blocks the exit."""
+    try:
+        print("  Backfilling standing stops before exiting...")
+        ensure_standing_stops(api)
+    except Exception as exc:
+        print(f"  [BACKFILL ERROR] could not verify standing stops: {exc}")
+        send_discord(
+            f"🚨 **Could not verify standing stops** before a halted exit: {exc}\n"
+            f"Positions may be unprotected. Manual review required."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Standing stop-loss cancellation (required before any SELL)
 # ---------------------------------------------------------------------------
 def cancel_standing_stops(api, ticker: str) -> tuple[bool, list[str]]:
@@ -1457,6 +1556,7 @@ def run() -> None:
     # 2a. Halt flag: manual-reset circuit breaker from a prior portfolio halt.
     halt_present, halt_contents = _check_halt_flag()
     if halt_present:
+        _protect_before_exit(api)
         from signal_logger import log_signal
         log_signal("PIPELINE", "HALT_FLAG_PRESENT", 0, 0, 0, HALT_FLAG_PRESENT)
         send_discord(
@@ -1472,6 +1572,7 @@ def run() -> None:
     print("  Checking market data freshness...")
     is_fresh, reason, failed = check_market_data_freshness(pipeline_start_time)
     if not is_fresh:
+        _protect_before_exit(api)   # stops need no market data
         from signal_logger import log_signal
         log_signal(
             ticker="PIPELINE",
@@ -1578,46 +1679,8 @@ def _run_execution(api: tradeapi.REST) -> None:
     equity = get_equity(api)
 
     # Backfill: attach a standing GTC stop-loss to any existing position that lacks one.
-    # Runs once per session at startup.
     print("  Backfilling standing stops for existing positions...")
-    from signal_logger import log_signal as _log_backfill
-    positions = api.list_positions()
-    for position in positions:
-        ticker      = position.symbol
-        entry_price = float(position.avg_entry_price)
-        qty         = float(position.qty)
-
-        try:
-            existing = api.list_orders(status="open", symbols=[ticker])
-        except Exception as exc:
-            print(f"    [BACKFILL ERROR] {ticker} — could not list open orders: {exc}")
-            _log_backfill(ticker, "STOP_BACKFILL_FAILED", entry_price, qty, 0.0, STOP_BACKFILL_FAILED)
-            send_discord(f"⚠️ **Stop-loss backfill failed** for {ticker}: {exc}")
-            continue
-
-        has_stop = any(
-            o.side == "sell" and o.type in ("stop", "stop_limit")
-            for o in existing
-        )
-        if has_stop:
-            continue
-
-        stop_price = round(entry_price * (1.0 - STOP_LOSS_PCT), 2)
-        try:
-            api.submit_order(
-                symbol        = ticker,
-                qty           = qty,
-                side          = "sell",
-                type          = "stop",
-                stop_price    = stop_price,
-                time_in_force = "gtc",
-            )
-            print(f"    [BACKFILL] {ticker} standing stop @ ${stop_price:.2f} (entry ${entry_price:.2f})")
-            _log_backfill(ticker, "STOP_BACKFILL", entry_price, qty, 0.0, STOP_BACKFILL)
-        except Exception as exc:
-            print(f"    [BACKFILL ERROR] {ticker} — {exc}")
-            _log_backfill(ticker, "STOP_BACKFILL_FAILED", entry_price, qty, 0.0, STOP_BACKFILL_FAILED)
-            send_discord(f"⚠️ **Stop-loss backfill failed** for {ticker}: {exc}")
+    ensure_standing_stops(api)
 
     print(f"  Checking take-profits on {len(owned)} open position(s)...")
     guard_stamped = False                       # stamp on first confirmed fill
@@ -1840,6 +1903,13 @@ def _run_execution(api: tradeapi.REST) -> None:
     if not guard_stamped and rebalancer_tickers:
         _write_run_guard()
         guard_stamped = True
+
+    # Re-protect anything the passes above left without a stop. Every sell
+    # path cancels the ticker's standing stops first; a trim leaves shares
+    # behind, and a SELL or take-profit that did not fill leaves all of them.
+    # Without this they stay unprotected until the next session's backfill.
+    print("  Re-checking standing stops after the sell and rebalance passes...")
+    ensure_standing_stops(api)
 
     owned  = get_owned_tickers(api)
     equity = get_equity(api)
