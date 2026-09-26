@@ -445,3 +445,78 @@ def test_discord_summary_lists_recovered_exits():
     assert "AAPL" in message
     assert "-100" in message
     assert len(message) < 2000
+
+
+# --- position_id resolution --------------------------------------------------
+#
+# This job runs after the trading session. By then the bot may have bought the
+# ticker again, so "most recent position_id" would hand the old position's stop
+# loss to the new position. These tests pin the fill-time resolution.
+
+from reconcile_stops import resolve_position_id
+
+
+def _pos_entry(position_id, date_):
+    return {
+        "date": date_, "ticker": "AAPL", "row_type": "ENTRY", "actual_action": "BUY",
+        "entry_order_id": position_id, "position_id": position_id,
+    }
+
+
+def test_position_id_is_the_one_open_before_the_fill(log):
+    _write_log(log, [_pos_entry("posA", "2026-06-01")])
+    assert resolve_position_id(MagicMock(), "AAPL", "2026-07-01T14:30:00+00:00", str(log)) == ("posA", "")
+
+
+def test_rebuy_after_the_stop_does_not_capture_its_loss(log):
+    """Stop fires on 07-01, bot re-buys on 07-02, reconciler runs after that."""
+    _write_log(log, [_pos_entry("posA", "2026-06-01"), _pos_entry("posB", "2026-07-02")])
+    pid, _ = resolve_position_id(MagicMock(), "AAPL", "2026-07-01T14:30:00+00:00", str(log))
+    assert pid == "posA"
+
+
+def test_same_day_rebuy_after_the_stop_is_resolved_by_fill_time(log):
+    _write_log(log, [_pos_entry("posA", "2026-06-01"), _pos_entry("posB", "2026-07-01")])
+    api = MagicMock()
+    api.get_order.return_value.filled_at = "2026-07-01T15:02:00Z"   # after the 14:30 stop
+
+    pid, _ = resolve_position_id(api, "AAPL", "2026-07-01T14:30:00+00:00", str(log))
+
+    assert pid == "posA"
+    api.get_order.assert_called_once_with("posB")
+
+
+def test_same_day_open_before_the_stop_owns_it(log):
+    _write_log(log, [_pos_entry("posA", "2026-06-01"), _pos_entry("posB", "2026-07-01")])
+    api = MagicMock()
+    api.get_order.return_value.filled_at = "2026-07-01T13:45:00Z"
+
+    assert resolve_position_id(api, "AAPL", "2026-07-01T14:30:00+00:00", str(log)) == ("posB", "")
+
+
+def test_same_day_unfetchable_open_leaves_the_id_blank(log):
+    _write_log(log, [_pos_entry("posA", "2026-06-01"), _pos_entry("posB", "2026-07-01")])
+    api = MagicMock()
+    api.get_order.side_effect = RuntimeError("boom")
+
+    pid, note = resolve_position_id(api, "AAPL", "2026-07-01T14:30:00+00:00", str(log))
+
+    assert pid is None
+    assert "could not fetch" in note
+
+
+def test_no_position_ids_yet_returns_blank(log):
+    _write_log(log, [_entry()])
+    assert resolve_position_id(MagicMock(), "AAPL", "2026-07-01T14:30:00+00:00", str(log)) == (None, "")
+
+
+def test_reconcile_writes_the_resolved_position_id(log):
+    _write_log(log, [_pos_entry("posA", "2026-06-01"), _pos_entry("posB", "2026-07-02")])
+    api = MagicMock()
+    api.list_orders.return_value = [_order()]
+    api.get_order.return_value.filled_avg_price = "100.0"
+
+    reconcile(api, date(2026, 6, 1), log_path=str(log))
+
+    written = [r for r in csv.DictReader(open(log)) if r["row_type"] == "EXIT"]
+    assert written[0]["position_id"] == "posA"

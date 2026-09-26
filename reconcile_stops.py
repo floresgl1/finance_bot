@@ -29,6 +29,13 @@ and flagged in the run summary, because a slightly imprecise loss is far closer
 to the truth than a missing one.
 
 **DESIGN DECISION:**
+position_id is resolved by *fill time*, not by "most recent id for the ticker"
+as the live exit paths do. This job runs after the trading session, so by the
+time it sees a stop fill, the bot may already have bought the ticker again and
+minted a new position. The stop belongs to whichever position was open when it
+filled: the latest one whose opening BUY filled before the stop did.
+
+**DESIGN DECISION:**
 Linkage reuses `signal_logger.find_open_entry_order_id(ticker)` rather than
 trying to walk the OTO parent/child relationship. Alpaca does not expose a
 parent id on the child leg, and the open-ENTRY convention is what every other
@@ -229,6 +236,50 @@ def resolve_entry(api, ticker: str) -> tuple[str, float | None, str]:
         return (entry_order_id, None, f"could not fetch entry order ({exc})")
 
 
+def resolve_position_id(api, ticker: str, filled_at: str,
+                        path: str = SIGNAL_LOG_PATH) -> tuple[str | None, str]:
+    """Return (position_id, note) for the position a stop fill closed.
+
+    Walks the ticker's positions newest-first by the date each was opened.
+    Opened on an earlier day than the fill: that is the one. Opened on the
+    same day: the log only has dates, so the opening BUY's own fill time is
+    fetched from Alpaca (a position_id *is* that order's id). If it cannot be
+    fetched the answer is unknowable, and a blank id is honest where a guess
+    would silently misattribute the loss.
+    """
+    fill_date = _exit_date(filled_at)
+    if fill_date is None or not os.path.exists(path):
+        return (None, "")
+    try:
+        df = pd.read_csv(path, dtype=str)
+    except Exception:
+        return (None, "")
+    if "position_id" not in df.columns:
+        return (None, "")
+
+    rows = df[(df["ticker"] == ticker) & df["position_id"].notna() & (df["position_id"] != "")]
+    # First row seen for each id is its opening BUY.
+    openings = rows.drop_duplicates("position_id", keep="first")
+    openings = openings.assign(_pos=range(len(openings))).sort_values(
+        ["date", "_pos"], ascending=False
+    )
+
+    for _, row in openings.iterrows():
+        position_id, opened = row["position_id"], str(row["date"])
+        if opened < fill_date.isoformat():
+            return (position_id, "")
+        if opened > fill_date.isoformat():
+            continue
+        try:
+            opened_at = _normalize_timestamp(api.get_order(position_id).filled_at)
+        except Exception as exc:
+            return (None, f"position opened same day as stop; could not fetch its BUY ({exc})")
+        if opened_at and opened_at <= filled_at:
+            return (position_id, "")
+
+    return (None, "")
+
+
 def entry_price_from_log(ticker: str, entry_order_id: str, path: str = SIGNAL_LOG_PATH) -> float | None:
     """Fall back to the signal-time price on the matching ENTRY row."""
     if not os.path.exists(path):
@@ -277,6 +328,11 @@ def reconcile(api, since: date, *, dry_run: bool = False,
 
     for fill in pending:
         entry_order_id, entry_price, note = resolve_entry(api, fill["ticker"])
+        position_id, position_note = resolve_position_id(
+            api, fill["ticker"], fill["filled_at"], log_path
+        )
+        if position_note:
+            note = f"{note}; {position_note}" if note else position_note
 
         if entry_price is None:
             entry_price = entry_price_from_log(fill["ticker"], entry_order_id, log_path)
@@ -297,6 +353,7 @@ def reconcile(api, since: date, *, dry_run: bool = False,
         row = {
             **fill,
             "entry_order_id": entry_order_id,
+            "position_id": position_id,
             "entry_price": entry_price,
             "realized_pnl": realized,
             "note": note,
@@ -320,6 +377,7 @@ def reconcile(api, since: date, *, dry_run: bool = False,
             shares=fill["shares"],
             today=_exit_date(fill["filled_at"]),
             exit_timestamp=fill["filled_at"],
+            position_id=position_id,
         )
 
     return {

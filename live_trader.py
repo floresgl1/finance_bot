@@ -998,6 +998,30 @@ def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Position identity
+# ---------------------------------------------------------------------------
+def _buy_position_id(ticker: str, is_add: bool, entry_order_id: str | None) -> str | None:
+    """
+    position_id for a BUY row: the order id of the BUY that opened the position.
+
+    is_add comes from Alpaca's live position list, so "was the ticker flat?" is
+    answered by the broker rather than by counting rows in the log. That is
+    what makes a stop that fired between sessions safe here: the position is
+    gone from Alpaca, the next BUY is not an add, and it mints a fresh id
+    whether or not reconcile_stops.py has logged the stop yet.
+
+    An add with no recorded id is a position opened before position_id
+    existed; this add's order id becomes its id from here on.
+    """
+    if not entry_order_id:
+        return None
+    if is_add:
+        from signal_logger import find_position_id
+        return find_position_id(ticker) or entry_order_id
+    return entry_order_id
+
+
+# ---------------------------------------------------------------------------
 # Stop-loss cooldown check
 # ---------------------------------------------------------------------------
 def get_cooldown_tickers() -> set[str]:
@@ -1220,7 +1244,7 @@ def check_position_limits(
                     f"🎯 **[TAKE PROFIT]** {ticker} sold — up {gain_pct:.1f}%  "
                     f"(entry ${entry_price:.2f} → current ${current_price:.2f})"
                 )
-                from signal_logger import log_exit, find_open_entry_order_id
+                from signal_logger import log_exit, find_open_entry_order_id, find_position_id
                 entry_order_id = find_open_entry_order_id(ticker) or "UNLINKED"
                 log_exit(
                     ticker         = ticker,
@@ -1229,6 +1253,7 @@ def check_position_limits(
                     exit_price     = current_price,
                     exit_reason    = "TAKE_PROFIT",
                     shares         = qty,
+                    position_id    = find_position_id(ticker),
                 )
                 exited.append(ticker)
                 owned.pop(ticker, None)
@@ -1715,7 +1740,7 @@ def _run_execution(api: tradeapi.REST) -> None:
             if not guard_stamped:
                 _write_run_guard()
                 guard_stamped = True
-            from signal_logger import log_exit, find_open_entry_order_id
+            from signal_logger import log_exit, find_open_entry_order_id, find_position_id
             entry_order_id = find_open_entry_order_id(ticker) or "UNLINKED"
             log_exit(
                 ticker         = ticker,
@@ -1724,6 +1749,7 @@ def _run_execution(api: tradeapi.REST) -> None:
                 exit_price     = price,
                 exit_reason    = "MODEL_SELL",
                 shares         = actual_qty,
+                position_id    = find_position_id(ticker),
             )
 
         outcomes.append({
@@ -1919,10 +1945,12 @@ def _run_execution(api: tradeapi.REST) -> None:
                 actual_action = BUY_UNFILLED
             else:
                 actual_action = "BUY_ERROR"
+            entry_order_id = result.get("order_id") if result["status"] == "filled" else None
             log_signal(
                 ticker, "BUY", price, actual_qty, confidence, actual_action,
                 shap_values=r.get("shap_values"),
-                entry_order_id=result.get("order_id") if result["status"] == "filled" else None,
+                entry_order_id=entry_order_id,
+                position_id=_buy_position_id(ticker, is_add, entry_order_id),
             )
             outcomes.append({
                 "ticker":   ticker,

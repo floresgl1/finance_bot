@@ -459,9 +459,19 @@ def _touch(path, when: datetime):
     os.utime(path, (ts, ts))
 
 
+def _written_earlier_today(now: datetime) -> datetime:
+    """A write time before `now` that is still today in UTC.
+
+    `now - 30min` is yesterday between 00:00 and 00:30 UTC, which the gate
+    correctly rejects — that made a fresh-file test fail whenever CI ran then.
+    """
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(now - timedelta(minutes=30), today_start)
+
+
 def test_fresh_files_pass_the_gate(data_dir):
     now = datetime.now(timezone.utc)
-    written = now - timedelta(minutes=30)
+    written = _written_earlier_today(now)
     _touch(data_dir / "AAPL.csv", written)
     _touch(data_dir / "market" / "SPY.csv", written)
 
@@ -469,6 +479,26 @@ def test_fresh_files_pass_the_gate(data_dir):
 
     assert is_fresh is True
     assert reason == ""
+    assert failed == []
+
+
+def test_fresh_files_pass_the_gate_just_after_midnight(data_dir, monkeypatch):
+    """Pins the clock to 00:20 UTC, the time the flaky CI run failed at."""
+    frozen = datetime(2026, 9, 26, 0, 20, tzinfo=timezone.utc)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz else frozen.replace(tzinfo=None)
+
+    monkeypatch.setattr(live_trader, "datetime", _FrozenDatetime)
+    written = _written_earlier_today(frozen)
+    _touch(data_dir / "AAPL.csv", written)
+    _touch(data_dir / "market" / "SPY.csv", written)
+
+    is_fresh, reason, failed = check_market_data_freshness(frozen)
+
+    assert is_fresh is True, reason
     assert failed == []
 
 
@@ -1835,3 +1865,37 @@ def test_nan_feature_error_does_not_halt_session(monkeypatch, tmp_path):
     from live_trader import _is_infra_error
     exc = _NaNFeatureError("AAPL: 1 NaN feature(s) — Volatility")
     assert _is_infra_error(exc) is False
+
+
+# --- position_id on BUY rows -------------------------------------------------
+
+
+def _log_with(tmp_path, monkeypatch, rows):
+    path = tmp_path / "signal_log.csv"
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=signal_logger.FIELDNAMES, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+    monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(path))
+
+
+def test_new_position_mints_its_own_order_id(tmp_path, monkeypatch):
+    # An older id for the ticker belongs to a closed position; Alpaca says
+    # we are flat, so it must not be reused.
+    _log_with(tmp_path, monkeypatch, [{"date": "2026-06-01", "ticker": "AAPL", "position_id": "old"}])
+    assert live_trader._buy_position_id("AAPL", False, "new-order") == "new-order"
+
+
+def test_add_reuses_the_open_position_id(tmp_path, monkeypatch):
+    _log_with(tmp_path, monkeypatch, [{"date": "2026-06-01", "ticker": "AAPL", "position_id": "pos1"}])
+    assert live_trader._buy_position_id("AAPL", True, "add-order") == "pos1"
+
+
+def test_add_to_a_pre_position_id_holding_starts_an_id(tmp_path, monkeypatch):
+    _log_with(tmp_path, monkeypatch, [])
+    assert live_trader._buy_position_id("AAPL", True, "add-order") == "add-order"
+
+
+def test_unfilled_buy_gets_no_position_id(tmp_path, monkeypatch):
+    _log_with(tmp_path, monkeypatch, [])
+    assert live_trader._buy_position_id("AAPL", False, None) is None

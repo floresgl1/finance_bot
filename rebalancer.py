@@ -166,7 +166,7 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
             print(f"  [REBALANCER] {ticker} trim placed — order id {order.id}")
 
             # Log as EXIT row — rebalancer is an operational trim, not a model signal
-            from signal_logger import log_exit, find_open_entry_order_id
+            from signal_logger import log_exit, find_open_entry_order_id, find_position_id
             entry_order_id = find_open_entry_order_id(ticker) or "UNLINKED"
 
             # Avg entry price from the position (captured above in this function's
@@ -187,6 +187,7 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
                 exit_price     = price,
                 exit_reason    = "REBALANCE_TRIM",
                 shares         = qty,
+                position_id    = find_position_id(ticker),
             )
 
             # Refresh equity after each successful trim
