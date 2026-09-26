@@ -913,6 +913,47 @@ L's +0.0353 was a classification edge. Like E, it does not survive being
 scored on returns. The pre-registered consequence: **the SELL-overlay (Stage 2)
 is not built.** No component of this model has a return edge left to deploy.
 
+## N. A model does not forecast volatility better than EWMA (2026-09-26)
+
+M closed the direction question, so this changed it: volatility clusters and
+is forecastable, but does a model add anything over the standard formula?
+
+`edge_probe.py --vol-info --broad`. Target: realised volatility over the next
+5 trading days (weekly, to match a weekly rebalance). XGBRegressor on log
+realised volatility with the project's existing tree settings (no tuning), the
+20 features plus seven volatility features (5/20/60-day realised, Parkinson
+high-low range, 5/20-day returns, EWMA), one model per window with a 5-day
+label embargo and a training-only scale correction. Scored with QLIKE on
+variances against two baselines: EWMA (RiskMetrics, lambda 0.94) and the
+trailing 20-day volatility.
+
+**Pass criteria agreed before the first run:** the model beats EWMA on QLIKE in
+at least 7 of 10 windows AND improves on it by at least 5% on average.
+
+| Window | model | EWMA | persistence | model vs EWMA |
+|---|---|---|---|---|
+| late 2019 bull | 0.5147 | 0.4881 | 0.5277 | −5.5% |
+| covid crash 2020 | 1.9322 | 1.1659 | 1.1326 | **−65.7%** |
+| covid recovery 2020 | 0.6775 | 0.5627 | 0.6473 | −20.4% |
+| bull 2021 | 0.4883 | 0.4166 | 0.4719 | −17.2% |
+| bear 2022 | 0.6515 | 0.6316 | 0.7278 | −3.2% |
+| recovery 2023 | 0.4463 | 0.4793 | 0.5604 | +6.9% |
+| bull 2024 | 0.7032 | 0.6332 | 0.6987 | −11.1% |
+| choppy 2025 | 0.6828 | 0.7077 | 0.7762 | +3.5% |
+| rally 2025-26 | 0.5700 | 0.5654 | 0.6274 | −0.8% |
+| recent 2026 | 0.5512 | 0.5702 | 0.7006 | +3.3% |
+
+**FAIL: 3 of 10 windows, mean −11.0%.** EWMA is the best forecaster tested — it
+also beats persistence in 9 of 10. The covid window is the model's worst: a
+tree ensemble cannot predict outside the target range it trained on, and March
+2020 volatility exceeded anything in its 2017-2020 training data, so it
+under-forecast the spike that QLIKE penalises most. That explains the loss; per
+the pre-registration it does not justify a retry.
+
+The pre-registered consequence: **ML adds nothing over the formula.** The one
+question left open is whether sizing the basket by EWMA volatility — no model
+at all — beats equal-weight holding on drawdown.
+
 ## Where this leaves things
 
 **The strategy does not beat buy-and-hold**, on every measurement taken: six
@@ -1048,6 +1089,7 @@ python edge_probe.py --exposure --broad         # F, corrected
 python edge_probe.py --tiers --broad            # position sizes (finding K)
 python edge_probe.py --exits --broad            # exit policy    (finding L)
 python edge_probe.py --sell-info --broad        # SELL -> forward return (finding M)
+python edge_probe.py --vol-info --broad         # model vs EWMA volatility (finding N)
 python edge_probe.py --exposure --window 2026-03-05 2026-09-04
                                                 # simulate one exact period
 ```
