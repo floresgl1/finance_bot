@@ -1194,6 +1194,168 @@ def summarise_horizons(results: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# SELL information probe -- Stage 1, pre-registered 2026-09-26
+# ---------------------------------------------------------------------------
+#
+# Finding L measured SELL's edge as classification: +0.0353 over its own
+# constant baseline, ~5x BUY's. Finding E showed a classification edge can
+# fail to move returns at all. Before building anything on SELL, this asks the
+# narrow question directly: over the next label horizon, do names the model
+# says SELL on actually do worse?
+#
+# **DESIGN DECISION -- the gap is measured within each ticker.**
+# For each ticker, mean forward return on non-SELL days minus mean on SELL
+# days, then averaged across tickers weighted by SELL-day count. A pooled
+# comparison can be won by WHICH tickers the model flags (say, the volatile
+# ones in a falling window) rather than WHEN it flags them. Timing is the
+# skill an overlay would need. The pooled means are reported for context only.
+#
+# **DESIGN DECISION -- embargo the training labels.**
+# A label is the forward return over the next `labels._WINDOW` rows, so the
+# last rows before a window's start are labelled from prices inside it.
+# _window_signals trains on everything before the start; here the last
+# horizon's worth of business days is dropped first. The leak is small, but it
+# tilts toward passing, which is the wrong direction for a pre-registered test.
+#
+# Pass criteria were fixed with the user BEFORE the first run, and are only
+# evaluated on BROAD_WINDOWS. Do not tune them after seeing results -- that is
+# how findings F, H and J went wrong.
+
+SELL_INFO_MIN_WINDOWS = 7         # windows where SELL days underperform, of 10
+SELL_INFO_MIN_MEAN_GAP = 0.002    # mean gap > 0.2%, a round trip at 0.1% slippage a side
+
+
+def _forward_returns(close: pd.Series, horizon: int) -> pd.Series:
+    """Return from each close to the close `horizon` rows later."""
+    return close.shift(-horizon) / close - 1.0
+
+
+def sell_gap(frames: dict) -> dict:
+    """Within-ticker gap between non-SELL and SELL forward returns.
+
+    frames: ticker -> DataFrame with a `Signal` column and a `fwd` column.
+    Rows without a forward return are dropped. A positive gap means SELL days
+    were followed by worse returns, which is what SELL is supposed to mean.
+    A ticker needs both SELL and non-SELL days to contribute a gap.
+    """
+    gaps, weights = [], []
+    sell_parts, other_parts = [], []
+    for frame in frames.values():
+        f = frame.dropna(subset=["fwd"])
+        is_sell = (f["Signal"] == "SELL").to_numpy()
+        sell, other = f["fwd"][is_sell], f["fwd"][~is_sell]
+        sell_parts.append(sell)
+        other_parts.append(other)
+        if len(sell) and len(other):
+            gaps.append(float(other.mean() - sell.mean()))
+            weights.append(len(sell))
+
+    sell_all = pd.concat(sell_parts) if sell_parts else pd.Series(dtype=float)
+    other_all = pd.concat(other_parts) if other_parts else pd.Series(dtype=float)
+    return {
+        "n_sell": int(len(sell_all)),
+        "n_other": int(len(other_all)),
+        "sell_fwd_mean": float(sell_all.mean()) if len(sell_all) else None,
+        "other_fwd_mean": float(other_all.mean()) if len(other_all) else None,
+        "gap": float(np.average(gaps, weights=weights)) if weights else None,
+        "tickers_scored": len(gaps),
+    }
+
+
+def sell_info_verdict(windows: dict) -> dict:
+    """Apply the pre-registered Stage 1 criteria to per-window results."""
+    gaps = [w["gap"] for w in windows.values() if w.get("gap") is not None]
+    wins = sum(1 for g in gaps if g > 0)
+    mean_gap = float(np.mean(gaps)) if gaps else None
+    # Rounded before the strict comparison: the mean of ten 0.002 gaps is
+    # 0.0020000000000000005, which would otherwise pass a gap that only
+    # equals the round-trip cost.
+    passed = (
+        wins >= SELL_INFO_MIN_WINDOWS
+        and mean_gap is not None
+        and round(mean_gap, 10) > SELL_INFO_MIN_MEAN_GAP
+    )
+    return {
+        "windows_scored": len(gaps),
+        "windows_sell_underperforms": wins,
+        "mean_gap": mean_gap,
+        "min_windows": SELL_INFO_MIN_WINDOWS,
+        "min_mean_gap": SELL_INFO_MIN_MEAN_GAP,
+        "passed": bool(passed),
+    }
+
+
+def run_sell_info_probe(windows: dict | None = None, lookback_years: int = 3) -> dict:
+    """Score SELL's forward-return information over every window."""
+    import labels as labels_mod
+
+    windows = windows or BROAD_WINDOWS
+    horizon = labels_mod._WINDOW
+    per_ticker = _build_per_ticker(1.0)
+    if not per_ticker:
+        return {}
+    combined = pd.concat(per_ticker.values()).sort_index()
+
+    results = {}
+    for name, (start_s, end_s) in windows.items():
+        start, end = pd.Timestamp(start_s), pd.Timestamp(end_s)
+        embargo = start - pd.tseries.offsets.BDay(horizon)
+        base = _window_signals(per_ticker, combined[combined.index < embargo],
+                               FEATURE_COLUMNS, start, end, lookback_years, label=name)
+        if base is None:
+            continue
+
+        frames = {
+            ticker: pd.DataFrame({
+                "Signal": frame["Signal"],
+                "fwd": _forward_returns(per_ticker[ticker]["Close"], horizon)
+                       .reindex(frame.index),
+            })
+            for ticker, frame in base.items()
+        }
+        results[name] = sell_gap(frames)
+
+    return results
+
+
+def summarise_sell_info(results: dict, broad: bool) -> str:
+    """ASCII table plus the verdict. No verdict off the broad set."""
+    out = [
+        f"  {'window':<22}{'SELL days':>10}{'other':>8}{'SELL fwd':>10}"
+        f"{'other fwd':>11}{'gap':>9}  SELL worse?",
+        "  " + "-" * 82,
+    ]
+    for name, r in results.items():
+        if r["gap"] is None:
+            out.append(f"  {name:<22}{r['n_sell']:>10}{r['n_other']:>8}   (no gap: no ticker had both)")
+            continue
+        out.append(
+            f"  {name:<22}{r['n_sell']:>10}{r['n_other']:>8}"
+            f"{r['sell_fwd_mean'] * 100:>9.2f}%{r['other_fwd_mean'] * 100:>10.2f}%"
+            f"{r['gap'] * 100:>8.2f}%  {'yes' if r['gap'] > 0 else 'no'}"
+        )
+
+    v = sell_info_verdict(results)
+    mean = f"{v['mean_gap'] * 100:.3f}%" if v["mean_gap"] is not None else "n/a"
+    out += [
+        "",
+        f"  SELL days underperform in {v['windows_sell_underperforms']} of "
+        f"{v['windows_scored']} windows (need >= {v['min_windows']})",
+        f"  Mean within-ticker gap: {mean} (need > {v['min_mean_gap'] * 100:.1f}%)",
+    ]
+    if not broad:
+        out.append("  NO VERDICT: the criteria were pre-registered on --broad only.")
+    elif v["windows_scored"] < len(BROAD_WINDOWS):
+        # A data failure is not evidence about SELL. Reporting it as FAIL
+        # would close the question on a broken run.
+        out.append(f"  NO VERDICT: only {v['windows_scored']} of {len(BROAD_WINDOWS)} "
+                   f"windows scored; the criteria assume all of them. Fix the data and re-run.")
+    else:
+        out.append(f"  STAGE 1: {'PASS' if v['passed'] else 'FAIL'}")
+    return "\n".join(out)
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure the model against trivial baselines and sweep training history.",
@@ -1235,6 +1397,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Compare how a position is closed: on any non-BUY (the old "
              "simulator), on SELL only (what the bot does), on SELL or a stop, "
              "at the label horizon, or all three.",
+    )
+    parser.add_argument(
+        "--sell-info", action="store_true",
+        help="Stage 1: do the model's SELL days precede worse forward returns "
+             "than its other days, within each ticker? Pre-registered pass "
+             "criteria; verdict only with --broad.",
     )
     parser.add_argument(
         "--tiers", action="store_true",
@@ -1403,6 +1571,22 @@ def main(argv: list[str] | None = None) -> int:
             "policies": run_exit_probe(windows=window_set),
         }
         print(summarise_exits(results["policies"]))
+    elif args.sell_info:
+        print(f"\n=== SELL information probe, Stage 1 ({window_label}) ===")
+        print("  One model per window, trained with a label embargo; forward")
+        print("  returns over the label horizon, compared within each ticker.")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "sell_info",
+            "window_set": window_label,
+            "windows": run_sell_info_probe(windows=window_set),
+        }
+        results["verdict"] = sell_info_verdict(results["windows"])
+        results["verdict"]["complete"] = (
+            window_set is BROAD_WINDOWS
+            and results["verdict"]["windows_scored"] == len(BROAD_WINDOWS)
+        )
+        print(summarise_sell_info(results["windows"], broad=window_set is BROAD_WINDOWS))
     elif args.tiers:
         print(f"\n=== Position-tier sweep ({window_label}) ===")
         print("  One model per window, shared by every level; only the tier")
