@@ -42,7 +42,7 @@ def run_rebalancer(api, sell_executed_tickers: list[str] | None = None) -> list[
 
     Parameters
     ----------
-    api : alpaca_trade_api.REST
+    api : broker.AlpacaREST
         Live Alpaca client (paper or live).
     sell_executed_tickers : list[str] | None
         Tickers for which a model SELL order was placed successfully in the
