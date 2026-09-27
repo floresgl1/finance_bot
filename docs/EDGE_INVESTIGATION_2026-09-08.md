@@ -1070,9 +1070,12 @@ probe's criteria are fixed before its run.
 3. **The holdout starts at the freeze commit,** not at 2026-09-08. Data between
    those dates may already have been looked at.
 4. **Confirmation** requires the frozen criteria to hold on live data for at
-   least [6 months] AND for that period to include a drawdown of at least [10%]
-   in the equal-weight basket. If [12 months] pass with no such drawdown, the
-   verdict is "untested under stress", not PASS.
+   least [6 months] AND for that period to include a drawdown of at least 10%
+   in the equal-weight basket. If 24 months pass with no such drawdown, the
+   verdict is "untested under stress", not PASS. The cap is 24 months because
+   drawdowns that deep hit roughly 3 of the 10 `BROAD_WINDOWS` (covid 2020,
+   bear 2022, the April 2025 tariff crash) — about one every two years — so a
+   12-month cap would usually end untested.
 5. **Refutation** has a lower bar and is checked [monthly]: the effect has the
    wrong sign against its baseline over any rolling [3 months], or its mean gap
    is at or below zero after [6 months]. Either ends the lead. Killing a false
