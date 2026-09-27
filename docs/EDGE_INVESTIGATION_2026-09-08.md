@@ -988,6 +988,41 @@ arm judged separately:
 Under the confirmation protocol this probe is two draws, and a pass on
 historical windows is a lead, not a result.
 
+| Window | A DD gain | A return gap | B DD gain | B return gap | B exposure |
+|---|---|---|---|---|---|
+| late 2019 bull | −0.09pp | −3.48pp | +0.10pp | −0.38pp | 97% |
+| covid crash 2020 | +2.23pp | +1.63pp | **−5.91pp** | **−10.00pp** | 41% |
+| covid recovery 2020 | +0.39pp | −9.08pp | −0.67pp | −4.32pp | 88% |
+| bull 2021 | +1.89pp | −1.86pp | −0.02pp | −0.37pp | 100% |
+| bear 2022 | +4.55pp | +4.90pp | −2.49pp | −2.75pp | 80% |
+| recovery 2023 | +0.44pp | −20.45pp | 0.00pp | 0.00pp | 100% |
+| bull 2024 | +3.13pp | −7.76pp | −0.06pp | −1.13pp | 100% |
+| choppy 2025 | +2.53pp | −3.36pp | −1.74pp | −8.97pp | 93% |
+| rally 2025-26 | +0.77pp | −6.37pp | 0.00pp | 0.00pp | 100% |
+| recent 2026 | −0.11pp | +2.50pp | 0.00pp | 0.00pp | 100% |
+
+Gains are arm minus its control; positive drawdown gain means shallower.
+
+**Arm A: FAIL on the return guardrail.** Shallower drawdown in 8 of 10
+windows, mean +1.57pp — both drawdown tests pass — but mean return is
+−4.34pp per window against a −2pp limit. Inverse-vol weighting moves money
+from NVDA and TSLA into JNJ and XOM: a calmer basket, not a smarter one. It
+buys its drawdown gain at more than twice the agreed price, worst in the
+bull windows (2023: −20.45pp).
+
+**Arm B: FAIL on every test.** Shallower drawdown in 1 of 10 windows, mean
+−1.08pp, return −2.79pp. It is worse than holding the same average exposure
+with no timing at all. In the covid crash EWMA reacted after the fall, cut
+exposure near the bottom (41% average) and missed the rebound; the constant
+control fell less and recovered more. The target, set from three calm-ish
+prior years, sat above the basket's forecast volatility most of the time, so
+in six windows B was simply fully invested.
+
+The pre-registered consequence: **EWMA volatility does not make a better
+basket here.** A trades return for drawdown at a worse rate than agreed; B's
+timing subtracts value. Reading A on a risk-adjusted measure instead was not
+the question asked, and would be a second draw.
+
 ## Where this leaves things
 
 **The strategy does not beat buy-and-hold**, on every measurement taken: six
