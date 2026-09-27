@@ -1049,6 +1049,43 @@ The promotion gate now encodes this: `beats_buy_and_hold` (added 2026-09-08)
 rejects any challenger that loses to holding the basket, so the conclusion here
 cannot be quietly forgotten by a future retrain.
 
+### Confirming a future pass (drafted 2026-09-27)
+
+**History is spent as a test set.** `BROAD_WINDOWS` covers 2019-09-01 to
+2026-09-08 continuously, and every day of it has now been scored by at least
+six probes. Each probe has its own pre-registered bar, but each is also another
+draw: if one eventually passes, it is the best of many tries, and a pass on
+historical windows is a lead, not a result. The only data no probe has touched
+is what arrives after the freeze below.
+
+These rules are fixed now, before any probe passes, for the same reason each
+probe's criteria are fixed before its run.
+
+1. **Record the draw count.** A passing probe is written up with the number of
+   probes run before it in this investigation.
+2. **Freeze on pass.** The probe's full configuration — features, model
+   settings, label definition, cost assumptions and pass criteria — is pinned to
+   a commit. Nothing changes between the pass and the confirmation verdict; any
+   change restarts the clock.
+3. **The holdout starts at the freeze commit,** not at 2026-09-08. Data between
+   those dates may already have been looked at.
+4. **Confirmation** requires the frozen criteria to hold on live data for at
+   least [6 months] AND for that period to include a drawdown of at least [10%]
+   in the equal-weight basket. If [12 months] pass with no such drawdown, the
+   verdict is "untested under stress", not PASS.
+5. **Refutation** has a lower bar and is checked [monthly]: the effect has the
+   wrong sign against its baseline over any rolling [3 months], or its mean gap
+   is at or below zero after [6 months]. Either ends the lead. Killing a false
+   edge early is cheap; trading one is not.
+6. **No production change on a historical pass alone.** Promotion waits for
+   confirmation, and `beats_buy_and_hold` still applies on top of it.
+
+Scale note: a 5-day horizon gives about 12 non-overlapping observations per
+ticker per quarter, so six months of live data is roughly one `BROAD_WINDOWS`
+window. That is why rule 4 asks for a stress period rather than a longer
+calendar span alone, and why a confirmation is weaker evidence than the 7-of-10
+bar the probes used.
+
 ## Recommended next steps (original, from the first pass)
 
 Ordered by expected information per unit of effort.
