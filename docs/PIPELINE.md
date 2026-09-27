@@ -7,6 +7,26 @@
 > ⚠️  sentiment is currently being used as a veto functio
 > ⚠️  currently the bot is in paper trading phases
 
+## SETUP
+
+Always install into a virtualenv with a current pip, never the system pip:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install --upgrade pip setuptools wheel
+.venv/bin/pip install -r requirements-dev.txt
+```
+
+`ta` and `msgpack` (pulled in by `alpaca-trade-api`) ship no wheels for recent
+Pythons, so pip builds them from source. Debian/Ubuntu system Pythons carry a
+patched, older setuptools that fails those builds (`AttributeError:
+install_layout`); an upgraded setuptools inside a venv does not. CI does the
+equivalent (`.github/workflows/tests.yml` upgrades pip before installing).
+
+`alpaca-trade-api` pins `msgpack==1.0.3`, whose C extension cannot compile on
+Python 3.11+. It falls back to msgpack's pure-Python implementation — slower,
+same behaviour, and irrelevant to the bot's REST-only calls.
+
 ## DATA COLLECTION
 
 ### `data_collector.py` 
