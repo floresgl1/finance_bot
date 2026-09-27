@@ -91,6 +91,65 @@ def read_only_checks(api, symbol: str, c: Checks) -> None:
                      ("portfolio history", history)):
         c.run(name, fn)
 
+    try:
+        rows, warnings = stop_coverage(api.list_positions(), api.list_orders(status="open"))
+        print_stop_coverage(rows, warnings)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not mask the checks above
+        print(f"  WARN  stop coverage could not be computed — {type(exc).__name__}: {exc}")
+
+
+def _is_sell_stop(o) -> bool:
+    return o.side == "sell" and o.type in ("stop", "stop_limit")
+
+
+def stop_coverage(positions, orders) -> tuple[list[dict], list[str]]:
+    """Per-symbol view of positions against open orders, plus risk warnings.
+
+    Each held position should be protected by exactly one sell stop for its
+    full quantity. Warns on: no stop (unprotected), more than one stop
+    (stacked — together they could sell more than is held), stop quantity
+    different from the position, and a live stop on a symbol not held
+    (orphan). A stop leg still waiting on its unfilled OTO parent (status
+    "held") protects nothing yet and is reported separately, not as an orphan.
+    """
+    held = {p.symbol: float(p.qty) for p in positions}
+    symbols = sorted(set(held) | {o.symbol for o in orders})
+    rows, warnings = [], []
+    for sym in symbols:
+        mine = [o for o in orders if o.symbol == sym]
+        live_stops = [o for o in mine if _is_sell_stop(o) and o.status != "held"]
+        waiting_stops = [o for o in mine if _is_sell_stop(o) and o.status == "held"]
+        other = [o for o in mine if not _is_sell_stop(o)]
+        stop_qty = sum(float(o.qty) for o in live_stops)
+        qty = held.get(sym, 0.0)
+        rows.append({
+            "symbol": sym, "held": qty, "stops": len(live_stops), "stop_qty": stop_qty,
+            "waiting_stops": len(waiting_stops),
+            "other": ", ".join(sorted(f"{o.side} {o.type}" for o in other)),
+        })
+        if qty > 0 and not live_stops:
+            warnings.append(f"{sym}: {qty:g} shares held with NO live stop (unprotected)")
+        if len(live_stops) > 1:
+            warnings.append(f"{sym}: {len(live_stops)} live sell stops stacked "
+                            f"({stop_qty:g} shares vs {qty:g} held)")
+        elif live_stops and qty > 0 and abs(stop_qty - qty) > 1e-9:
+            warnings.append(f"{sym}: stop covers {stop_qty:g} shares but {qty:g} are held")
+        if live_stops and qty == 0:
+            warnings.append(f"{sym}: {len(live_stops)} live sell stop(s) but no position (orphan)")
+    return rows, warnings
+
+
+def print_stop_coverage(rows: list[dict], warnings: list[str]) -> None:
+    print("\nStop coverage (read-only)")
+    print(f"  {'symbol':<8}{'held':>8}{'stops':>7}{'stop qty':>10}{'waiting':>9}  other open orders")
+    for r in rows:
+        print(f"  {r['symbol']:<8}{r['held']:>8g}{r['stops']:>7}{r['stop_qty']:>10g}"
+              f"{r['waiting_stops']:>9}  {r['other'] or '-'}")
+    for w in warnings:
+        print(f"  WARN  {w}")
+    if not warnings:
+        print("  every position has exactly one live stop for its full quantity")
+
 
 def _stops(api, symbol):
     return [o for o in api.list_orders(status="open", symbols=[symbol])

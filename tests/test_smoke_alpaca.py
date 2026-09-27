@@ -84,3 +84,57 @@ def test_order_checks_skip_a_symbol_already_held():
     smoke_alpaca.order_checks(_api(trading), "AAPL", c)
     assert c.failed == 1
     assert not any(n == "submit_order" for n, _ in trading.calls)
+
+
+# --- stop coverage diagnostic ---------------------------------------------------
+from types import SimpleNamespace as NS
+
+
+def _pos(sym, qty):
+    return NS(symbol=sym, qty=str(qty))
+
+
+def _ord(sym, side="sell", type="stop", qty=10, status="new"):
+    return NS(symbol=sym, side=side, type=type, qty=str(qty), status=status)
+
+
+def test_one_stop_per_position_is_clean():
+    rows, warnings = smoke_alpaca.stop_coverage([_pos("AAPL", 10)], [_ord("AAPL")])
+    assert warnings == []
+    assert rows[0]["stops"] == 1 and rows[0]["stop_qty"] == 10
+
+
+def test_stacked_stops_are_flagged():
+    _, warnings = smoke_alpaca.stop_coverage(
+        [_pos("AAPL", 10)], [_ord("AAPL"), _ord("AAPL"), _ord("AAPL")])
+    assert any("3 live sell stops stacked (30 shares vs 10 held)" in w for w in warnings)
+
+
+def test_an_unprotected_position_is_flagged():
+    _, warnings = smoke_alpaca.stop_coverage([_pos("MSFT", 5)], [])
+    assert warnings == ["MSFT: 5 shares held with NO live stop (unprotected)"]
+
+
+def test_a_partial_stop_is_flagged():
+    _, warnings = smoke_alpaca.stop_coverage([_pos("MSFT", 5)], [_ord("MSFT", qty=3)])
+    assert warnings == ["MSFT: stop covers 3 shares but 5 are held"]
+
+
+def test_an_orphan_stop_is_flagged():
+    _, warnings = smoke_alpaca.stop_coverage([], [_ord("NVDA")])
+    assert warnings == ["NVDA: 1 live sell stop(s) but no position (orphan)"]
+
+
+def test_a_stop_leg_waiting_on_an_unfilled_buy_is_not_an_orphan():
+    rows, warnings = smoke_alpaca.stop_coverage(
+        [], [_ord("XOM", side="buy", type="market"), _ord("XOM", status="held")])
+    assert warnings == []
+    assert rows[0]["waiting_stops"] == 1 and rows[0]["other"] == "buy market"
+
+
+def test_read_only_run_prints_coverage_without_failing(capsys):
+    c = smoke_alpaca.Checks()
+    smoke_alpaca.read_only_checks(_api(FakeTrading()), "F", c)
+    out = capsys.readouterr().out
+    assert c.failed == 0
+    assert "Stop coverage" in out
