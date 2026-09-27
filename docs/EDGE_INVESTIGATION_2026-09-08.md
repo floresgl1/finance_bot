@@ -1070,12 +1070,10 @@ probe's criteria are fixed before its run.
 3. **The holdout starts at the freeze commit,** not at 2026-09-08. Data between
    those dates may already have been looked at.
 4. **Confirmation** requires the frozen criteria to hold on live data for at
-   least 6 months AND for that period to include a drawdown of at least 10%
+   least 6 months AND for that period to include a drawdown of at least 15%
    in the equal-weight basket. If 24 months pass with no such drawdown, the
-   verdict is "untested under stress", not PASS. The cap is 24 months because
-   drawdowns that deep hit roughly 3 of the 10 `BROAD_WINDOWS` (covid 2020,
-   bear 2022, the April 2025 tariff crash) — about one every two years — so a
-   12-month cap would usually end untested.
+   verdict is "untested under stress", not PASS. See "Choosing the drawdown
+   bar" below for why 15% and 24 months.
 5. **Refutation** has a lower bar and is checked monthly: the lead ends if its
    mean gap against the baseline, measured cumulatively from the freeze, is at
    or below zero at any check from 6 months on. Killing a false edge early is
@@ -1094,6 +1092,49 @@ ticker per quarter, so six months of live data is roughly one `BROAD_WINDOWS`
 window. That is why rule 4 asks for a stress period rather than a longer
 calendar span alone, and why a confirmation is weaker evidence than the 7-of-10
 bar the probes used.
+
+#### Choosing the drawdown bar (measured 2026-09-27)
+
+The first draft set the bar at 10%, on the belief that drawdowns that deep hit
+about 3 of the 10 `BROAD_WINDOWS`. Measured, it is 6 of 10: this basket holds
+NVDA, TSLA and INTC and pulls back 13–14% in ordinary bull years. Per-window
+max drawdown of the equal-weight hold, from `edge_probe.py --exposure --broad`:
+
+| Window | Hold return | Hold max DD |
+|---|---|---|
+| late 2019 bull | +24.10% | −4.62% |
+| covid crash 2020 | −5.52% | −31.06% |
+| covid recovery 2020 | +69.66% | −14.08% |
+| bull 2021 | +32.48% | −9.21% |
+| bear 2022 | −29.00% | −34.29% |
+| recovery 2023 | +75.20% | −13.44% |
+| bull 2024 | +43.33% | −13.71% |
+| choppy 2025 | +21.29% | −22.95% |
+| rally 2025-26 | +20.29% | −7.45% |
+| recent 2026 | +3.50% | −6.35% |
+
+Waiting time for each bar, starting the clock on every trading day from
+2019-09-03 to 2024-09-20 (1,272 starts, each followed for 24 months) and
+measuring drawdown from the peak since the start:
+
+| Bar | Windows clearing | Median wait | 90th pct | Untested at 12m | Untested at 24m |
+|---|---|---|---|---|---|
+| 10% | 6/10 | 4.0 mo | 10.1 mo | 6% | 0% |
+| 15% | 3/10 | 11.0 mo | 19.8 mo | 46% | 0% |
+| 20% | 3/10 | 13.4 mo | >24 mo | 54% | 15% |
+| 25% | 2/10 | 22.8 mo | >24 mo | 71% | 48% |
+
+At 10% the median wait is shorter than the 6-month minimum, so the
+requirement filters almost nothing. 15% is the lowest bar that excludes
+ordinary pullbacks: the three windows that clear it are exactly the stress
+events (covid 2020, bear 2022, April 2025). 20% selects the same three and
+leaves 15% of starts untested. At 15% the worst wait was 22.6 months, so a
+24-month cap gave every start a verdict; a 12-month cap would leave 46%
+untested.
+
+Caveats: the start days overlap heavily, so only three stress events drive the
+15%+ rows, and 2019–2024 was a turbulent stretch — calmer years will wait
+longer, and "untested under stress" is then the right verdict.
 
 ## Recommended next steps (original, from the first pass)
 
