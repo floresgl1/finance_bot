@@ -1025,7 +1025,7 @@ the question asked, and would be a second draw.
 
 ## Where this leaves things
 
-**The strategy does not beat buy-and-hold**, on every measurement taken: six
+**The strategy does not beat buy-and-hold**, on every measurement taken: nine
 simulated attempts to find an edge, and the live account itself at −3.23pp over
 its first six months.
 
@@ -1095,6 +1095,13 @@ dead:
    and made worse by adding the model.
 6. ~~**A different label horizon.**~~ Findings G and H: every horizon from 3 to
    21 days loses by 14–25pp.
+7. ~~**Use SELL as a warning signal.**~~ Finding M: SELL days precede worse
+   returns in 5 of 10 windows — a coin flip.
+8. ~~**Forecast volatility instead of direction.**~~ Finding N: a model loses
+   to EWMA, a one-line formula, in 7 of 10 windows.
+9. ~~**Size the basket by EWMA volatility.**~~ Finding O: inverse-vol weights
+   cut drawdown but cost twice the agreed return; vol targeting cuts exposure
+   after the fall and misses the rebound, losing to a constant fraction.
 
 ### What is left
 
@@ -1102,17 +1109,19 @@ dead:
 technical indicators is a crowded, well-arbitraged space. "No durable edge" is
 the expected outcome, not a bug.
 
-Six independent attempts to find one have now failed, and the most informative
+Nine independent attempts to find one have now failed, and the most informative
 of them found that a rule with no model in it beats the model. The pipeline
 around the signal — risk controls, monitoring, P&L attribution, a promotion gate
-that correctly refuses to ship a worse model, 499 tests — is sound engineering
+that correctly refuses to ship a worse model, 813 tests — is sound engineering
 regardless of whether this particular signal pays.
 
 If the project continues as a learning exercise rather than a strategy, the
 interesting next chapter is a different question, not a better answer to this
-one: a more predictable target (realised volatility rather than direction), a
-different asset class or timeframe, or continued investment in the execution and
-monitoring machinery, which is the part that works.
+one. The more predictable target suggested here first, realised volatility,
+has now been tried (findings N and O): it forecasts well, but neither a model
+nor sizing by the forecast turns that into a better basket. What remains is a
+different asset class or timeframe, or continued investment in the execution
+and monitoring machinery, which is the part that works.
 
 The promotion gate now encodes this: `beats_buy_and_hold` (added 2026-09-08)
 rejects any challenger that loses to holding the basket, so the conclusion here
