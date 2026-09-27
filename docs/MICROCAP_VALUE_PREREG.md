@@ -5,6 +5,10 @@ Every choice below was fixed on paper before any backtest exists. Changing one
 after seeing results turns this into a second draw; see "Confirming a future
 pass" in `EDGE_INVESTIGATION_2026-09-08.md`.
 
+*Amended 2026-09-27, still before any data exists:* the universe now names
+which securities qualify (CRSP share and exchange codes), and "Identifiers and
+joins" fixes how prices and fundamentals are matched.
+
 ## Why this, and not more of the current bot
 
 Nine pre-registered probes found no edge in daily technical signals on twelve
@@ -18,7 +22,7 @@ competition there.
 
 | # | Component | Decision |
 |---|---|---|
-| 1 | Universe | US stocks, $50M–$300M market cap, built **point-in-time** (including companies later delisted); average daily dollar volume ≥ $100k; **excluding financials** (banks, insurers, REITs) |
+| 1 | Universe | Ordinary shares of US companies — CRSP **share code 10 or 11**, **exchange code 1, 2 or 3** (NYSE, AMEX, Nasdaq) — with $50M–$300M market cap, built **point-in-time** (including companies later delisted); average daily dollar volume ≥ $100k; **excluding financials** (banks, insurers, REITs); must have EBIT and EV available as of the rebalance date |
 | 2 | Signal | Rank by **EBIT / enterprise value**, highest first, using only filings public before the rebalance date |
 | 2a | Filter | **Net debt / EBIT ≤ 3×** |
 | 3 | Portfolio | Top **30** names, equal weight |
@@ -36,7 +40,14 @@ competition there.
    excluded *from the universe*, not just filtered by the debt rule, because
    debt is their raw material and both metrics are meaningless for them; and
    because if the strategy dropped them while the control kept them, the two
-   would differ in sector mix as well as signal.
+   would differ in sector mix as well as signal. Share codes 10/11 keep out
+   ETFs, closed-end funds and ADRs, which a market-cap filter lets through:
+   ETFs have no EBIT, and ADRs report under foreign rules that North American
+   fundamentals data mostly does not cover. Exchange codes 1–3 keep out stray
+   over-the-counter listings. A security without EBIT and EV on the rebalance
+   date is excluded from the universe, so it is missing from strategy and
+   control alike — never sorted to one end of the ranking by a missing value,
+   and never held by the control alone.
 2. **Signal.** Cheapness has two independent explanations — compensation for
    the risk of holding troubled companies, and investors over-reacting to bad
    news in names no analyst covers — so the effect has a reason to exist.
@@ -56,6 +67,24 @@ competition there.
 5. **Control.** Against SPY, the strategy could win by being in micro-caps
    during a good decade for micro-caps. The control differs from the strategy
    in exactly one respect — which names are picked — so any gap is the signal.
+
+## Identifiers and joins
+
+Tickers are never used as identifiers: they are reused across unrelated
+companies and change when a company renames. Joining on them attaches one
+company's data to another's years, or drops a delisted company entirely.
+
+- **Securities** are identified by CRSP **PERMNO**; **companies** by Compustat
+  **GVKEY**.
+- Fundamentals attach to prices only through the **CRSP–Compustat (CCM) link
+  table**, and only where all three hold:
+  - `linktype` is `LU` or `LC` (the reliable link types);
+  - `linkprim` is `P` or `C` (the primary security, so a company with two
+    share classes enters once, not twice);
+  - the rebalance date lies within `linkdt`–`linkenddt` (a link is valid only
+    for its dates; mergers and share-class changes move it).
+- A fundamentals row is usable on a rebalance date only if it was public by
+  then (see "filing lag" under open items).
 
 ## Pass criteria
 
