@@ -104,10 +104,19 @@ def test_one_stop_per_position_is_clean():
     assert rows[0]["stops"] == 1 and rows[0]["stop_qty"] == 10
 
 
-def test_stacked_stops_are_flagged():
+def test_one_stop_per_lot_is_clean():
+    """A position bought in lots carries one OTO stop per lot; that is fine."""
+    rows, warnings = smoke_alpaca.stop_coverage(
+        [_pos("AMZN", 38)], [_ord("AMZN", qty=q) for q in (10, 8, 7, 7, 6)])
+    assert warnings == []
+    assert rows[0]["stops"] == 5 and rows[0]["stop_qty"] == 38
+
+
+def test_stops_covering_more_than_held_are_flagged():
     _, warnings = smoke_alpaca.stop_coverage(
         [_pos("AAPL", 10)], [_ord("AAPL"), _ord("AAPL"), _ord("AAPL")])
-    assert any("3 live sell stops stacked (30 shares vs 10 held)" in w for w in warnings)
+    assert warnings == ["AAPL: stops cover 30 shares but only 10 are held "
+                        "(over-covered: could sell shares that are not there)"]
 
 
 def test_an_unprotected_position_is_flagged():
@@ -117,7 +126,7 @@ def test_an_unprotected_position_is_flagged():
 
 def test_a_partial_stop_is_flagged():
     _, warnings = smoke_alpaca.stop_coverage([_pos("MSFT", 5)], [_ord("MSFT", qty=3)])
-    assert warnings == ["MSFT: stop covers 3 shares but 5 are held"]
+    assert warnings == ["MSFT: stops cover 3 shares but 5 are held (partly unprotected)"]
 
 
 def test_an_orphan_stop_is_flagged():
