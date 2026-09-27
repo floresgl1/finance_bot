@@ -1076,10 +1076,14 @@ probe's criteria are fixed before its run.
    drawdowns that deep hit roughly 3 of the 10 `BROAD_WINDOWS` (covid 2020,
    bear 2022, the April 2025 tariff crash) — about one every two years — so a
    12-month cap would usually end untested.
-5. **Refutation** has a lower bar and is checked [monthly]: the effect has the
-   wrong sign against its baseline over any rolling [3 months], or its mean gap
-   is at or below zero after [6 months]. Either ends the lead. Killing a false
-   edge early is cheap; trading one is not.
+5. **Refutation** has a lower bar and is checked [monthly]: the lead ends if its
+   mean gap against the baseline, measured cumulatively from the freeze, is at
+   or below zero at any check from [6 months] on. Killing a false edge early is
+   cheap; trading one is not. There is deliberately no rolling-window test: at
+   ~12 non-overlapping observations per ticker per quarter, a real edge shows
+   the wrong sign over some short stretch by chance, and checking a rolling
+   window every month would almost surely kill it eventually. The cumulative
+   mean steadies as data accumulates, so repeated checks cost far less.
 6. **No production change on a historical pass alone.** Promotion waits for
    confirmation, and `beats_buy_and_hold` still applies on top of it.
 
