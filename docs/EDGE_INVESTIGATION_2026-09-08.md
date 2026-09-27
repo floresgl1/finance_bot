@@ -1083,7 +1083,9 @@ probe's criteria are fixed before its run.
    ~12 non-overlapping observations per ticker per quarter, a real edge shows
    the wrong sign over some short stretch by chance, and checking a rolling
    window every month would almost surely kill it eventually. The cumulative
-   mean steadies as data accumulates, so repeated checks cost far less.
+   mean steadies as data accumulates, so repeated checks cost far less. There
+   is no early loss floor either: under rule 6 nothing trades before
+   confirmation, so a lead losing in its first months loses only on paper.
 6. **No production change on a historical pass alone.** Promotion waits for
    confirmation, and `beats_buy_and_hold` still applies on top of it.
 
