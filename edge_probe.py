@@ -1571,6 +1571,230 @@ def summarise_vol_info(results: dict, broad: bool) -> str:
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Volatility sizing (finding O): does EWMA volatility make a better basket?
+# ---------------------------------------------------------------------------
+# Finding N left one question open: EWMA is the best volatility forecaster
+# tested, so does sizing by it -- no model at all -- reduce drawdown? Two arms,
+# each against a control that differs from it in exactly one respect:
+#
+#   A. Inverse-vol weights vs equal weight. Both fully invested and rebalanced
+#      on the same schedule, so the weighting is the only difference.
+#   B. Vol targeting vs matched constant exposure. B scales an equal-weight
+#      basket so its EWMA volatility forecast meets a target, holding the rest
+#      in cash. Holding less stock wins drawdowns automatically (finding F), so
+#      the control holds a CONSTANT fraction equal to B's own average exposure
+#      in that window: same stock on average, no volatility information.
+#
+# Shared mechanics: rebalanced every VOL_HORIZON trading days, EWMA lambda
+# 0.94, no leverage, costs = backtest.SLIPPAGE on traded notional only (Alpaca
+# charges no commission, and a $1 fee on 12 weekly trades would measure fees
+# rather than sizing). Weights for a trade at close t use EWMA through t-1:
+# a sizing rule that reads the close it trades on is look-ahead.
+#
+# Pass criteria agreed with the user BEFORE the first run, evaluated on
+# BROAD_WINDOWS only, each arm judged separately:
+#   A passes if its max drawdown is shallower than the control's in >= 7 of 10
+#     windows AND the mean improvement is >= 1.0pp AND its mean return is no
+#     more than 2pp per window below the control's.
+#   B passes on the same three tests with a 2.0pp drawdown bar: an
+#     exposure-timing rule has more ways to look lucky.
+# Under the confirmation protocol this probe is two draws, and a pass is a
+# lead, not a result.
+
+VOL_SIZING_MIN_WINDOWS = 7
+VOL_SIZING_MIN_DD_GAIN_PP = {"A": 1.0, "B": 2.0}
+VOL_SIZING_MAX_RETURN_COST_PP = 2.0
+VOL_SIZING_TARGET_YEARS = 3
+VOL_SIZING_MIN_TARGET_DAYS = 500
+
+
+def _lagged_ewma_vol(closes: pd.DataFrame) -> pd.DataFrame:
+    """Per-ticker daily EWMA volatility known at the close BEFORE each date."""
+    r = np.log(closes).diff()
+    return np.sqrt(r.apply(_ewma_variance)).shift(1)
+
+
+def _basket_returns(closes: pd.DataFrame) -> pd.Series:
+    """Daily return of an equal-weight basket rebalanced every day."""
+    return closes.pct_change().mean(axis=1)
+
+
+def inverse_vol_weights(vol_row: pd.Series) -> pd.Series:
+    """Weights proportional to 1/vol, summing to 1. Fully invested."""
+    inv = 1.0 / vol_row
+    return inv / inv.sum()
+
+
+def vol_target_exposure(basket_vol: float, target_vol: float) -> float:
+    """Fraction of the account invested to hit `target_vol`, capped at 1."""
+    return float(min(1.0, target_vol / basket_vol))
+
+
+def simulate_rebalanced(closes: pd.DataFrame, weights: pd.DataFrame,
+                        slippage: float) -> pd.DataFrame:
+    """Hold dollar positions that drift with prices; reset them on each row of
+    `weights` (a rebalance date) at that day's close.
+
+    Returns daily `equity` (starting at 1.0 before costs) and `exposure`
+    (invested fraction). Slippage is charged on the notional traded,
+    including the opening purchase.
+    """
+    rets = closes.pct_change().fillna(0.0)
+    cash, pos = 1.0, pd.Series(0.0, index=closes.columns)
+    equity, exposure = [], []
+    for date in closes.index:
+        pos = pos * (1.0 + rets.loc[date])
+        if date in weights.index:
+            total = cash + pos.sum()
+            w = weights.loc[date].reindex(closes.columns).fillna(0.0)
+            # Pay the cost before sizing: buying w * total and then taking
+            # slippage out of cash would leave a fully invested book short
+            # cash, i.e. quietly levered.
+            est = slippage * float((w * total - pos).abs().sum())
+            target = w * (total - est)
+            cost = slippage * float((target - pos).abs().sum())
+            cash = total - float(target.sum()) - cost
+            pos = target
+        value = cash + float(pos.sum())
+        equity.append(value)
+        exposure.append(float(pos.sum()) / value)
+    return pd.DataFrame({"equity": equity, "exposure": exposure}, index=closes.index)
+
+
+def _arm_stats(sim: pd.DataFrame) -> dict:
+    eq = sim["equity"]
+    return {
+        "total_return": float((eq.iloc[-1] - 1.0) * 100),
+        "max_drawdown": float((eq / eq.cummax() - 1.0).min() * 100),
+        "avg_exposure": float(sim["exposure"].mean() * 100),
+    }
+
+
+def score_vol_sizing_window(closes: pd.DataFrame, start: pd.Timestamp,
+                            end: pd.Timestamp, slippage: float,
+                            horizon: int = VOL_HORIZON) -> dict | None:
+    """All four portfolios over one window. `closes` must include history."""
+    vol = _lagged_ewma_vol(closes)
+    basket_r = _basket_returns(closes)
+    basket_vol = np.sqrt(_ewma_variance(np.log1p(basket_r))).shift(1)
+
+    hist = basket_r[(basket_r.index >= start - pd.DateOffset(years=VOL_SIZING_TARGET_YEARS))
+                    & (basket_r.index < start)].dropna()
+    if len(hist) < VOL_SIZING_MIN_TARGET_DAYS:
+        return None
+    target_vol = float(hist.std())
+
+    px = closes[(closes.index >= start) & (closes.index <= end)]
+    if len(px) < 2 * horizon:
+        return None
+    rebal = px.index[::horizon]
+    n = len(closes.columns)
+    equal = pd.DataFrame(1.0 / n, index=rebal, columns=closes.columns)
+
+    inv = pd.DataFrame([inverse_vol_weights(vol.loc[d]) for d in rebal], index=rebal)
+    k = pd.Series([vol_target_exposure(basket_vol.loc[d], target_vol) for d in rebal],
+                  index=rebal)
+    targeted = equal.mul(k, axis=0)
+
+    sims = {
+        "equal": simulate_rebalanced(px, equal, slippage),
+        "A": simulate_rebalanced(px, inv, slippage),
+        "B": simulate_rebalanced(px, targeted, slippage),
+    }
+    matched = sims["B"]["exposure"].mean()
+    sims["B_control"] = simulate_rebalanced(px, equal * matched, slippage)
+
+    out = {name: _arm_stats(sim) for name, sim in sims.items()}
+    out["target_vol_daily"] = target_vol
+    out["matched_exposure"] = float(matched * 100)
+    return out
+
+
+def vol_sizing_verdict(windows: dict, arm: str) -> dict:
+    """Apply one arm's pre-registered criteria against its own control."""
+    control = "equal" if arm == "A" else "B_control"
+    scored = [w for w in windows.values() if w and arm in w and control in w]
+    dd_gain = [w[arm]["max_drawdown"] - w[control]["max_drawdown"] for w in scored]
+    ret_gap = [w[arm]["total_return"] - w[control]["total_return"] for w in scored]
+    wins = sum(1 for g in dd_gain if g > 0)
+    mean_dd = float(np.mean(dd_gain)) if dd_gain else None
+    mean_ret = float(np.mean(ret_gap)) if ret_gap else None
+    passed = (
+        wins >= VOL_SIZING_MIN_WINDOWS
+        and mean_dd is not None
+        and round(mean_dd, 10) >= VOL_SIZING_MIN_DD_GAIN_PP[arm]
+        and round(mean_ret, 10) >= -VOL_SIZING_MAX_RETURN_COST_PP
+    )
+    return {
+        "arm": arm,
+        "control": control,
+        "windows_scored": len(scored),
+        "windows_shallower": wins,
+        "mean_dd_gain_pp": mean_dd,
+        "mean_return_gap_pp": mean_ret,
+        "min_windows": VOL_SIZING_MIN_WINDOWS,
+        "min_dd_gain_pp": VOL_SIZING_MIN_DD_GAIN_PP[arm],
+        "max_return_cost_pp": VOL_SIZING_MAX_RETURN_COST_PP,
+        "passed": bool(passed),
+    }
+
+
+def run_vol_sizing_probe(windows: dict | None = None) -> dict:
+    """Score both sizing arms and their controls on every window."""
+    import backtest as bt
+
+    windows = windows or BROAD_WINDOWS
+    closes = pd.concat({t: _load_prices(t)["Close"].astype(float) for t in WATCHLIST},
+                       axis=1).dropna()
+    results = {}
+    for name, (start_s, end_s) in windows.items():
+        r = score_vol_sizing_window(closes, pd.Timestamp(start_s), pd.Timestamp(end_s),
+                                    bt.SLIPPAGE)
+        if r is None:
+            print(f"  {name}: not enough history, skipping")
+            continue
+        results[name] = r
+    return results
+
+
+def summarise_vol_sizing(results: dict, broad: bool) -> str:
+    """Per-window table for each arm plus its verdict. ASCII only."""
+    out = []
+    for arm, title in (("A", "Arm A: inverse-vol vs equal weight (both fully invested)"),
+                       ("B", "Arm B: vol target vs matched constant exposure")):
+        v = vol_sizing_verdict(results, arm)
+        ctl = v["control"]
+        out += ["", f"  {title}",
+                f"  {'window':<22}{'ret':>9}{'ctl ret':>9}{'max DD':>9}{'ctl DD':>9}"
+                f"{'DD gain':>9}{'exp':>6}",
+                "  " + "-" * 73]
+        for name, r in results.items():
+            a, c = r[arm], r[ctl]
+            out.append(
+                f"  {name:<22}{a['total_return']:>8.2f}%{c['total_return']:>8.2f}%"
+                f"{a['max_drawdown']:>8.2f}%{c['max_drawdown']:>8.2f}%"
+                f"{a['max_drawdown'] - c['max_drawdown']:>+8.2f}pp{a['avg_exposure']:>5.0f}%"
+            )
+        fmt = lambda x: "n/a" if x is None else f"{x:+.2f}pp"
+        out += [
+            f"  Shallower drawdown in {v['windows_shallower']} of {v['windows_scored']} "
+            f"windows (need >= {v['min_windows']})",
+            f"  Mean drawdown gain: {fmt(v['mean_dd_gain_pp'])} "
+            f"(need >= +{v['min_dd_gain_pp']:.1f}pp)",
+            f"  Mean return gap: {fmt(v['mean_return_gap_pp'])} "
+            f"(need >= -{v['max_return_cost_pp']:.1f}pp)",
+        ]
+        if not broad:
+            out.append("  NO VERDICT: the criteria were pre-registered on --broad only.")
+        elif v["windows_scored"] < len(BROAD_WINDOWS):
+            out.append(f"  NO VERDICT: only {v['windows_scored']} of {len(BROAD_WINDOWS)} "
+                       f"windows scored; the criteria assume all of them.")
+        else:
+            out.append(f"  ARM {arm}: {'PASS' if v['passed'] else 'FAIL'}")
+    return "\n".join(out)
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure the model against trivial baselines and sweep training history.",
@@ -1618,6 +1842,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Volatility Stage 1: does a model forecast next-5-day realised "
              "volatility better than EWMA (QLIKE)? Pre-registered pass "
              "criteria; verdict only with --broad.",
+    )
+    parser.add_argument(
+        "--vol-sizing", action="store_true",
+        help="Does EWMA volatility make a better basket? Arm A: inverse-vol "
+             "weights vs equal weight. Arm B: vol targeting vs matched "
+             "constant exposure. Pre-registered pass criteria; verdict only "
+             "with --broad.",
     )
     parser.add_argument(
         "--sell-info", action="store_true",
@@ -1808,6 +2039,23 @@ def main(argv: list[str] | None = None) -> int:
             and results["verdict"]["windows_scored"] == len(BROAD_WINDOWS)
         )
         print(summarise_vol_info(results["windows"], broad=window_set is BROAD_WINDOWS))
+    elif args.vol_sizing:
+        print(f"\n=== Volatility sizing probe ({window_label}) ===")
+        print("  EWMA-sized baskets vs controls that differ in one respect,")
+        print(f"  rebalanced every {VOL_HORIZON} trading days, slippage only.")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "vol_sizing",
+            "window_set": window_label,
+            "windows": run_vol_sizing_probe(windows=window_set),
+        }
+        results["verdict"] = {
+            arm: vol_sizing_verdict(results["windows"], arm) for arm in ("A", "B")
+        }
+        for v in results["verdict"].values():
+            v["complete"] = (window_set is BROAD_WINDOWS
+                             and v["windows_scored"] == len(BROAD_WINDOWS))
+        print(summarise_vol_sizing(results["windows"], broad=window_set is BROAD_WINDOWS))
     elif args.sell_info:
         print(f"\n=== SELL information probe, Stage 1 ({window_label}) ===")
         print("  One model per window, trained with a label embargo; forward")

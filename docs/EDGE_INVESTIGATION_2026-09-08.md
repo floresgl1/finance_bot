@@ -954,9 +954,78 @@ The pre-registered consequence: **ML adds nothing over the formula.** The one
 question left open is whether sizing the basket by EWMA volatility — no model
 at all — beats equal-weight holding on drawdown.
 
+## O. Does sizing by EWMA volatility make a better basket? (2026-09-27)
+
+Finding N's open question, with no model anywhere: EWMA is the best volatility
+forecaster tested, so does sizing the basket by it reduce drawdown?
+`edge_probe.py --vol-sizing --broad`. Two arms, each against a control that
+differs from it in exactly one respect:
+
+- **Arm A — inverse-vol weights vs equal weight.** Each name weighted by
+  1/EWMA vol; both sides fully invested and rebalanced on the same schedule,
+  so the weighting is the only difference.
+- **Arm B — vol targeting vs matched constant exposure.** An equal-weight
+  basket scaled so its EWMA volatility forecast meets a target (the basket's
+  realised daily volatility over the 3 years before the window), rest in cash,
+  never levered. Holding less stock wins drawdowns automatically (finding F),
+  so the control holds a *constant* fraction equal to B's own average exposure
+  in that window: the same stock on average, with no volatility information.
+
+Shared: rebalanced every 5 trading days, EWMA lambda 0.94, weights for a trade
+at close t use EWMA through t−1, costs are `backtest.SLIPPAGE` on traded
+notional only (Alpaca charges no commission; a $1 fee on 12 weekly trades
+would measure fees, not sizing).
+
+**Pass criteria agreed before the first run,** on `BROAD_WINDOWS` only, each
+arm judged separately:
+
+- **A** passes if its max drawdown is shallower than the control's in at least
+  7 of 10 windows AND the mean improvement is at least 1.0pp AND its mean
+  return is no more than 2pp per window below the control's.
+- **B** passes on the same three tests with a 2.0pp drawdown bar: an
+  exposure-timing rule has more ways to look lucky.
+
+Under the confirmation protocol this probe is two draws, and a pass on
+historical windows is a lead, not a result.
+
+| Window | A DD gain | A return gap | B DD gain | B return gap | B exposure |
+|---|---|---|---|---|---|
+| late 2019 bull | −0.09pp | −3.48pp | +0.10pp | −0.38pp | 97% |
+| covid crash 2020 | +2.23pp | +1.63pp | **−5.91pp** | **−10.00pp** | 41% |
+| covid recovery 2020 | +0.39pp | −9.08pp | −0.67pp | −4.32pp | 88% |
+| bull 2021 | +1.89pp | −1.86pp | −0.02pp | −0.37pp | 100% |
+| bear 2022 | +4.55pp | +4.90pp | −2.49pp | −2.75pp | 80% |
+| recovery 2023 | +0.44pp | −20.45pp | 0.00pp | 0.00pp | 100% |
+| bull 2024 | +3.13pp | −7.76pp | −0.06pp | −1.13pp | 100% |
+| choppy 2025 | +2.53pp | −3.36pp | −1.74pp | −8.97pp | 93% |
+| rally 2025-26 | +0.77pp | −6.37pp | 0.00pp | 0.00pp | 100% |
+| recent 2026 | −0.11pp | +2.50pp | 0.00pp | 0.00pp | 100% |
+
+Gains are arm minus its control; positive drawdown gain means shallower.
+
+**Arm A: FAIL on the return guardrail.** Shallower drawdown in 8 of 10
+windows, mean +1.57pp — both drawdown tests pass — but mean return is
+−4.34pp per window against a −2pp limit. Inverse-vol weighting moves money
+from NVDA and TSLA into JNJ and XOM: a calmer basket, not a smarter one. It
+buys its drawdown gain at more than twice the agreed price, worst in the
+bull windows (2023: −20.45pp).
+
+**Arm B: FAIL on every test.** Shallower drawdown in 1 of 10 windows, mean
+−1.08pp, return −2.79pp. It is worse than holding the same average exposure
+with no timing at all. In the covid crash EWMA reacted after the fall, cut
+exposure near the bottom (41% average) and missed the rebound; the constant
+control fell less and recovered more. The target, set from three calm-ish
+prior years, sat above the basket's forecast volatility most of the time, so
+in six windows B was simply fully invested.
+
+The pre-registered consequence: **EWMA volatility does not make a better
+basket here.** A trades return for drawdown at a worse rate than agreed; B's
+timing subtracts value. Reading A on a risk-adjusted measure instead was not
+the question asked, and would be a second draw.
+
 ## Where this leaves things
 
-**The strategy does not beat buy-and-hold**, on every measurement taken: six
+**The strategy does not beat buy-and-hold**, on every measurement taken: nine
 simulated attempts to find an edge, and the live account itself at −3.23pp over
 its first six months.
 
@@ -1026,6 +1095,13 @@ dead:
    and made worse by adding the model.
 6. ~~**A different label horizon.**~~ Findings G and H: every horizon from 3 to
    21 days loses by 14–25pp.
+7. ~~**Use SELL as a warning signal.**~~ Finding M: SELL days precede worse
+   returns in 5 of 10 windows — a coin flip.
+8. ~~**Forecast volatility instead of direction.**~~ Finding N: a model loses
+   to EWMA, a one-line formula, in 7 of 10 windows.
+9. ~~**Size the basket by EWMA volatility.**~~ Finding O: inverse-vol weights
+   cut drawdown but cost twice the agreed return; vol targeting cuts exposure
+   after the fall and misses the rebound, losing to a constant fraction.
 
 ### What is left
 
@@ -1033,17 +1109,19 @@ dead:
 technical indicators is a crowded, well-arbitraged space. "No durable edge" is
 the expected outcome, not a bug.
 
-Six independent attempts to find one have now failed, and the most informative
+Nine independent attempts to find one have now failed, and the most informative
 of them found that a rule with no model in it beats the model. The pipeline
 around the signal — risk controls, monitoring, P&L attribution, a promotion gate
-that correctly refuses to ship a worse model, 499 tests — is sound engineering
+that correctly refuses to ship a worse model, 813 tests — is sound engineering
 regardless of whether this particular signal pays.
 
 If the project continues as a learning exercise rather than a strategy, the
 interesting next chapter is a different question, not a better answer to this
-one: a more predictable target (realised volatility rather than direction), a
-different asset class or timeframe, or continued investment in the execution and
-monitoring machinery, which is the part that works.
+one. The more predictable target suggested here first, realised volatility,
+has now been tried (findings N and O): it forecasts well, but neither a model
+nor sizing by the forecast turns that into a better basket. What remains is a
+different asset class or timeframe, or continued investment in the execution
+and monitoring machinery, which is the part that works.
 
 The promotion gate now encodes this: `beats_buy_and_hold` (added 2026-09-08)
 rejects any challenger that loses to holding the basket, so the conclusion here

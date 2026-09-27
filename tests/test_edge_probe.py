@@ -1044,3 +1044,105 @@ def test_model_that_knows_the_regime_beats_ewma():
                           "ewma_vol": 0.025, "rv_20": 0.025})
     r = edge_probe.score_vol_window(frame.iloc[:3000], frame.iloc[3000:], ["regime"])
     assert r["model"] < r["ewma"]
+
+
+# ---------------------------------------------------------------------------
+# Volatility sizing (finding O)
+# ---------------------------------------------------------------------------
+def _closes(n=40, cols=("X", "Y"), seed=0):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2024-01-01", periods=n)
+    rets = rng.normal(0, 0.01, (n, len(cols)))
+    return pd.DataFrame(100 * np.exp(np.cumsum(rets, axis=0)), index=idx, columns=list(cols))
+
+
+def test_sizing_vol_never_reads_the_close_it_trades_on():
+    closes = _closes(60)
+    before = edge_probe._lagged_ewma_vol(closes)
+    shocked = closes.copy()
+    shocked.iloc[45:] *= 3.0                           # huge move on day 45
+    after = edge_probe._lagged_ewma_vol(shocked)
+    day = closes.index[45]
+    assert after.loc[day].equals(before.loc[day])
+    assert not after.iloc[46].equals(before.iloc[46])  # seen the next day
+
+
+def test_inverse_vol_weights_sum_to_one_and_favour_the_calm_name():
+    w = edge_probe.inverse_vol_weights(pd.Series({"calm": 0.01, "wild": 0.03}))
+    assert w.sum() == pytest.approx(1.0)
+    assert w["calm"] == pytest.approx(0.75)
+
+
+def test_vol_target_scales_down_but_never_levers_up():
+    assert edge_probe.vol_target_exposure(0.02, 0.01) == pytest.approx(0.5)
+    assert edge_probe.vol_target_exposure(0.005, 0.01) == 1.0
+
+
+def test_rebalanced_simulation_tracks_prices_and_charges_slippage_on_turnover():
+    idx = pd.bdate_range("2024-01-01", periods=3)
+    closes = pd.DataFrame({"X": [100.0, 110.0, 110.0]}, index=idx)
+    w = pd.DataFrame({"X": [1.0]}, index=idx[:1])
+    sim = edge_probe.simulate_rebalanced(closes, w, slippage=0.01)
+    assert sim["equity"].iloc[0] == pytest.approx(0.99, abs=1e-3)  # 1% on the opening buy
+    assert sim["equity"].iloc[1] == pytest.approx(0.99 * 1.10, abs=1e-3)
+    assert sim["exposure"].max() <= 1.0                     # the fee never borrows
+
+
+def test_cash_earns_nothing_and_is_not_exposed():
+    idx = pd.bdate_range("2024-01-01", periods=3)
+    closes = pd.DataFrame({"X": [100.0, 50.0, 50.0]}, index=idx)
+    w = pd.DataFrame({"X": [0.5]}, index=idx[:1])
+    sim = edge_probe.simulate_rebalanced(closes, w, slippage=0.0)
+    assert sim["equity"].iloc[1] == pytest.approx(0.75)
+    assert sim["exposure"].iloc[0] == pytest.approx(0.5)
+
+
+def test_the_b_control_holds_exactly_b_average_exposure():
+    closes = _closes(1000, cols=("X", "Y", "Z"), seed=3)
+    start, end = closes.index[800], closes.index[-1]
+    r = edge_probe.score_vol_sizing_window(closes, start, end, slippage=0.0)
+    assert r["B_control"]["avg_exposure"] == pytest.approx(r["matched_exposure"], abs=1.0)
+    assert r["A"]["avg_exposure"] == pytest.approx(100.0)
+    assert r["equal"]["avg_exposure"] == pytest.approx(100.0)
+
+
+def test_a_window_without_enough_history_for_the_target_is_skipped():
+    closes = _closes(300)
+    assert edge_probe.score_vol_sizing_window(
+        closes, closes.index[200], closes.index[-1], slippage=0.0) is None
+
+
+def _sizing_windows(rows):
+    """rows: (arm_dd, ctl_dd, arm_ret, ctl_ret) per window, applied to both arms."""
+    out = {}
+    for i, (add, cdd, aret, cret) in enumerate(rows):
+        arm = {"max_drawdown": add, "total_return": aret}
+        ctl = {"max_drawdown": cdd, "total_return": cret}
+        out[f"w{i}"] = {"A": arm, "equal": ctl, "B": arm, "B_control": ctl}
+    return out
+
+
+@pytest.mark.parametrize("rows, a_passed, b_passed", [
+    ([(-10, -12, 5, 5)] * 7 + [(-12, -11, 5, 5)] * 3, True, False),  # mean +1.1pp
+    ([(-10, -12, 5, 5)] * 10, True, True),                            # exactly +2.0pp
+    ([(-9, -12, 5, 5)] * 6 + [(-12, -11, 5, 5)] * 4, False, False),   # only 6 wins
+    ([(-8, -12, 3, 5)] * 10, True, True),                             # return cost exactly 2pp
+    ([(-8, -12, 2.9, 5)] * 10, False, False),                         # return cost 2.1pp
+])
+def test_sizing_verdict_applies_the_pre_registered_criteria(rows, a_passed, b_passed):
+    w = _sizing_windows(rows)
+    assert edge_probe.vol_sizing_verdict(w, "A")["passed"] is a_passed
+    assert edge_probe.vol_sizing_verdict(w, "B")["passed"] is b_passed
+
+
+def test_sizing_run_with_missing_windows_gives_no_verdict():
+    text = edge_probe.summarise_vol_sizing({}, broad=True)
+    assert text.count("NO VERDICT") == 2
+    assert "FAIL" not in text and "PASS" not in text
+
+
+def test_sizing_criteria_are_the_ones_agreed_before_the_run():
+    assert edge_probe.VOL_SIZING_MIN_WINDOWS == 7
+    assert edge_probe.VOL_SIZING_MIN_DD_GAIN_PP == {"A": 1.0, "B": 2.0}
+    assert edge_probe.VOL_SIZING_MAX_RETURN_COST_PP == 2.0
+    assert edge_probe.VOL_SIZING_TARGET_YEARS == 3
