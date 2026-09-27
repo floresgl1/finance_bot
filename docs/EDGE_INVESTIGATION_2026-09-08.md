@@ -954,6 +954,40 @@ The pre-registered consequence: **ML adds nothing over the formula.** The one
 question left open is whether sizing the basket by EWMA volatility — no model
 at all — beats equal-weight holding on drawdown.
 
+## O. Does sizing by EWMA volatility make a better basket? (2026-09-27)
+
+Finding N's open question, with no model anywhere: EWMA is the best volatility
+forecaster tested, so does sizing the basket by it reduce drawdown?
+`edge_probe.py --vol-sizing --broad`. Two arms, each against a control that
+differs from it in exactly one respect:
+
+- **Arm A — inverse-vol weights vs equal weight.** Each name weighted by
+  1/EWMA vol; both sides fully invested and rebalanced on the same schedule,
+  so the weighting is the only difference.
+- **Arm B — vol targeting vs matched constant exposure.** An equal-weight
+  basket scaled so its EWMA volatility forecast meets a target (the basket's
+  realised daily volatility over the 3 years before the window), rest in cash,
+  never levered. Holding less stock wins drawdowns automatically (finding F),
+  so the control holds a *constant* fraction equal to B's own average exposure
+  in that window: the same stock on average, with no volatility information.
+
+Shared: rebalanced every 5 trading days, EWMA lambda 0.94, weights for a trade
+at close t use EWMA through t−1, costs are `backtest.SLIPPAGE` on traded
+notional only (Alpaca charges no commission; a $1 fee on 12 weekly trades
+would measure fees, not sizing).
+
+**Pass criteria agreed before the first run,** on `BROAD_WINDOWS` only, each
+arm judged separately:
+
+- **A** passes if its max drawdown is shallower than the control's in at least
+  7 of 10 windows AND the mean improvement is at least 1.0pp AND its mean
+  return is no more than 2pp per window below the control's.
+- **B** passes on the same three tests with a 2.0pp drawdown bar: an
+  exposure-timing rule has more ways to look lucky.
+
+Under the confirmation protocol this probe is two draws, and a pass on
+historical windows is a lead, not a result.
+
 ## Where this leaves things
 
 **The strategy does not beat buy-and-hold**, on every measurement taken: six
