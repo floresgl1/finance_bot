@@ -1,12 +1,12 @@
 name: Update Market Data
 
-# Primary run at 12:00 PM UTC Mon–Fri; backup at 12:30 in case GHA skips the
-# first schedule.  The workflow is idempotent — a second run just re-uploads
-# the same CSVs.  Can also be triggered manually from the Actions tab.
+# Started at 12:00 UTC Mon–Fri by a PythonAnywhere scheduled task running
+# dispatch_workflow.py (see create_pa_dispatch_tasks.py). GitHub's own
+# `schedule:` trigger was removed: it ran this workflow up to seven hours late,
+# and a late run's webhook chain then traded hours after the 15:00 UTC window.
+# The workflow is idempotent — a second run just re-uploads the same CSVs.
+# Can also be triggered manually from the Actions tab.
 on:
-  schedule:
-    - cron: '0 12 * * 1-5'    # primary
-    - cron: '30 12 * * 1-5'   # backup
   workflow_dispatch:
 
 jobs:

@@ -28,16 +28,22 @@ contradictory.
 
 | Time  | What fires | Where |
 |-------|-----------|-------|
-| 12:00 | `update_market_data.yml` — refreshes CSVs, uploads to PA, then hits the webhook that runs `run_bot.py` | GitHub Actions cron |
+| 12:00 | `update_market_data.yml` — refreshes CSVs, uploads to PA, then hits the webhook that runs `run_bot.py` | GitHub Actions, started by a PA task (`dispatch_workflow.py`) |
 | 13:00 | `pre_run_validation.py` | PA task |
 | 13:30 | `sentiment_collector.py`; **market opens** | PA task |
+| 14:15 | `agent_pretrade.yml` — writes `agent_decisions.json` for the 15:00 run | GitHub Actions, started by a PA task (`dispatch_workflow.py`) |
 | 15:00 | `run_bot.py` — the safety net, the run that is *supposed* to trade | PA task |
 | 20:30 | `agent_daily.yml` — news-validation agent | GitHub Actions |
 
-The webhook run typically lands ~13:00, **before** the 13:30 open, so it
-correctly does nothing. GitHub's cron is frequently late; when it slips past
-13:30 that run trades instead, and the 15:00 net then correctly skips. Both
-orderings are legitimate. What matters is that **exactly one** run traded.
+The webhook run typically lands ~12:05, **before** the 13:30 open, so it
+correctly does nothing. Both 12:00 and 14:15 used to be GitHub `schedule:`
+crons, which ran up to seven hours late (2026-09-28: data at 19:14, pre-trade
+agent at 20:32, so 15:00 halted on stale data and the late webhook run traded
+at 19:17). They are now started by PA tasks via `workflow_dispatch`. If the
+webhook run still lands after 13:30, it trades and the 15:00 net correctly
+skips; both orderings are legitimate. What matters is that **exactly one** run
+traded. A `🚨 Workflow dispatch failed` Discord alert means a PA task could not
+start its workflow.
 
 ## The invariant that matters most
 
