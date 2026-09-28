@@ -1,16 +1,25 @@
 name: Alpaca Smoke Test
 
-# Manual only. Runs smoke_alpaca.py against the Alpaca PAPER account with the
-# repo's ALPACA_* secrets, so the broker.py adapter can be checked without
-# keys on a local machine.
+# Runs smoke_alpaca.py against the Alpaca PAPER account with the repo's
+# ALPACA_* secrets, so the broker.py adapter can be checked without keys on a
+# local machine.
 #
-# Pick the branch to test in the "Run workflow" dropdown. Read-only unless
-# place_order is ticked; with it, the script trades one share of a symbol
-# outside the watchlist and cleans up (see smoke_alpaca.py).
+# Manual: pick the branch to test in the "Run workflow" dropdown. Read-only
+# unless place_order is ticked; with it, the script trades one share of a
+# symbol outside the watchlist and cleans up (see smoke_alpaca.py).
+#
+# Scheduled: one run with place_order on 2026-09-29 at 16:30 UTC (9:30 PT),
+# during market hours so the order fills and the whole order path is
+# exercised for PR #37. Scheduled runs always execute the workflow on main,
+# so this one checks out claude/alpaca-py-adapter explicitly. Cron repeats
+# every 29 September, so the "One-off date gate" step makes every other year
+# a no-op. Remove the schedule once PR #37 is merged.
 #
 # Refuses to place orders between 14:45 and 15:30 UTC so it can never overlap
 # the live trader's 15:00 UTC run on PythonAnywhere.
 on:
+  schedule:
+    - cron: '30 16 29 9 *'
   workflow_dispatch:
     inputs:
       place_order:
@@ -26,15 +35,33 @@ concurrency:
   group: smoke-alpaca
   cancel-in-progress: false
 
+env:
+  SCHEDULED_DATE: '2026-09-29'
+  SCHEDULED_REF: 'claude/alpaca-py-adapter'
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: One-off date gate
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ] || [ "$(date -u +%F)" = "$SCHEDULED_DATE" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Scheduled run outside $SCHEDULED_DATE; nothing to do."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.gate.outputs.go == 'true'
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && env.SCHEDULED_REF || github.ref }}
 
       - name: Set up Python
+        if: steps.gate.outputs.go == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -42,12 +69,13 @@ jobs:
       # Only what smoke_alpaca.py imports: broker.py needs alpaca-py and
       # pandas; config.py is standard library.
       - name: Install dependencies
+        if: steps.gate.outputs.go == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install alpaca-py pandas
 
       - name: Keep clear of the live trader's window
-        if: ${{ inputs.place_order }}
+        if: steps.gate.outputs.go == 'true' && (github.event_name == 'schedule' || inputs.place_order)
         run: |
           now=$(date -u +%H%M)
           if [ "$now" -ge 1445 ] && [ "$now" -le 1530 ]; then
@@ -56,11 +84,12 @@ jobs:
           fi
 
       - name: Run smoke test
+        if: steps.gate.outputs.go == 'true'
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          PLACE_ORDER: ${{ inputs.place_order }}
-          SYMBOL: ${{ inputs.symbol }}
+          PLACE_ORDER: ${{ github.event_name == 'schedule' || inputs.place_order }}
+          SYMBOL: ${{ inputs.symbol || 'F' }}
         run: |
           args=(--symbol "$SYMBOL")
           if [ "$PLACE_ORDER" = "true" ]; then args+=(--place-order); fi
