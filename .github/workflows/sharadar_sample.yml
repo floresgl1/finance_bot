@@ -1,8 +1,9 @@
 name: Sharadar Sample Discovery
 
-# Runs sharadar_sample.py --discover with the repo's SHARADAR_API_KEY secret,
-# to see which Sharadar tables and companies the key can reach before the
-# checks in docs/MICROCAP_VALUE_PREREG.md are written.
+# Runs sharadar_sample.py --discover with the repo's SHARADAR_API_KEY secret
+# (a sharadar.com key, for api.sharadar.com), to see which tables and how much
+# data the key can reach before the structural checks in
+# docs/MICROCAP_VALUE_PREREG.md are written.
 #
 # Manual only. Prints structure (tables, columns, counts, a few tickers) to the
 # log; never prices, returns or rankings, and uploads no data.
