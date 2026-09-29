@@ -33,6 +33,7 @@ contradictory.
 | 13:30 | `sentiment_collector.py`; **market opens** | PA task |
 | 14:15 | `agent_pretrade.yml` — writes `agent_decisions.json` for the 15:00 run | GitHub Actions, started by a PA task (`dispatch_workflow.py`) |
 | 15:00 | `run_bot.py` — the safety net, the run that is *supposed* to trade | PA task |
+| 15:45 | `pipeline_check.py` — posts ✅ or 🚨 per step to Discord; a 🚨 line names the step to start from | PA task |
 | 20:30 | `agent_daily.yml` — news-validation agent | GitHub Actions |
 
 The webhook run typically lands ~12:05, **before** the 13:30 open, so it
