@@ -15,6 +15,14 @@ Sharadar data. At the time of writing only Sharadar's free sample had been
 accessed, and only to plan this amendment; no returns, rankings or results
 had been computed from any source.
 
+*Amended again 2026-09-29, still before any data exists:* Sharadar is used
+through its own API (`api.sharadar.com`), not Nasdaq Data Link, and its field
+names differ from those first written here. The free tier covers only the 30
+Dow stocks, so the structural checks cannot run on it; they now run on the
+downloaded data, before any return or ranking is computed. A fifth check
+covers the ticker join. The only data seen was public ticker metadata and
+Sharadar's AAPL-only demo key.
+
 ## Why this, and not more of the current bot
 
 Nine pre-registered probes found no edge in daily technical signals on twelve
@@ -123,7 +131,7 @@ live data before any real money.
 
 These rules apply whichever data source is used.
 
-- **Data source.** Sharadar (Nasdaq Data Link): active and delisted US
+- **Data source.** Sharadar (sharadar.com's own API): active and delisted US
   companies, point-in-time fundamentals with filing dates, from the late 1990s.
   WRDS (CRSP/Compustat) access is being pursued; if granted, the test is also
   run on CRSP/Compustat under the rules above, and a pass must hold on both.
@@ -177,35 +185,52 @@ These rules apply whichever data source is used.
 
 ## Implementing on Sharadar
 
-CRSP codes named above have Sharadar equivalents as follows.
+CRSP codes named above have Sharadar equivalents as follows. Table names are
+those of `api.sharadar.com/v1.0/data/`: `tickers`, `fundamentals`, `stocks`,
+`actions`.
 
 | Rule | Sharadar implementation |
 |---|---|
-| Identity (PERMNO, GVKEY, CCM link) | `permaticker` identifies both security and company, and every Sharadar table carries it, so there is no link table to go wrong. Tickers are never used. |
-| Share code 10/11 | `category` is `Domestic Common Stock` or `Domestic Common Stock Primary Class`. `Domestic Common Stock Secondary Class` is excluded, so a dual-class company enters once — the job CRSP's `linkprim` does. |
+| Identity (PERMNO, GVKEY, CCM link) | `permaticker` is the identity. Only the `tickers` table carries it; `fundamentals` and `stocks` carry only `ticker`, so each row is joined to its `permaticker` through `tickers`. This is safe only because Sharadar renames an old ticker when it is reused (e.g. `AAC2`), keeping each ticker unique in its database — which check 5 verifies. Tickers from any other source are never used. |
+| Share code 10/11 | `category` is `Domestic Common Stock` or `Domestic Common Stock Primary Class`. `Domestic Common Stock Secondary Class` is excluded, so a dual-class company enters once — the job CRSP's `linkprim` does. ADR and Canadian categories are excluded. |
 | Exchange code 1–3 | **Not implemented from Sharadar's `exchange` field.** It is a snapshot of the last known exchange: a company demoted to OTC before failing would be dropped from every earlier year too, deleting future losers from past rankings. Eligibility rests instead on the point-in-time size and liquidity filters on each rebalance date. |
 | Financials | `siccode` 6000–6999 excluded. |
 | Blank-check shells | Company-years whose latest usable filing shows **zero revenue** are excluded. A SPAC that later merges takes the operating company's SIC, so the snapshot `siccode` misses its shell years; shells trade flat near $10 at $100M–$300M and would dilute the control. This also drops pre-revenue companies, from strategy and control alike. |
-| Fundamentals as known at the time | `SF1` rows with dimension **`ARY`** (as first reported) only, never `MRY`: a restatement published later must not appear in an earlier ranking. Filing date is `datekey`. EBIT, debt and cash are the raw fields; the vendor's `ev` and `evebit` are not used (see "Enterprise value"). |
-| Total return | Daily change in `SEP.closeadj`, which is adjusted for splits and dividends. |
-| Delisting reason | The Sharadar `ACTIONS` event that ends the listing, mapped to the table above. |
+| Fundamentals as known at the time | `fundamentals` rows with dimension **`ARY`** (as first reported) only, never `MRY`: a restatement published later must not appear in an earlier ranking. The filing date is the field `date` (Sharadar's "Date Key": for `ARY`, the date the filing reached the SEC). EBIT, debt and cash are the raw fields `ebit`, `debt`, `cashneq`; the vendor's `ev`, `evebit` and `marketcap` are not used (see "Enterprise value"). |
+| Total return | Daily change in `stocks.closeadj`, which is adjusted for splits and dividends. |
+| Delisting reason | The `actions` event that ends the listing, mapped to the table above. |
+| Date coverage | Date-filtered queries default to the last year only, and the `from`/`to` filter did not behave as documented in a test with the demo key. The download therefore states its date range explicitly, and the loader verifies that every year of the test has rows before anything else runs. |
 
-## Checks on the free sample — before the full download
+## Structural checks — before any result
 
-Sharadar's free sample is used for **structure only**: column names, types,
-and how delisted and dual-class companies appear. No returns or rankings are
-computed from it. Each check below tests an assumption in the table above. If
-one fails, the affected rule is amended here **before** the full download,
-never after.
+The free tier covers only the 30 Dow stocks, which contain no micro-caps,
+SPACs or failures, so these checks run on the **downloaded** data. They
+examine structure only: fields, identifiers, categories, event names. They run
+before any return, ranking or result is computed. If one fails, the affected
+rule is amended here, dated, **before** any result exists.
+
+The download must also prove it is the paid data: a wrong API key returns
+HTTP 200 with limited data, not an error. The loader stops if one page of
+`ARY` fundamentals holds fewer than 100 distinct tickers.
 
 1. **Dual-class share counts.** For a known dual-class company, does the share
    count in the fundamentals cover all classes? If not, market cap must be
    summed across the classes' price rows.
-2. **Demoted stocks.** Does `SEP` carry prices after a stock moves to OTC, and
-   do any such names pass the $100k ADV floor? If so, the dropped exchange
+2. **Demoted stocks.** Does `stocks` carry prices after a stock moves to OTC,
+   and do any such names pass the $100k ADV floor? If so, the dropped exchange
    filter needs a point-in-time replacement.
 3. **SPAC shell years.** What `siccode` and revenue does a merged SPAC show
    for its shell years? If Sharadar flags shells directly, that flag replaces
    the zero-revenue rule.
-4. **Delisting event names.** Which `ACTIONS` values mark an acquisition and
+4. **Delisting event names.** Which `actions` values mark an acquisition and
    which a failure? The mapping to 0% / −30% is fixed from these names.
+5. **Ticker join.** Every ticker in the downloaded `fundamentals` and `stocks`
+   rows maps to exactly one `permaticker` in `tickers`. A ticker with none is
+   reported; a ticker with two stops the run.
+
+Seen in the public `tickers` table on 2026-09-29 (metadata only, visible to
+any key): 17,854 companies with fundamentals, 12,325 of them delisted; no
+ticker mapped to two permatickers; no `Secondary Class` category among them;
+many SPACs listed as `Primary Class` (their Class A/Class B structure), which
+the SIC and zero-revenue rules remove. These observations do not replace the
+checks, which run on the downloaded rows.
