@@ -9,6 +9,12 @@ pass" in `EDGE_INVESTIGATION_2026-09-08.md`.
 which securities qualify (CRSP share and exchange codes), and "Identifiers and
 joins" fixes how prices and fundamentals are matched.
 
+*Amended 2026-09-29, still before any data exists:* every open item is now
+decided, and "Implementing on Sharadar" states how each rule is met with
+Sharadar data. At the time of writing only Sharadar's free sample had been
+accessed, and only to plan this amendment; no returns, rankings or results
+had been computed from any source.
+
 ## Why this, and not more of the current bot
 
 Nine pre-registered probes found no edge in daily technical signals on twelve
@@ -84,7 +90,7 @@ company's data to another's years, or drops a delisted company entirely.
   - the rebalance date lies within `linkdt`–`linkenddt` (a link is valid only
     for its dates; mergers and share-class changes move it).
 - A fundamentals row is usable on a rebalance date only if it was public by
-  then (see "filing lag" under open items).
+  then (see "Filing lag" under the decisions below).
 
 ## Pass criteria
 
@@ -113,16 +119,93 @@ itself orders the returns, not just whether one portfolio got lucky.
 A pass is a lead, not a result. It goes through the confirmation protocol on
 live data before any real money.
 
-## Open items — must be fixed before the first run
+## Decisions on the former open items (2026-09-29)
 
-- **Data source.** Point-in-time prices, fundamentals with filing dates, and
-  delisting returns for US micro-caps. Yahoo has none of these. Cost and
-  coverage decide how many years the test gets.
-- **Spread source.** "Half the spread" needs historical bid-ask spreads, which
-  are hard to get for micro-caps. If the vendor lacks them, pick an estimator
-  now (for example one based on daily high/low prices) and state it here.
-- **Rebalance month and filing lag.** Which month, and how the filing date is
-  determined (a vendor's filing date, or a fixed lag after fiscal year end).
-- **Delisting return.** What a position returns when its stock delists
-  mid-year — the vendor's delisting return if it has one, otherwise a fixed
-  assumption stated here.
+These rules apply whichever data source is used.
+
+- **Data source.** Sharadar (Nasdaq Data Link): active and delisted US
+  companies, point-in-time fundamentals with filing dates, from the late 1990s.
+  WRDS (CRSP/Compustat) access is being pursued; if granted, the test is also
+  run on CRSP/Compustat under the rules above, and a pass must hold on both.
+  Alternatives rejected: SEC EDGAR XBRL has no prices, covers small companies
+  only from 2011, and would need a hand-built EBIT from raw tags — errors there
+  would reorder the ranking and look like signal. Norgate has only current
+  fundamentals, not what was known on past dates.
+- **Rebalance date: July 1** each year (the next trading day if closed). By
+  then even late December-year-end filers are past their deadline, and it is
+  the standard academic timing, so results stay comparable to published ones.
+- **Filing lag.** A fundamentals row is usable on rebalance date D only if its
+  filing date is strictly before D; filings often arrive after the close.
+- **Staleness.** A company whose latest usable filing covers a fiscal year that
+  ended more than **18 months** before D is excluded from the universe, for
+  strategy and control alike. Late filing is a warning sign; without this rule
+  the ranking would value a troubled company on pre-trouble EBIT against a
+  post-trouble price, making it look cheap just before it fails.
+- **Enterprise value** is computed on D from that day's market cap plus the
+  latest usable filing's debt minus cash. A vendor's precomputed EV is not
+  used: it is dated at the filing, so companies filing in different months
+  would be ranked on prices from different days.
+- **Market cap** is the whole company's, summed across all share classes, for
+  both EV and the $50M–$300M filter. Using one class's shares would understate
+  EV and make dual-class companies look cheaper than they are.
+- **Delisting return**, applied on the delisting day, by reason:
+
+  | Reason | Return beyond the last close |
+  |---|---|
+  | Acquired or merged away | 0% (a buyout's last trade is near the deal price) |
+  | Bankruptcy, regulatory delisting, voluntary, or unknown | **−30%** (Shumway) |
+
+  Unknown reasons take the loss, so unclear data makes the backtest look worse,
+  not better.
+- **Cash from a delisting** is reinvested the same day into the remaining
+  holdings in proportion to their current weights, paying half the spread on
+  those buys. The control follows the same rule. Holding the cash instead
+  would leave the strategy — whose cheap, troubled stocks delist more often —
+  holding more cash than the control, and the gap would partly measure cash
+  held rather than the signal.
+- **Spread**, when the source has no bid-ask data: the Abdi–Ranaldo (2017)
+  estimator on split-adjusted daily high, low and close.
+  - Two-day estimates, negatives set to 0, averaged over the **252 trading
+    days before** the trade date. Only data known on the trade date is used,
+    and the trailing year exists even for a stock that delists soon after.
+  - Floor of **0.5%**: estimators undershoot for quiet stocks, and too little
+    cost flatters the strategy.
+  - Fewer than 126 valid days: **2 × the universe median** on that date.
+    Unknown liquidity is treated as poor liquidity.
+  - The cost of each trade is half the estimated spread, as in the strategy
+    table.
+
+## Implementing on Sharadar
+
+CRSP codes named above have Sharadar equivalents as follows.
+
+| Rule | Sharadar implementation |
+|---|---|
+| Identity (PERMNO, GVKEY, CCM link) | `permaticker` identifies both security and company, and every Sharadar table carries it, so there is no link table to go wrong. Tickers are never used. |
+| Share code 10/11 | `category` is `Domestic Common Stock` or `Domestic Common Stock Primary Class`. `Domestic Common Stock Secondary Class` is excluded, so a dual-class company enters once — the job CRSP's `linkprim` does. |
+| Exchange code 1–3 | **Not implemented from Sharadar's `exchange` field.** It is a snapshot of the last known exchange: a company demoted to OTC before failing would be dropped from every earlier year too, deleting future losers from past rankings. Eligibility rests instead on the point-in-time size and liquidity filters on each rebalance date. |
+| Financials | `siccode` 6000–6999 excluded. |
+| Blank-check shells | Company-years whose latest usable filing shows **zero revenue** are excluded. A SPAC that later merges takes the operating company's SIC, so the snapshot `siccode` misses its shell years; shells trade flat near $10 at $100M–$300M and would dilute the control. This also drops pre-revenue companies, from strategy and control alike. |
+| Fundamentals as known at the time | `SF1` rows with dimension **`ARY`** (as first reported) only, never `MRY`: a restatement published later must not appear in an earlier ranking. Filing date is `datekey`. EBIT, debt and cash are the raw fields; the vendor's `ev` and `evebit` are not used (see "Enterprise value"). |
+| Total return | Daily change in `SEP.closeadj`, which is adjusted for splits and dividends. |
+| Delisting reason | The Sharadar `ACTIONS` event that ends the listing, mapped to the table above. |
+
+## Checks on the free sample — before the full download
+
+Sharadar's free sample is used for **structure only**: column names, types,
+and how delisted and dual-class companies appear. No returns or rankings are
+computed from it. Each check below tests an assumption in the table above. If
+one fails, the affected rule is amended here **before** the full download,
+never after.
+
+1. **Dual-class share counts.** For a known dual-class company, does the share
+   count in the fundamentals cover all classes? If not, market cap must be
+   summed across the classes' price rows.
+2. **Demoted stocks.** Does `SEP` carry prices after a stock moves to OTC, and
+   do any such names pass the $100k ADV floor? If so, the dropped exchange
+   filter needs a point-in-time replacement.
+3. **SPAC shell years.** What `siccode` and revenue does a merged SPAC show
+   for its shell years? If Sharadar flags shells directly, that flag replaces
+   the zero-revenue rule.
+4. **Delisting event names.** Which `ACTIONS` values mark an acquisition and
+   which a failure? The mapping to 0% / −30% is fixed from these names.
