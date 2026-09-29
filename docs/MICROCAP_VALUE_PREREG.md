@@ -283,3 +283,39 @@ securities `SEP`.
 - **Checks 2–5 report counts only.** Check 5 fails the run if any ticker maps
   to two permatickers. Checks 2–4 inform the rules above; a rule they show to
   be wrong is amended here, dated, before any result.
+
+## Structural check results and the rules they changed (2026-09-29)
+
+`microcap_checks.py` on the downloaded data. No return, ranking or EBIT/EV had
+been computed.
+
+| Check | Result |
+|---|---|
+| Guard | 17,687 distinct tickers in `ARY` fundamentals: the paid universe |
+| Coverage | Every year 1998–2025 has ≥ 248 trading days of prices and ≥ 5,502 `ARY` filings; prices run to 2026-09-29 |
+| 5. Ticker join | No ticker maps to two permatickers; no unmapped rows |
+| 4. Delisting reasons | 11,356 delistings of eligible common stock: acquired 62%, failed 37%, **unknown 1%** (151). The −30% / 0% sensitivity run is kept, and is expected to change little |
+| 3. SPAC shells | All 818 merged SPACs now carry a non-6770 SIC; only 71% of their 1,737 pre-merger filings show zero or missing revenue |
+| 2. Demoted stocks | Of 1,453 moves to OTC, 1,034 kept trading, and 725 (ticker, rebalance) pairs on OTC passed the $100k ADV floor |
+| 1. Dual-class | 154 companies (65 listed); hand verification pending, recorded below when done |
+
+Sharadar also files most old SPAC units under `Secondary Class` (1,137 of
+1,339), renamed after the company the SPAC merged into. The universe already
+excludes `Secondary Class`, so this changes only how check 1 finds real
+dual-class companies (by issuer name, unit tickers skipped).
+
+Two rules change, as the checks section specified. Approved by the author
+2026-09-29, before any backtest code existed:
+
+- **A. Exchange (from check 2).** The liquidity floor does not keep OTC stocks
+  out, so a point-in-time exchange rule replaces it for that purpose: a
+  security is **not eligible on D if its most recent `exchangeto` event before
+  D moved it to OTC**. Built from dated events, not the snapshot `exchange`
+  field, so a company that later drops to OTC stays eligible in its earlier
+  exchange-listed years.
+- **B. SPAC shells (from check 3).** Sharadar flags shells directly, so the
+  flag replaces the zero-revenue rule: a company is a shell, and not
+  eligible, **on any D before its `spacmerger` date, or while its SIC is
+  6770**. The zero-revenue rule is dropped. Pre-revenue companies therefore
+  return to the universe; with negative EBIT they rank at the bottom, so they
+  enter the control, not the strategy.
