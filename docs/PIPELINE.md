@@ -500,6 +500,17 @@ start them on time with `dispatch_workflow.py`:
 |---|---|---|
 | 12:00 | `python dispatch_workflow.py update_market_data.yml` | market data refresh + webhook |
 | 14:15 | `python dispatch_workflow.py agent_pretrade.yml` | pre-trade agent |
+| 15:45 | `python pipeline_check.py` | daily alarm (below) |
+
+**`pipeline_check.py` — did every step produce today's output?** Exit codes
+missed two of the September 2026 silent failures (an expired token that exited
+0, and a task nobody read the log of), so this checks each step's *output*:
+market CSVs modified today, `pending_signals.json` and `agent_decisions.json`
+dated today, the run guard stamped today and no `HALT_FLAG.txt`. It posts one
+Discord line every trading day, green or a list of failures, and exits 1 on any
+failure. The daily green line is intentional: if it stops appearing, the check
+itself has stopped running. For *why* a step failed, use `pipeline_status.py`
+or the daily-run-triage agent.
 
 `create_pa_dispatch_tasks.py` creates or updates both tasks (idempotent).
 `dispatch_workflow.py` skips weekends, retries network errors and 5xx, and posts
