@@ -23,6 +23,13 @@ downloaded data, before any return or ranking is computed. A fifth check
 covers the ticker join. The only data seen was public ticker metadata and
 Sharadar's AAPL-only demo key.
 
+*Amended a third time 2026-09-29, after the download and before any check,
+return or ranking:* "Rules fixed before the structural checks" states how
+unknown delistings, liquidity, market cap and year coverage are measured, and
+turns check 1 into a hand verification. The files used are recorded by hash in
+`docs/sharadar_manifest.json`. Data seen so far: row counts, date ranges,
+table and category names, and the layout of exchange-change events.
+
 ## Why this, and not more of the current bot
 
 Nine pre-registered probes found no edge in daily technical signals on twelve
@@ -234,3 +241,45 @@ ticker mapped to two permatickers; no `Secondary Class` category among them;
 many SPACs listed as `Primary Class` (their Class A/Class B structure), which
 the SIC and zero-revenue rules remove. These observations do not replace the
 checks, which run on the downloaded rows.
+
+## Rules fixed before the structural checks (2026-09-29)
+
+Written after the download and before `microcap_checks.py` first ran. In the
+bulk files the `tickers` table labels fundamentals companies `SF1` and priced
+securities `SEP`.
+
+- **Delisting reason.** A `delisted` event takes its reason from an event on
+  the same ticker within **30 calendar days** either side. Acquired
+  (`acquisitionby`, `mergerto`, `spacmerger`): 0%. Failed
+  (`bankruptcyliquidation`, `regulatorydelisting`, `voluntarydelisting`):
+  −30%. If both kinds are present, failure wins. No reason event: unknown.
+- **Unknown delistings: primary rule and sensitivity run.** The primary run
+  gives unknown delistings −30%, and only a pass under it counts. A second run
+  gives them 0%. Unknowns concentrate in the strategy, whose cheap stocks both
+  fail and get taken over more often than the control's, so −30% biases the
+  test against a pass; the second run shows by how much. **Fails at −30% but
+  passes at 0% means inconclusive, never a pass**: the next step would be to
+  find out what those delistings were, not to pick the rule that wins.
+- **Liquidity (ADV).** Mean of `close × volume` over the **252 trading days
+  before** D; both are split-adjusted, so their product is the real dollar
+  volume. A security with fewer than 126 days of volume in that window is not
+  eligible: its liquidity cannot be assessed.
+- **Market cap on D** = `close(D) × sharesbas × closeunadj(f) / close(f)`,
+  where f is the trading day on or before the filing's `date`. `close` is
+  split-adjusted but `sharesbas` is the count as reported, so after a later
+  split the adjusted price alone would understate market cap; the ratio
+  `closeunadj(f) / close(f)` puts the reported count on the adjusted basis.
+- **Year coverage.** The first rebalance is July 1999 (it needs a year of
+  prices from the first date, 1997-12-31) and the last is July 2025 (its year
+  ends July 2026). The data must have price rows and `ARY` filings in every
+  calendar year 1998–2025, and prices through 2026-07-01. A gap stops the run.
+- **Check 1 becomes a hand verification.** Sharadar has no per-class share
+  counts, so the data cannot answer it. `microcap_checks.py` lists dual-class
+  companies (a `Secondary Class` security whose issuer is an `SF1` company);
+  the researcher checks **three** of them against the share counts on the
+  cover page of their 10-K on SEC EDGAR and records the result here. If
+  `sharesbas` misses a class in any of the three, market cap is amended before
+  any result.
+- **Checks 2–5 report counts only.** Check 5 fails the run if any ticker maps
+  to two permatickers. Checks 2–4 inform the rules above; a rule they show to
+  be wrong is amended here, dated, before any result.
