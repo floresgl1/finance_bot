@@ -17,7 +17,7 @@ files the test used, without containing any data.
     python sharadar_download.py --tables tickers # just one
     python sharadar_download.py --force          # re-download existing files
 
-Needs SHARADAR_API_KEY in the environment. Never prints the key or the
+Needs SHARADAR_API_KEY in the environment or .env. Never prints the key or the
 signed redirect URL. Exit 0 only if every requested file is on disk, is a
 valid zip, and is in the manifest.
 """
@@ -32,6 +32,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BASE_URL = "https://api.sharadar.com/v1.0/data"
 TABLES = ["tickers", "actions", "fundamentals", "stocks"]
