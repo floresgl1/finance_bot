@@ -297,7 +297,7 @@ been computed.
 | 4. Delisting reasons | 11,356 delistings of eligible common stock: acquired 62%, failed 37%, **unknown 1%** (151). The −30% / 0% sensitivity run is kept, and is expected to change little |
 | 3. SPAC shells | All 818 merged SPACs now carry a non-6770 SIC; only 71% of their 1,737 pre-merger filings show zero or missing revenue |
 | 2. Demoted stocks | Of 1,453 moves to OTC, 1,034 kept trading, and 725 (ticker, rebalance) pairs on OTC passed the $100k ADV floor |
-| 1. Dual-class | 154 companies (65 listed); hand verification pending, recorded below when done |
+| 1. Dual-class | 154 companies (65 listed); verified by hand below: `sharesbas` is the total of all classes |
 
 Sharadar also files most old SPAC units under `Secondary Class` (1,137 of
 1,339), renamed after the company the SPAC merged into. The universe already
@@ -319,3 +319,15 @@ Two rules change, as the checks section specified. Approved by the author
   6770**. The zero-revenue rule is dropped. Pre-revenue companies therefore
   return to the universe; with negative EBIT they rank at the bottom, so they
   enter the control, not the strategy.
+
+**Check 1, verified by hand 2026-09-29.** Each company's latest `sharesbas`
+against the share counts on the cover page of the same 10-K on SEC EDGAR:
+
+| Company | 10-K filed | Classes on the cover page | Sum | `sharesbas` |
+|---|---|---|---|---|
+| Bel Fuse | 2026-02-24 | A 2,115,263 · B 10,541,050 | 12,656,313 | 12,656,313 |
+| Bio-Rad | 2026-02-13 | A 21,924,284 · B 5,066,110 | 26,990,394 | 26,990,394 |
+| Central Garden & Pet | 2025-11-26 | Common 9,650,221 · A 51,080,111 · B 1,602,374 | 62,332,706 | 62,332,706 |
+
+All three match exactly, including a three-class company: `sharesbas` is the
+total of every class. The market-cap rule stands unchanged.
