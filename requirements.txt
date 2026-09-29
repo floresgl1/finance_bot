@@ -6,6 +6,7 @@ alpaca-py
 # --- Data / ML ---------------------------------------------------------
 yfinance
 pandas
+pyarrow
 numpy
 scikit-learn
 ta
