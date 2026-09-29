@@ -184,12 +184,7 @@ def get_spy_start_price() -> float | None:
 def get_current_portfolio_value() -> float | None:
     """Fetch current portfolio equity from the Alpaca paper trading API."""
     try:
-        try:
-            import alpaca_trade_api as tradeapi
-        except ImportError:
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "alpaca-trade-api"])
-            import alpaca_trade_api as tradeapi
+        import broker
 
         api_key    = os.environ.get("ALPACA_API_KEY")
         secret_key = os.environ.get("ALPACA_SECRET_KEY")
@@ -197,11 +192,7 @@ def get_current_portfolio_value() -> float | None:
             print("[WARN] ALPACA_API_KEY / ALPACA_SECRET_KEY not set — portfolio value unavailable")
             return None
 
-        api = tradeapi.REST(
-            api_key, secret_key,
-            "https://paper-api.alpaca.markets",
-            api_version="v2",
-        )
+        api = broker.AlpacaREST(api_key, secret_key, broker.PAPER_URL)
         return float(api.get_account().equity)
     except Exception as exc:
         print(f"[ERROR] Failed to fetch portfolio value from Alpaca: {exc}")

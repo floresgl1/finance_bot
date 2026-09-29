@@ -17,15 +17,16 @@ python -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 ```
 
-`ta` and `msgpack` (pulled in by `alpaca-trade-api`) ship no wheels for recent
-Pythons, so pip builds them from source. Debian/Ubuntu system Pythons carry a
-patched, older setuptools that fails those builds (`AttributeError:
-install_layout`); an upgraded setuptools inside a venv does not. CI does the
-equivalent (`.github/workflows/tests.yml` upgrades pip before installing).
+`ta` ships no wheel, so pip builds it from source. Debian/Ubuntu system
+Pythons carry a patched, older setuptools that fails such builds
+(`AttributeError: install_layout`); an upgraded setuptools inside a venv does
+not. CI does the equivalent (`.github/workflows/tests.yml` upgrades pip before
+installing).
 
-`alpaca-trade-api` pins `msgpack==1.0.3`, whose C extension cannot compile on
-Python 3.11+. It falls back to msgpack's pure-Python implementation — slower,
-same behaviour, and irrelevant to the bot's REST-only calls.
+Alpaca access uses `alpaca-py` through `broker.py`. The deprecated
+`alpaca-trade-api` it replaced pulled in a `msgpack` pin that could not build
+its C extension on Python 3.11+. On an existing deployment, install
+`alpaca-py` before pulling the code that needs it.
 
 ## DATA COLLECTION
 

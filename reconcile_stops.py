@@ -88,17 +88,9 @@ DEFAULT_LOOKBACK_DAYS = 30
 def get_api():
     """Build an Alpaca REST client. Imported lazily so --help works without
     credentials and so tests never need the dependency."""
-    import alpaca_trade_api as tradeapi
+    import broker
 
-    api_key = os.environ.get("ALPACA_API_KEY")
-    secret_key = os.environ.get("ALPACA_SECRET_KEY")
-    if not api_key or not secret_key:
-        raise EnvironmentError(
-            "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set as environment variables."
-        )
-    return tradeapi.REST(
-        api_key, secret_key, "https://paper-api.alpaca.markets", api_version="v2"
-    )
+    return broker.connect()
 
 
 def fetch_filled_stops(api, since: date) -> list[dict]:

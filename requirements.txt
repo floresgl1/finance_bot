@@ -1,7 +1,7 @@
 # --- Execution ---------------------------------------------------------
-# Declared explicitly: live_trader.py previously relied on a runtime
-# subprocess pip-install fallback if this import failed.
-alpaca-trade-api
+# alpaca-py, wrapped by broker.py. Replaced the deprecated alpaca-trade-api,
+# whose msgpack pin cannot compile its C extension on Python 3.11+.
+alpaca-py
 
 # --- Data / ML ---------------------------------------------------------
 yfinance
