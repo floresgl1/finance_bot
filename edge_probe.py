@@ -1194,6 +1194,607 @@ def summarise_horizons(results: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# SELL information probe -- Stage 1, pre-registered 2026-09-26
+# ---------------------------------------------------------------------------
+#
+# Finding L measured SELL's edge as classification: +0.0353 over its own
+# constant baseline, ~5x BUY's. Finding E showed a classification edge can
+# fail to move returns at all. Before building anything on SELL, this asks the
+# narrow question directly: over the next label horizon, do names the model
+# says SELL on actually do worse?
+#
+# **DESIGN DECISION -- the gap is measured within each ticker.**
+# For each ticker, mean forward return on non-SELL days minus mean on SELL
+# days, then averaged across tickers weighted by SELL-day count. A pooled
+# comparison can be won by WHICH tickers the model flags (say, the volatile
+# ones in a falling window) rather than WHEN it flags them. Timing is the
+# skill an overlay would need. The pooled means are reported for context only.
+#
+# **DESIGN DECISION -- embargo the training labels.**
+# A label is the forward return over the next `labels._WINDOW` rows, so the
+# last rows before a window's start are labelled from prices inside it.
+# _window_signals trains on everything before the start; here the last
+# horizon's worth of business days is dropped first. The leak is small, but it
+# tilts toward passing, which is the wrong direction for a pre-registered test.
+#
+# Pass criteria were fixed with the user BEFORE the first run, and are only
+# evaluated on BROAD_WINDOWS. Do not tune them after seeing results -- that is
+# how findings F, H and J went wrong.
+
+SELL_INFO_MIN_WINDOWS = 7         # windows where SELL days underperform, of 10
+SELL_INFO_MIN_MEAN_GAP = 0.002    # mean gap > 0.2%, a round trip at 0.1% slippage a side
+
+
+def _forward_returns(close: pd.Series, horizon: int) -> pd.Series:
+    """Return from each close to the close `horizon` rows later."""
+    return close.shift(-horizon) / close - 1.0
+
+
+def sell_gap(frames: dict) -> dict:
+    """Within-ticker gap between non-SELL and SELL forward returns.
+
+    frames: ticker -> DataFrame with a `Signal` column and a `fwd` column.
+    Rows without a forward return are dropped. A positive gap means SELL days
+    were followed by worse returns, which is what SELL is supposed to mean.
+    A ticker needs both SELL and non-SELL days to contribute a gap.
+    """
+    gaps, weights = [], []
+    sell_parts, other_parts = [], []
+    for frame in frames.values():
+        f = frame.dropna(subset=["fwd"])
+        is_sell = (f["Signal"] == "SELL").to_numpy()
+        sell, other = f["fwd"][is_sell], f["fwd"][~is_sell]
+        sell_parts.append(sell)
+        other_parts.append(other)
+        if len(sell) and len(other):
+            gaps.append(float(other.mean() - sell.mean()))
+            weights.append(len(sell))
+
+    sell_all = pd.concat(sell_parts) if sell_parts else pd.Series(dtype=float)
+    other_all = pd.concat(other_parts) if other_parts else pd.Series(dtype=float)
+    return {
+        "n_sell": int(len(sell_all)),
+        "n_other": int(len(other_all)),
+        "sell_fwd_mean": float(sell_all.mean()) if len(sell_all) else None,
+        "other_fwd_mean": float(other_all.mean()) if len(other_all) else None,
+        "gap": float(np.average(gaps, weights=weights)) if weights else None,
+        "tickers_scored": len(gaps),
+    }
+
+
+def sell_info_verdict(windows: dict) -> dict:
+    """Apply the pre-registered Stage 1 criteria to per-window results."""
+    gaps = [w["gap"] for w in windows.values() if w.get("gap") is not None]
+    wins = sum(1 for g in gaps if g > 0)
+    mean_gap = float(np.mean(gaps)) if gaps else None
+    # Rounded before the strict comparison: the mean of ten 0.002 gaps is
+    # 0.0020000000000000005, which would otherwise pass a gap that only
+    # equals the round-trip cost.
+    passed = (
+        wins >= SELL_INFO_MIN_WINDOWS
+        and mean_gap is not None
+        and round(mean_gap, 10) > SELL_INFO_MIN_MEAN_GAP
+    )
+    return {
+        "windows_scored": len(gaps),
+        "windows_sell_underperforms": wins,
+        "mean_gap": mean_gap,
+        "min_windows": SELL_INFO_MIN_WINDOWS,
+        "min_mean_gap": SELL_INFO_MIN_MEAN_GAP,
+        "passed": bool(passed),
+    }
+
+
+def run_sell_info_probe(windows: dict | None = None, lookback_years: int = 3) -> dict:
+    """Score SELL's forward-return information over every window."""
+    import labels as labels_mod
+
+    windows = windows or BROAD_WINDOWS
+    horizon = labels_mod._WINDOW
+    per_ticker = _build_per_ticker(1.0)
+    if not per_ticker:
+        return {}
+    combined = pd.concat(per_ticker.values()).sort_index()
+
+    results = {}
+    for name, (start_s, end_s) in windows.items():
+        start, end = pd.Timestamp(start_s), pd.Timestamp(end_s)
+        embargo = start - pd.tseries.offsets.BDay(horizon)
+        base = _window_signals(per_ticker, combined[combined.index < embargo],
+                               FEATURE_COLUMNS, start, end, lookback_years, label=name)
+        if base is None:
+            continue
+
+        frames = {
+            ticker: pd.DataFrame({
+                "Signal": frame["Signal"],
+                "fwd": _forward_returns(per_ticker[ticker]["Close"], horizon)
+                       .reindex(frame.index),
+            })
+            for ticker, frame in base.items()
+        }
+        results[name] = sell_gap(frames)
+
+    return results
+
+
+def summarise_sell_info(results: dict, broad: bool) -> str:
+    """ASCII table plus the verdict. No verdict off the broad set."""
+    out = [
+        f"  {'window':<22}{'SELL days':>10}{'other':>8}{'SELL fwd':>10}"
+        f"{'other fwd':>11}{'gap':>9}  SELL worse?",
+        "  " + "-" * 82,
+    ]
+    for name, r in results.items():
+        if r["gap"] is None:
+            out.append(f"  {name:<22}{r['n_sell']:>10}{r['n_other']:>8}   (no gap: no ticker had both)")
+            continue
+        out.append(
+            f"  {name:<22}{r['n_sell']:>10}{r['n_other']:>8}"
+            f"{r['sell_fwd_mean'] * 100:>9.2f}%{r['other_fwd_mean'] * 100:>10.2f}%"
+            f"{r['gap'] * 100:>8.2f}%  {'yes' if r['gap'] > 0 else 'no'}"
+        )
+
+    v = sell_info_verdict(results)
+    mean = f"{v['mean_gap'] * 100:.3f}%" if v["mean_gap"] is not None else "n/a"
+    out += [
+        "",
+        f"  SELL days underperform in {v['windows_sell_underperforms']} of "
+        f"{v['windows_scored']} windows (need >= {v['min_windows']})",
+        f"  Mean within-ticker gap: {mean} (need > {v['min_mean_gap'] * 100:.1f}%)",
+    ]
+    if not broad:
+        out.append("  NO VERDICT: the criteria were pre-registered on --broad only.")
+    elif v["windows_scored"] < len(BROAD_WINDOWS):
+        # A data failure is not evidence about SELL. Reporting it as FAIL
+        # would close the question on a broken run.
+        out.append(f"  NO VERDICT: only {v['windows_scored']} of {len(BROAD_WINDOWS)} "
+                   f"windows scored; the criteria assume all of them. Fix the data and re-run.")
+    else:
+        out.append(f"  STAGE 1: {'PASS' if v['passed'] else 'FAIL'}")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Volatility forecast probe -- Stage 1, pre-registered 2026-09-26
+# ---------------------------------------------------------------------------
+#
+# Findings A-M closed the direction question: nothing in this model beats
+# holding. This changes the question. Volatility clusters -- a calm week
+# tends to follow a calm week -- so it IS forecastable; the open question is
+# whether a model adds anything over the standard formula for it.
+#
+# Target: realised volatility over the NEXT 5 trading days, as the root mean
+# square of daily log returns t+1..t+5 (weekly, to match a weekly rebalance).
+#
+# Baselines the model must beat, both using only data up to day t:
+#   persistence -- RMS of the last 20 daily log returns
+#   EWMA        -- RiskMetrics, variance_{t+1} = 0.94 * variance_t + 0.06 * r_t^2,
+#                  held flat over the 5 days. The real opponent.
+#
+# **DESIGN DECISION -- scored with QLIKE on variances.**
+# QLIKE(h, rv2) = rv2/h - log(rv2/h) - 1. Realised volatility over 5 days is a
+# noisy proxy for the true volatility; QLIKE (like MSE) still ranks forecasts
+# correctly under that noise, and it penalises under-forecasting risk harder
+# than over-forecasting it, which is the right bias for sizing.
+#
+# **DESIGN DECISION -- fixed model, no tuning.** XGBRegressor with the
+# project's existing XGB_PARAMS tree settings, trained on log realised
+# volatility pooled across tickers, 3 years before each window with a 5-day
+# label embargo. Predictions are exp(pred) times one scale factor fitted on
+# the training rows, because exp() of a log-space mean under-forecasts
+# variance. The factor comes from training data only.
+#
+# Pass criteria agreed with the user BEFORE the first run, evaluated on
+# BROAD_WINDOWS only: the model beats EWMA on mean QLIKE in >= 7 of 10 windows
+# AND the mean per-window improvement over EWMA is >= 5%.
+
+VOL_HORIZON = 5
+VOL_EWMA_LAMBDA = 0.94
+VOL_INFO_MIN_WINDOWS = 7
+VOL_INFO_MIN_IMPROVEMENT = 0.05
+
+VOL_FEATURES = ["rv_5", "rv_20", "rv_60", "range_vol_20", "ret_5", "ret_20", "ewma_vol"]
+
+
+def _ewma_variance(log_ret: pd.Series, lam: float = VOL_EWMA_LAMBDA) -> pd.Series:
+    """RiskMetrics variance forecast for day t+1, known at the close of day t.
+
+    Seeded with the mean square of the first 20 returns. Each value uses only
+    returns up to and including its own date.
+    """
+    r2 = (log_ret ** 2).to_numpy()
+    out = np.full(len(r2), np.nan)
+    valid = ~np.isnan(r2)
+    idx = np.flatnonzero(valid)
+    if len(idx) < 20:
+        return pd.Series(out, index=log_ret.index)
+    var = float(np.mean(r2[idx[:20]]))
+    for i in idx[20:]:
+        var = lam * var + (1.0 - lam) * r2[i]
+        out[i] = var
+    return pd.Series(out, index=log_ret.index)
+
+
+def vol_frame(prices: pd.DataFrame, horizon: int = VOL_HORIZON) -> pd.DataFrame:
+    """Volatility features, baselines and the forward target from OHLC prices.
+
+    Every feature and baseline at row t uses data up to t; only `target_rv`
+    looks forward (days t+1..t+horizon).
+    """
+    close = prices["Close"].astype(float)
+    r = np.log(close).diff()
+    r2 = r ** 2
+
+    out = pd.DataFrame(index=prices.index)
+    for n in (5, 20, 60):
+        out[f"rv_{n}"] = np.sqrt(r2.rolling(n).mean())
+    # Parkinson range estimator: uses each day's high-low span, which sees
+    # intraday moves a close-to-close return misses.
+    hl = np.log(prices["High"].astype(float) / prices["Low"].astype(float)) ** 2
+    out["range_vol_20"] = np.sqrt(hl.rolling(20).mean() / (4.0 * np.log(2.0)))
+    out["ret_5"] = np.log(close / close.shift(5))
+    out["ret_20"] = np.log(close / close.shift(20))
+    out["ewma_vol"] = np.sqrt(_ewma_variance(r))
+
+    # sum over t+1..t+horizon of r^2, via a reversed rolling window.
+    fwd_sq = r2[::-1].rolling(horizon).sum()[::-1].shift(-1)
+    out["target_rv"] = np.sqrt(fwd_sq / horizon)
+    return out
+
+
+def qlike(forecast_var: np.ndarray, realised_var: np.ndarray) -> float:
+    """Mean QLIKE loss. Lower is better; 0 is a perfect forecast."""
+    ratio = realised_var / forecast_var
+    return float(np.mean(ratio - np.log(ratio) - 1.0))
+
+
+def _load_prices(ticker: str) -> pd.DataFrame:
+    df = pd.read_csv(os.path.join(PROBE_DIR, f"{ticker}.csv"))
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    df.index = df.index.tz_localize(None).normalize()
+    return df
+
+
+def score_vol_window(train: pd.DataFrame, test: pd.DataFrame, cols: list[str]) -> dict:
+    """Fit on `train`, score model and both baselines on `test` with QLIKE."""
+    from xgboost import XGBRegressor
+
+    params = {k: XGB_PARAMS[k] for k in ("n_estimators", "learning_rate", "max_depth", "subsample")
+              if k in XGB_PARAMS}
+    model = XGBRegressor(**params, random_state=42)
+    model.fit(train[cols], np.log(train["target_rv"]))
+
+    # One scale factor, fitted on training rows only: the QLIKE-optimal
+    # multiplier for a variance forecast h is mean(realised / h).
+    train_var = np.exp(2 * model.predict(train[cols]))
+    scale = float(np.mean(train["target_rv"].to_numpy() ** 2 / train_var))
+
+    realised = test["target_rv"].to_numpy() ** 2
+    model_var = scale * np.exp(2 * model.predict(test[cols]))
+    return {
+        "rows": int(len(test)),
+        "model": qlike(model_var, realised),
+        "ewma": qlike(test["ewma_vol"].to_numpy() ** 2, realised),
+        "persistence": qlike(test["rv_20"].to_numpy() ** 2, realised),
+        "scale": scale,
+    }
+
+
+def vol_info_verdict(windows: dict) -> dict:
+    """Apply the pre-registered Stage 1 criteria to per-window QLIKE scores."""
+    scored = [w for w in windows.values() if w.get("model") is not None]
+    improvements = [1.0 - w["model"] / w["ewma"] for w in scored]
+    wins = sum(1 for w in scored if w["model"] < w["ewma"])
+    mean_imp = float(np.mean(improvements)) if improvements else None
+    passed = (
+        wins >= VOL_INFO_MIN_WINDOWS
+        and mean_imp is not None
+        and round(mean_imp, 10) >= VOL_INFO_MIN_IMPROVEMENT
+    )
+    return {
+        "windows_scored": len(scored),
+        "windows_model_beats_ewma": wins,
+        "mean_improvement_vs_ewma": mean_imp,
+        "min_windows": VOL_INFO_MIN_WINDOWS,
+        "min_improvement": VOL_INFO_MIN_IMPROVEMENT,
+        "passed": bool(passed),
+    }
+
+
+def run_vol_info_probe(windows: dict | None = None, lookback_years: int = 3) -> dict:
+    """Walk-forward volatility forecasts: model vs EWMA vs persistence."""
+    windows = windows or BROAD_WINDOWS
+    per_ticker = _build_per_ticker(1.0)
+    if not per_ticker:
+        return {}
+
+    frames = []
+    for ticker, feats in per_ticker.items():
+        vf = vol_frame(_load_prices(ticker))
+        f = feats[FEATURE_COLUMNS].join(vf, how="inner")
+        f["ticker"] = ticker
+        frames.append(f)
+    data = pd.concat(frames).sort_index()
+    cols = FEATURE_COLUMNS + VOL_FEATURES
+    data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=cols + ["target_rv"])
+    data = data[data["target_rv"] > 0]
+
+    results = {}
+    for name, (start_s, end_s) in windows.items():
+        start, end = pd.Timestamp(start_s), pd.Timestamp(end_s)
+        embargo = start - pd.tseries.offsets.BDay(VOL_HORIZON)
+        train = data[(data.index >= start - pd.DateOffset(years=lookback_years))
+                     & (data.index < embargo)]
+        test = data[(data.index >= start) & (data.index <= end)]
+        if len(train) < 500 or test.empty:
+            print(f"  {name}: {len(train)} training rows, {len(test)} test rows, skipping")
+            continue
+        results[name] = score_vol_window(train, test, cols)
+
+    return results
+
+
+def summarise_vol_info(results: dict, broad: bool) -> str:
+    """ASCII table plus the verdict. No verdict off the full broad set."""
+    out = [
+        f"  {'window':<22}{'rows':>7}{'model':>9}{'EWMA':>9}{'persist':>9}"
+        f"{'vs EWMA':>10}  model wins?",
+        "  " + "-" * 76,
+    ]
+    for name, r in results.items():
+        imp = 1.0 - r["model"] / r["ewma"]
+        out.append(
+            f"  {name:<22}{r['rows']:>7}{r['model']:>9.4f}{r['ewma']:>9.4f}"
+            f"{r['persistence']:>9.4f}{imp * 100:>9.1f}%  {'yes' if r['model'] < r['ewma'] else 'no'}"
+        )
+
+    v = vol_info_verdict(results)
+    mean = (f"{v['mean_improvement_vs_ewma'] * 100:.1f}%"
+            if v["mean_improvement_vs_ewma"] is not None else "n/a")
+    out += [
+        "",
+        "  QLIKE: lower is better.",
+        f"  Model beats EWMA in {v['windows_model_beats_ewma']} of {v['windows_scored']} "
+        f"windows (need >= {v['min_windows']})",
+        f"  Mean improvement over EWMA: {mean} (need >= {v['min_improvement'] * 100:.0f}%)",
+    ]
+    if not broad:
+        out.append("  NO VERDICT: the criteria were pre-registered on --broad only.")
+    elif v["windows_scored"] < len(BROAD_WINDOWS):
+        out.append(f"  NO VERDICT: only {v['windows_scored']} of {len(BROAD_WINDOWS)} "
+                   f"windows scored; the criteria assume all of them. Fix the data and re-run.")
+    else:
+        out.append(f"  STAGE 1: {'PASS' if v['passed'] else 'FAIL'}")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Volatility sizing (finding O): does EWMA volatility make a better basket?
+# ---------------------------------------------------------------------------
+# Finding N left one question open: EWMA is the best volatility forecaster
+# tested, so does sizing by it -- no model at all -- reduce drawdown? Two arms,
+# each against a control that differs from it in exactly one respect:
+#
+#   A. Inverse-vol weights vs equal weight. Both fully invested and rebalanced
+#      on the same schedule, so the weighting is the only difference.
+#   B. Vol targeting vs matched constant exposure. B scales an equal-weight
+#      basket so its EWMA volatility forecast meets a target, holding the rest
+#      in cash. Holding less stock wins drawdowns automatically (finding F), so
+#      the control holds a CONSTANT fraction equal to B's own average exposure
+#      in that window: same stock on average, no volatility information.
+#
+# Shared mechanics: rebalanced every VOL_HORIZON trading days, EWMA lambda
+# 0.94, no leverage, costs = backtest.SLIPPAGE on traded notional only (Alpaca
+# charges no commission, and a $1 fee on 12 weekly trades would measure fees
+# rather than sizing). Weights for a trade at close t use EWMA through t-1:
+# a sizing rule that reads the close it trades on is look-ahead.
+#
+# Pass criteria agreed with the user BEFORE the first run, evaluated on
+# BROAD_WINDOWS only, each arm judged separately:
+#   A passes if its max drawdown is shallower than the control's in >= 7 of 10
+#     windows AND the mean improvement is >= 1.0pp AND its mean return is no
+#     more than 2pp per window below the control's.
+#   B passes on the same three tests with a 2.0pp drawdown bar: an
+#     exposure-timing rule has more ways to look lucky.
+# Under the confirmation protocol this probe is two draws, and a pass is a
+# lead, not a result.
+
+VOL_SIZING_MIN_WINDOWS = 7
+VOL_SIZING_MIN_DD_GAIN_PP = {"A": 1.0, "B": 2.0}
+VOL_SIZING_MAX_RETURN_COST_PP = 2.0
+VOL_SIZING_TARGET_YEARS = 3
+VOL_SIZING_MIN_TARGET_DAYS = 500
+
+
+def _lagged_ewma_vol(closes: pd.DataFrame) -> pd.DataFrame:
+    """Per-ticker daily EWMA volatility known at the close BEFORE each date."""
+    r = np.log(closes).diff()
+    return np.sqrt(r.apply(_ewma_variance)).shift(1)
+
+
+def _basket_returns(closes: pd.DataFrame) -> pd.Series:
+    """Daily return of an equal-weight basket rebalanced every day."""
+    return closes.pct_change().mean(axis=1)
+
+
+def inverse_vol_weights(vol_row: pd.Series) -> pd.Series:
+    """Weights proportional to 1/vol, summing to 1. Fully invested."""
+    inv = 1.0 / vol_row
+    return inv / inv.sum()
+
+
+def vol_target_exposure(basket_vol: float, target_vol: float) -> float:
+    """Fraction of the account invested to hit `target_vol`, capped at 1."""
+    return float(min(1.0, target_vol / basket_vol))
+
+
+def simulate_rebalanced(closes: pd.DataFrame, weights: pd.DataFrame,
+                        slippage: float) -> pd.DataFrame:
+    """Hold dollar positions that drift with prices; reset them on each row of
+    `weights` (a rebalance date) at that day's close.
+
+    Returns daily `equity` (starting at 1.0 before costs) and `exposure`
+    (invested fraction). Slippage is charged on the notional traded,
+    including the opening purchase.
+    """
+    rets = closes.pct_change().fillna(0.0)
+    cash, pos = 1.0, pd.Series(0.0, index=closes.columns)
+    equity, exposure = [], []
+    for date in closes.index:
+        pos = pos * (1.0 + rets.loc[date])
+        if date in weights.index:
+            total = cash + pos.sum()
+            w = weights.loc[date].reindex(closes.columns).fillna(0.0)
+            # Pay the cost before sizing: buying w * total and then taking
+            # slippage out of cash would leave a fully invested book short
+            # cash, i.e. quietly levered.
+            est = slippage * float((w * total - pos).abs().sum())
+            target = w * (total - est)
+            cost = slippage * float((target - pos).abs().sum())
+            cash = total - float(target.sum()) - cost
+            pos = target
+        value = cash + float(pos.sum())
+        equity.append(value)
+        exposure.append(float(pos.sum()) / value)
+    return pd.DataFrame({"equity": equity, "exposure": exposure}, index=closes.index)
+
+
+def _arm_stats(sim: pd.DataFrame) -> dict:
+    eq = sim["equity"]
+    return {
+        "total_return": float((eq.iloc[-1] - 1.0) * 100),
+        "max_drawdown": float((eq / eq.cummax() - 1.0).min() * 100),
+        "avg_exposure": float(sim["exposure"].mean() * 100),
+    }
+
+
+def score_vol_sizing_window(closes: pd.DataFrame, start: pd.Timestamp,
+                            end: pd.Timestamp, slippage: float,
+                            horizon: int = VOL_HORIZON) -> dict | None:
+    """All four portfolios over one window. `closes` must include history."""
+    vol = _lagged_ewma_vol(closes)
+    basket_r = _basket_returns(closes)
+    basket_vol = np.sqrt(_ewma_variance(np.log1p(basket_r))).shift(1)
+
+    hist = basket_r[(basket_r.index >= start - pd.DateOffset(years=VOL_SIZING_TARGET_YEARS))
+                    & (basket_r.index < start)].dropna()
+    if len(hist) < VOL_SIZING_MIN_TARGET_DAYS:
+        return None
+    target_vol = float(hist.std())
+
+    px = closes[(closes.index >= start) & (closes.index <= end)]
+    if len(px) < 2 * horizon:
+        return None
+    rebal = px.index[::horizon]
+    n = len(closes.columns)
+    equal = pd.DataFrame(1.0 / n, index=rebal, columns=closes.columns)
+
+    inv = pd.DataFrame([inverse_vol_weights(vol.loc[d]) for d in rebal], index=rebal)
+    k = pd.Series([vol_target_exposure(basket_vol.loc[d], target_vol) for d in rebal],
+                  index=rebal)
+    targeted = equal.mul(k, axis=0)
+
+    sims = {
+        "equal": simulate_rebalanced(px, equal, slippage),
+        "A": simulate_rebalanced(px, inv, slippage),
+        "B": simulate_rebalanced(px, targeted, slippage),
+    }
+    matched = sims["B"]["exposure"].mean()
+    sims["B_control"] = simulate_rebalanced(px, equal * matched, slippage)
+
+    out = {name: _arm_stats(sim) for name, sim in sims.items()}
+    out["target_vol_daily"] = target_vol
+    out["matched_exposure"] = float(matched * 100)
+    return out
+
+
+def vol_sizing_verdict(windows: dict, arm: str) -> dict:
+    """Apply one arm's pre-registered criteria against its own control."""
+    control = "equal" if arm == "A" else "B_control"
+    scored = [w for w in windows.values() if w and arm in w and control in w]
+    dd_gain = [w[arm]["max_drawdown"] - w[control]["max_drawdown"] for w in scored]
+    ret_gap = [w[arm]["total_return"] - w[control]["total_return"] for w in scored]
+    wins = sum(1 for g in dd_gain if g > 0)
+    mean_dd = float(np.mean(dd_gain)) if dd_gain else None
+    mean_ret = float(np.mean(ret_gap)) if ret_gap else None
+    passed = (
+        wins >= VOL_SIZING_MIN_WINDOWS
+        and mean_dd is not None
+        and round(mean_dd, 10) >= VOL_SIZING_MIN_DD_GAIN_PP[arm]
+        and round(mean_ret, 10) >= -VOL_SIZING_MAX_RETURN_COST_PP
+    )
+    return {
+        "arm": arm,
+        "control": control,
+        "windows_scored": len(scored),
+        "windows_shallower": wins,
+        "mean_dd_gain_pp": mean_dd,
+        "mean_return_gap_pp": mean_ret,
+        "min_windows": VOL_SIZING_MIN_WINDOWS,
+        "min_dd_gain_pp": VOL_SIZING_MIN_DD_GAIN_PP[arm],
+        "max_return_cost_pp": VOL_SIZING_MAX_RETURN_COST_PP,
+        "passed": bool(passed),
+    }
+
+
+def run_vol_sizing_probe(windows: dict | None = None) -> dict:
+    """Score both sizing arms and their controls on every window."""
+    import backtest as bt
+
+    windows = windows or BROAD_WINDOWS
+    closes = pd.concat({t: _load_prices(t)["Close"].astype(float) for t in WATCHLIST},
+                       axis=1).dropna()
+    results = {}
+    for name, (start_s, end_s) in windows.items():
+        r = score_vol_sizing_window(closes, pd.Timestamp(start_s), pd.Timestamp(end_s),
+                                    bt.SLIPPAGE)
+        if r is None:
+            print(f"  {name}: not enough history, skipping")
+            continue
+        results[name] = r
+    return results
+
+
+def summarise_vol_sizing(results: dict, broad: bool) -> str:
+    """Per-window table for each arm plus its verdict. ASCII only."""
+    out = []
+    for arm, title in (("A", "Arm A: inverse-vol vs equal weight (both fully invested)"),
+                       ("B", "Arm B: vol target vs matched constant exposure")):
+        v = vol_sizing_verdict(results, arm)
+        ctl = v["control"]
+        out += ["", f"  {title}",
+                f"  {'window':<22}{'ret':>9}{'ctl ret':>9}{'max DD':>9}{'ctl DD':>9}"
+                f"{'DD gain':>9}{'exp':>6}",
+                "  " + "-" * 73]
+        for name, r in results.items():
+            a, c = r[arm], r[ctl]
+            out.append(
+                f"  {name:<22}{a['total_return']:>8.2f}%{c['total_return']:>8.2f}%"
+                f"{a['max_drawdown']:>8.2f}%{c['max_drawdown']:>8.2f}%"
+                f"{a['max_drawdown'] - c['max_drawdown']:>+8.2f}pp{a['avg_exposure']:>5.0f}%"
+            )
+        fmt = lambda x: "n/a" if x is None else f"{x:+.2f}pp"
+        out += [
+            f"  Shallower drawdown in {v['windows_shallower']} of {v['windows_scored']} "
+            f"windows (need >= {v['min_windows']})",
+            f"  Mean drawdown gain: {fmt(v['mean_dd_gain_pp'])} "
+            f"(need >= +{v['min_dd_gain_pp']:.1f}pp)",
+            f"  Mean return gap: {fmt(v['mean_return_gap_pp'])} "
+            f"(need >= -{v['max_return_cost_pp']:.1f}pp)",
+        ]
+        if not broad:
+            out.append("  NO VERDICT: the criteria were pre-registered on --broad only.")
+        elif v["windows_scored"] < len(BROAD_WINDOWS):
+            out.append(f"  NO VERDICT: only {v['windows_scored']} of {len(BROAD_WINDOWS)} "
+                       f"windows scored; the criteria assume all of them.")
+        else:
+            out.append(f"  ARM {arm}: {'PASS' if v['passed'] else 'FAIL'}")
+    return "\n".join(out)
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure the model against trivial baselines and sweep training history.",
@@ -1235,6 +1836,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Compare how a position is closed: on any non-BUY (the old "
              "simulator), on SELL only (what the bot does), on SELL or a stop, "
              "at the label horizon, or all three.",
+    )
+    parser.add_argument(
+        "--vol-info", action="store_true",
+        help="Volatility Stage 1: does a model forecast next-5-day realised "
+             "volatility better than EWMA (QLIKE)? Pre-registered pass "
+             "criteria; verdict only with --broad.",
+    )
+    parser.add_argument(
+        "--vol-sizing", action="store_true",
+        help="Does EWMA volatility make a better basket? Arm A: inverse-vol "
+             "weights vs equal weight. Arm B: vol targeting vs matched "
+             "constant exposure. Pre-registered pass criteria; verdict only "
+             "with --broad.",
+    )
+    parser.add_argument(
+        "--sell-info", action="store_true",
+        help="Stage 1: do the model's SELL days precede worse forward returns "
+             "than its other days, within each ticker? Pre-registered pass "
+             "criteria; verdict only with --broad.",
     )
     parser.add_argument(
         "--tiers", action="store_true",
@@ -1403,6 +2023,55 @@ def main(argv: list[str] | None = None) -> int:
             "policies": run_exit_probe(windows=window_set),
         }
         print(summarise_exits(results["policies"]))
+    elif args.vol_info:
+        print(f"\n=== Volatility forecast probe, Stage 1 ({window_label}) ===")
+        print("  Next-5-day realised volatility: model vs EWMA vs persistence,")
+        print("  one model per window with a label embargo, scored with QLIKE.")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "vol_info",
+            "window_set": window_label,
+            "windows": run_vol_info_probe(windows=window_set),
+        }
+        results["verdict"] = vol_info_verdict(results["windows"])
+        results["verdict"]["complete"] = (
+            window_set is BROAD_WINDOWS
+            and results["verdict"]["windows_scored"] == len(BROAD_WINDOWS)
+        )
+        print(summarise_vol_info(results["windows"], broad=window_set is BROAD_WINDOWS))
+    elif args.vol_sizing:
+        print(f"\n=== Volatility sizing probe ({window_label}) ===")
+        print("  EWMA-sized baskets vs controls that differ in one respect,")
+        print(f"  rebalanced every {VOL_HORIZON} trading days, slippage only.")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "vol_sizing",
+            "window_set": window_label,
+            "windows": run_vol_sizing_probe(windows=window_set),
+        }
+        results["verdict"] = {
+            arm: vol_sizing_verdict(results["windows"], arm) for arm in ("A", "B")
+        }
+        for v in results["verdict"].values():
+            v["complete"] = (window_set is BROAD_WINDOWS
+                             and v["windows_scored"] == len(BROAD_WINDOWS))
+        print(summarise_vol_sizing(results["windows"], broad=window_set is BROAD_WINDOWS))
+    elif args.sell_info:
+        print(f"\n=== SELL information probe, Stage 1 ({window_label}) ===")
+        print("  One model per window, trained with a label embargo; forward")
+        print("  returns over the label horizon, compared within each ticker.")
+        results = {
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "sell_info",
+            "window_set": window_label,
+            "windows": run_sell_info_probe(windows=window_set),
+        }
+        results["verdict"] = sell_info_verdict(results["windows"])
+        results["verdict"]["complete"] = (
+            window_set is BROAD_WINDOWS
+            and results["verdict"]["windows_scored"] == len(BROAD_WINDOWS)
+        )
+        print(summarise_sell_info(results["windows"], broad=window_set is BROAD_WINDOWS))
     elif args.tiers:
         print(f"\n=== Position-tier sweep ({window_label}) ===")
         print("  One model per window, shared by every level; only the tier")

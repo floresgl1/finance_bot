@@ -1032,10 +1032,12 @@ def alerts(monkeypatch):
     return sent
 
 
-def _ord(order_id, status, filled_qty=None):
+def _ord(order_id, status, filled_qty=None, price=None):
     o = _NS(id=order_id, status=status)
     if filled_qty is not None:
         o.filled_qty = filled_qty
+    if price is not None:
+        o.filled_avg_price = price
     return o
 
 
@@ -1065,11 +1067,12 @@ _WORKING = int(config.FILL_TIMEOUT_S / config.FILL_POLL_INTERVAL_S) + 1   # poll
 
 @pytest.mark.parametrize("place, label", PLACERS)
 def test_immediate_fill(place, label, clock, alerts):
-    api = _api([_ord("order-1", "filled", "10")])
+    api = _api([_ord("order-1", "filled", "10", price="201.5")])
 
     result = place(api, "AAPL", 10)
 
-    assert result == {"status": "filled", "order_id": "order-1", "filled_qty": "10"}
+    assert result == {"status": "filled", "order_id": "order-1",
+                      "filled_qty": "10", "filled_avg_price": 201.5}
     api.submit_order.assert_called_once()
     assert alerts == []
 
@@ -1127,11 +1130,12 @@ def test_confirmed_cancel_with_nothing_filled_retries_once(place, label, clock, 
 @pytest.mark.parametrize("place, label", PLACERS)
 def test_partial_fill_then_cancel_reports_what_filled_and_does_not_retry(place, label, clock, alerts):
     api = _api([_ord("order-1", "partially_filled", "4")] * _WORKING
-               + [_ord("order-1", "canceled", "4")])
+               + [_ord("order-1", "canceled", "4", price="199.0")])
 
     result = place(api, "AAPL", 10)
 
-    assert result == {"status": "filled", "order_id": "order-1", "filled_qty": 4.0, "partial": True}
+    assert result == {"status": "filled", "order_id": "order-1", "filled_qty": 4.0,
+                      "partial": True, "filled_avg_price": 199.0}
     api.submit_order.assert_called_once()
     assert f"{label} PARTIALLY FILLED" in alerts[0]
 
@@ -1964,3 +1968,84 @@ def test_stops_are_rechecked_after_the_rebalancer(monkeypatch, tmp_path):
     _run_execution(MagicMock())
 
     assert events == ["stops", "rebalance", "stops"]
+
+
+# ---------------------------------------------------------------------------
+# Realized P&L is recorded at the fill price
+# ---------------------------------------------------------------------------
+#
+# Model SELLs used to log the previous close from the ticker CSV as their exit
+# price, so realized P&L carried the overnight gap. These pin the fill.
+
+def _exits_captured(monkeypatch, tmp_path):
+    monkeypatch.setattr(signal_logger, "SIGNAL_LOG_PATH", str(tmp_path / "signal_log.csv"))
+    exits = []
+    monkeypatch.setattr("signal_logger.log_exit", lambda **kw: exits.append(kw))
+    monkeypatch.setattr(live_trader, "send_discord", lambda msg: None)
+    monkeypatch.setattr(live_trader, "cancel_standing_stops", lambda api, t: (True, []))
+    return exits
+
+
+def test_take_profit_exit_uses_the_fill(monkeypatch, tmp_path):
+    exits = _exits_captured(monkeypatch, tmp_path)
+    monkeypatch.setattr(live_trader, "place_sell", lambda api, t, q: {
+        "status": "filled", "order_id": "tp-1", "filled_qty": "10", "filled_avg_price": 119.5,
+    })
+    api = MagicMock()
+    api.list_positions.return_value = [_NS(symbol="AAPL", current_price="120.0",
+                                           avg_entry_price="100.0", qty="10")]
+
+    exited, _ = live_trader.check_position_limits(api, {"AAPL": 10.0})
+
+    assert exited == ["AAPL"]
+    assert (exits[0]["exit_price"], exits[0]["shares"]) == (119.5, 10.0)
+
+
+def test_model_sell_exit_uses_the_fill_not_the_previous_close(monkeypatch, tmp_path):
+    from live_trader import _run_execution
+
+    exits = _exits_captured(monkeypatch, tmp_path)
+    monkeypatch.setattr(live_trader, "check_portfolio_loss_limits", lambda *a, **kw: (False, ""))
+    monkeypatch.setattr(live_trader, "check_peak_drawdown", lambda *a, **kw: (False, ""))
+    monkeypatch.setattr(live_trader, "check_position_limits", lambda api, owned: ([], owned))
+    monkeypatch.setattr(live_trader, "ensure_standing_stops", lambda api: [])
+    monkeypatch.setattr(live_trader, "get_owned_tickers", lambda api: {"AAPL": 10.0})
+    monkeypatch.setattr(live_trader, "get_equity", lambda api: 100_000.0)
+    monkeypatch.setattr(live_trader, "get_cooldown_tickers", lambda: set())
+    monkeypatch.setattr(live_trader, "get_recent_stop_fill_tickers", lambda api: set())
+    monkeypatch.setattr(live_trader, "_load_agent_decisions", lambda: {})
+    monkeypatch.setattr(live_trader, "run_rebalancer", lambda api, skip: [])
+    monkeypatch.setattr(live_trader, "get_signals", lambda sentiment_df=None: [{
+        "ticker": "AAPL", "final_signal": "SELL", "confidence": 60.0,
+        "current_price": 100.0,          # previous close from the CSV
+        "shap_values": {},
+    }])
+    monkeypatch.setattr(live_trader, "place_sell", lambda api, t, q: {
+        "status": "filled", "order_id": "s-1", "filled_qty": "10", "filled_avg_price": 103.25,
+    })
+    monkeypatch.setattr(live_trader, "LAST_RUN_GUARD_PATH", str(tmp_path / "guard.txt"))
+    monkeypatch.setattr(live_trader, "_read_portfolio_snapshot", lambda: {})
+    monkeypatch.setattr(live_trader, "_write_portfolio_snapshot", lambda snap: None)
+    monkeypatch.setattr("signal_logger.log_signal", lambda *a, **kw: None)
+    api = MagicMock()
+    api.get_position.return_value.avg_entry_price = "90.0"
+
+    _run_execution(api)
+
+    assert exits[0]["exit_reason"] == "MODEL_SELL"
+    assert exits[0]["exit_price"] == 103.25
+    assert exits[0]["entry_price"] == 90.0
+
+
+def test_missing_fill_price_falls_back_to_the_signal_price(monkeypatch, tmp_path):
+    exits = _exits_captured(monkeypatch, tmp_path)
+    monkeypatch.setattr(live_trader, "place_sell", lambda api, t, q: {
+        "status": "filled", "order_id": "tp-1", "filled_qty": "10", "filled_avg_price": None,
+    })
+    api = MagicMock()
+    api.list_positions.return_value = [_NS(symbol="AAPL", current_price="120.0",
+                                           avg_entry_price="100.0", qty="10")]
+
+    live_trader.check_position_limits(api, {"AAPL": 10.0})
+
+    assert exits[0]["exit_price"] == 120.0

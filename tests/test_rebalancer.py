@@ -13,6 +13,7 @@ failure here rather than as silently-rewritten expectations.
 """
 
 import math
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -62,6 +63,10 @@ def _api(equity: float, positions: list, order_id: str = "order-1"):
     api.get_account.return_value.equity = str(equity)
     api.list_positions.return_value = positions
     api.submit_order.return_value.id = order_id
+    # Trims go through live_trader.place_sell, which polls for the fill.
+    # Report every order filled so the confirmation path runs without waiting.
+    api.get_order.return_value = SimpleNamespace(status="filled", filled_qty=None,
+                                                 filled_avg_price=None)
     api.get_position.side_effect = lambda sym: next(
         p for p in positions if p.symbol == sym
     )
@@ -261,6 +266,36 @@ def test_successful_trim_logs_an_exit_row_with_rebalance_reason(stub_side_effect
     assert kwargs["exit_price"] == 100.0
     assert kwargs["shares"] == 25
     assert kwargs["entry_order_id"] == "entry-abc"
+
+
+def test_trim_is_logged_at_its_fill_price_and_filled_qty(stub_side_effects):
+    """The EXIT row carries what actually sold, not the quote or the request."""
+    api = _api(100_000.0, [_position("AAPL", 100, 100.0, avg_entry_price=80.0)])
+    api.get_order.return_value = SimpleNamespace(status="filled", filled_qty="25",
+                                                 filled_avg_price="99.40")
+
+    outcomes = run_rebalancer(api)
+
+    kwargs = stub_side_effects["log_exit"].call_args.kwargs
+    assert kwargs["exit_price"] == 99.40
+    assert kwargs["shares"] == 25.0
+    assert (outcomes[0]["price"], outcomes[0]["status"]) == (99.40, "placed")
+
+
+def test_unfilled_trim_writes_no_exit_row(stub_side_effects, monkeypatch):
+    """Used to be logged on submit whether or not it ever filled."""
+    import live_trader
+    monkeypatch.setattr(live_trader.time, "sleep", lambda s: None)
+    ticks = iter(range(0, 10_000))
+    monkeypatch.setattr(live_trader.time, "time", lambda: float(next(ticks)))
+    api = _api(100_000.0, [_position("AAPL", 100, 100.0)])
+    api.get_order.return_value = SimpleNamespace(status="rejected", filled_qty="0",
+                                                 filled_avg_price=None)
+
+    outcomes = run_rebalancer(api)
+
+    stub_side_effects["log_exit"].assert_not_called()
+    assert outcomes[0]["status"] == "error"
 
 
 def test_unlinked_entry_order_id_falls_back(stub_side_effects):

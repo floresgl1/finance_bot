@@ -41,7 +41,6 @@ paper-api.alpaca.markets this script CANNOT place live trades.
 import os
 import sys
 import json
-import subprocess
 import math
 import time
 from datetime import datetime, timezone
@@ -94,15 +93,9 @@ from config import (
     today_utc,
 )
 
-# ---------------------------------------------------------------------------
-# Dependency check — install alpaca-trade-api if not present
-# ---------------------------------------------------------------------------
-try:
-    import alpaca_trade_api as tradeapi
-except ImportError:
-    print("[setup] alpaca-trade-api not found — installing...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "alpaca-trade-api"])
-    import alpaca_trade_api as tradeapi
+# Alpaca access goes through broker.AlpacaREST, which keeps the old
+# alpaca_trade_api.REST interface on top of alpaca-py.
+import broker
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +449,7 @@ def _write_run_guard() -> None:
 # ---------------------------------------------------------------------------
 BASE_URL = "https://paper-api.alpaca.markets"
 
-def get_api() -> tradeapi.REST:
+def get_api() -> broker.AlpacaREST:
     """Build an Alpaca REST client from environment variables."""
     api_key    = os.environ.get("ALPACA_API_KEY")
     secret_key = os.environ.get("ALPACA_SECRET_KEY")
@@ -466,13 +459,13 @@ def get_api() -> tradeapi.REST:
             "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set as environment variables."
         )
 
-    return tradeapi.REST(api_key, secret_key, BASE_URL, api_version="v2")
+    return broker.AlpacaREST(api_key, secret_key, BASE_URL)
 
 
 # ---------------------------------------------------------------------------
 # Market status
 # ---------------------------------------------------------------------------
-def market_is_open(api: tradeapi.REST) -> bool:
+def market_is_open(api: broker.AlpacaREST) -> bool:
     clock = api.get_clock()
     return clock.is_open
 
@@ -802,7 +795,7 @@ def get_signals(sentiment_df=None) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Position helpers
 # ---------------------------------------------------------------------------
-def get_owned_tickers(api: tradeapi.REST) -> dict[str, float]:
+def get_owned_tickers(api: broker.AlpacaREST) -> dict[str, float]:
     """Return {ticker: qty_held} for all current positions."""
     try:
         positions = api.list_positions()
@@ -812,7 +805,7 @@ def get_owned_tickers(api: tradeapi.REST) -> dict[str, float]:
     return {p.symbol: float(p.qty) for p in positions}
 
 
-def get_equity(api: tradeapi.REST) -> float:
+def get_equity(api: broker.AlpacaREST) -> float:
     try:
         return float(api.get_account().equity)
     except Exception as exc:
@@ -866,7 +859,7 @@ def compute_buy_qty(equity: float, price: float, fraction: float = 0.20) -> int:
     return max(math.floor(equity * fraction / price), 0)
 
 
-def _submit_buy(api: tradeapi.REST, ticker: str, qty: int) -> dict:
+def _submit_buy(api: broker.AlpacaREST, ticker: str, qty: int) -> dict:
     """Submit an OTO buy order without verifying the fill. Returns a result dict.
 
     Separated from :func:`place_buy` so the retry loop can re-submit cleanly.
@@ -890,7 +883,7 @@ def _submit_buy(api: tradeapi.REST, ticker: str, qty: int) -> dict:
     return {"status": "placed", "order_id": order.id}
 
 
-def place_buy(api: tradeapi.REST, ticker: str, qty: int) -> dict:
+def place_buy(api: broker.AlpacaREST, ticker: str, qty: int) -> dict:
     """Submit an OTO buy, confirm the fill, retry once only if nothing filled.
 
     The stop_price is computed from the most recent trade price at submission time, so
@@ -909,7 +902,7 @@ def place_buy(api: tradeapi.REST, ticker: str, qty: int) -> dict:
     return _place_with_retry(api, ticker, qty, lambda: _submit_buy(api, ticker, qty), "BUY")
 
 
-def _submit_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
+def _submit_sell(api: broker.AlpacaREST, ticker: str, qty: float) -> dict:
     """Submit a market sell order without verifying the fill. Returns a result dict."""
     order = api.submit_order(
         symbol        = ticker,
@@ -922,7 +915,7 @@ def _submit_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
     return {"status": "placed", "order_id": order.id}
 
 
-def place_sell(api: tradeapi.REST, ticker: str, qty: float) -> dict:
+def place_sell(api: broker.AlpacaREST, ticker: str, qty: float) -> dict:
     """Submit a market sell, confirm the fill, retry once only if nothing filled.
 
     Same result shape as place_buy. See _place_with_retry.
@@ -1226,6 +1219,18 @@ def _order_filled_qty(order) -> float:
     return 0.0
 
 
+def _order_fill_price(order) -> float | None:
+    """filled_avg_price as a positive float, or None if Alpaca gave none."""
+    raw = getattr(order, "filled_avg_price", None)
+    if isinstance(raw, (int, float, str)):
+        try:
+            price = float(raw)
+        except ValueError:
+            return None
+        return price if price > 0 else None
+    return None
+
+
 def _wait_for_final(api, order_id: str, timeout_s: float, interval_s: float) -> object | None:
     """Poll until the order reaches a final status; ``None`` on timeout.
 
@@ -1304,7 +1309,8 @@ def _place_with_retry(api, ticker: str, qty: float, submit, label: str) -> dict:
         if order.status == "filled":
             print(f"  [FILL]  {ticker} order {order_id} — filled")
             return {"status": "filled", "order_id": order_id,
-                    "filled_qty": getattr(order, "filled_qty", None)}
+                    "filled_qty": getattr(order, "filled_qty", None),
+                    "filled_avg_price": _order_fill_price(order)}
 
         filled = _order_filled_qty(order)
         if filled > 0:
@@ -1313,7 +1319,8 @@ def _place_with_retry(api, ticker: str, qty: float, submit, label: str) -> dict:
                 f"(order {order_id} {order.status}). The remainder was not re-submitted."
             )
             return {"status": "filled", "order_id": order_id,
-                    "filled_qty": filled, "partial": True}
+                    "filled_qty": filled, "partial": True,
+                    "filled_avg_price": _order_fill_price(order)}
 
         # Final with nothing filled: a retry cannot double the position.
         print(f"  [FILL_POLL] order {order_id} — {order.status} with nothing filled")
@@ -1333,7 +1340,7 @@ def _place_with_retry(api, ticker: str, qty: float, submit, label: str) -> dict:
 # Take-profit (stop-loss is now enforced via standing OTO orders)
 # ---------------------------------------------------------------------------
 def check_position_limits(
-    api: tradeapi.REST,
+    api: broker.AlpacaREST,
     owned: dict[str, float],
     take_pct: float = 15.0,
 ) -> tuple[list[str], dict[str, float]]:
@@ -1392,7 +1399,7 @@ def check_position_limits(
                     ticker         = ticker,
                     entry_order_id = entry_order_id,
                     entry_price    = entry_price,
-                    exit_price     = current_price,
+                    exit_price     = result.get("filled_avg_price") or current_price,
                     exit_reason    = "TAKE_PROFIT",
                     shares         = float(result.get("filled_qty") or qty),
                     position_id    = find_position_id(ticker),
@@ -1624,7 +1631,7 @@ def run() -> None:
         raise
 
 
-def _run_execution(api: tradeapi.REST) -> None:
+def _run_execution(api: broker.AlpacaREST) -> None:
     """Inner execution body of run(), wrapped by AlpacaInfraError handler."""
     # 3a. Portfolio-level loss limit — checked after freshness so we trust the
     # equity read. On trip: write halt flag, alert, continue (SELLs still run).
@@ -1852,7 +1859,9 @@ def _run_execution(api: tradeapi.REST) -> None:
                 ticker         = ticker,
                 entry_order_id = entry_order_id,
                 entry_price    = entry_price_for_exit,
-                exit_price     = price,
+                # The fill, not `price`: that is the previous close from the
+                # ticker CSV, so P&L carried the overnight gap as if realised.
+                exit_price     = result.get("filled_avg_price") or price,
                 exit_reason    = "MODEL_SELL",
                 shares         = actual_qty,
                 position_id    = find_position_id(ticker),

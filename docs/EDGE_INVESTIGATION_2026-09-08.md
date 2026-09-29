@@ -869,9 +869,163 @@ investigation has been. The reason to do it is that it removes a component that
 is measurably worse than chance and replaces it with a knob pointed in the
 direction the evidence favours.
 
+## M. SELL carries no reliable return information (2026-09-26)
+
+L suggested one design no arm had tested: hold the basket by default and let
+the model only *sell*, since SELL was its one measurable edge. Before building
+that overlay, Stage 1 asked the narrow question it depends on: over the next
+label horizon, do names the model says SELL on actually do worse?
+
+`edge_probe.py --sell-info --broad`. One model per window, trained with a
+label embargo (the last horizon's rows before each window are dropped, since
+their labels read prices inside it). Forward 7-day returns compared **within
+each ticker** — SELL days vs other days of the same name, weighted by SELL-day
+count — so the result measures timing, not which tickers get flagged.
+
+**Pass criteria were agreed before the first run:** SELL days underperform in
+at least 7 of 10 windows AND the mean gap exceeds 0.2% (a round trip at 0.1%
+slippage a side).
+
+| Window | SELL days | other | SELL fwd | other fwd | within-ticker gap |
+|---|---|---|---|---|---|
+| late 2019 bull | 331 | 677 | 1.90% | 1.65% | +0.04% |
+| covid crash 2020 | 168 | 456 | −0.99% | 0.79% | **+2.20%** |
+| covid recovery 2020 | 589 | 1451 | 1.88% | 1.80% | **+1.37%** |
+| bull 2021 | 775 | 2249 | 1.47% | 0.56% | −0.60% |
+| bear 2022 | 586 | 1922 | −0.53% | −1.41% | −0.15% |
+| recovery 2023 | 1237 | 1763 | 1.76% | 1.12% | −0.97% |
+| bull 2024 | 1488 | 1536 | 1.26% | 0.67% | +0.63% |
+| choppy 2025 | 828 | 1728 | 0.90% | 0.72% | −0.01% |
+| rally 2025-26 | 393 | 1263 | 0.52% | 0.68% | +0.50% |
+| recent 2026 | 298 | 530 | 0.88% | 0.71% | −0.57% |
+
+**FAIL: 5 of 10 windows** — a coin flip. The mean gap (0.242%) clears the cost
+bar only because of the two covid windows; the other eight average **−0.14%**,
+i.e. SELL days did slightly *better*. That is exactly the single-regime result
+the 7-of-10 rule exists to reject.
+
+The pooled columns add a second point: in 7 of 10 windows the raw forward
+return on SELL days is *higher* than on other days. The model says SELL more
+on the stronger names; the within-ticker measure removes that composition
+effect, and what is left is noise.
+
+L's +0.0353 was a classification edge. Like E, it does not survive being
+scored on returns. The pre-registered consequence: **the SELL-overlay (Stage 2)
+is not built.** No component of this model has a return edge left to deploy.
+
+## N. A model does not forecast volatility better than EWMA (2026-09-26)
+
+M closed the direction question, so this changed it: volatility clusters and
+is forecastable, but does a model add anything over the standard formula?
+
+`edge_probe.py --vol-info --broad`. Target: realised volatility over the next
+5 trading days (weekly, to match a weekly rebalance). XGBRegressor on log
+realised volatility with the project's existing tree settings (no tuning), the
+20 features plus seven volatility features (5/20/60-day realised, Parkinson
+high-low range, 5/20-day returns, EWMA), one model per window with a 5-day
+label embargo and a training-only scale correction. Scored with QLIKE on
+variances against two baselines: EWMA (RiskMetrics, lambda 0.94) and the
+trailing 20-day volatility.
+
+**Pass criteria agreed before the first run:** the model beats EWMA on QLIKE in
+at least 7 of 10 windows AND improves on it by at least 5% on average.
+
+| Window | model | EWMA | persistence | model vs EWMA |
+|---|---|---|---|---|
+| late 2019 bull | 0.5147 | 0.4881 | 0.5277 | −5.5% |
+| covid crash 2020 | 1.9322 | 1.1659 | 1.1326 | **−65.7%** |
+| covid recovery 2020 | 0.6775 | 0.5627 | 0.6473 | −20.4% |
+| bull 2021 | 0.4883 | 0.4166 | 0.4719 | −17.2% |
+| bear 2022 | 0.6515 | 0.6316 | 0.7278 | −3.2% |
+| recovery 2023 | 0.4463 | 0.4793 | 0.5604 | +6.9% |
+| bull 2024 | 0.7032 | 0.6332 | 0.6987 | −11.1% |
+| choppy 2025 | 0.6828 | 0.7077 | 0.7762 | +3.5% |
+| rally 2025-26 | 0.5700 | 0.5654 | 0.6274 | −0.8% |
+| recent 2026 | 0.5512 | 0.5702 | 0.7006 | +3.3% |
+
+**FAIL: 3 of 10 windows, mean −11.0%.** EWMA is the best forecaster tested — it
+also beats persistence in 9 of 10. The covid window is the model's worst: a
+tree ensemble cannot predict outside the target range it trained on, and March
+2020 volatility exceeded anything in its 2017-2020 training data, so it
+under-forecast the spike that QLIKE penalises most. That explains the loss; per
+the pre-registration it does not justify a retry.
+
+The pre-registered consequence: **ML adds nothing over the formula.** The one
+question left open is whether sizing the basket by EWMA volatility — no model
+at all — beats equal-weight holding on drawdown.
+
+## O. Does sizing by EWMA volatility make a better basket? (2026-09-27)
+
+Finding N's open question, with no model anywhere: EWMA is the best volatility
+forecaster tested, so does sizing the basket by it reduce drawdown?
+`edge_probe.py --vol-sizing --broad`. Two arms, each against a control that
+differs from it in exactly one respect:
+
+- **Arm A — inverse-vol weights vs equal weight.** Each name weighted by
+  1/EWMA vol; both sides fully invested and rebalanced on the same schedule,
+  so the weighting is the only difference.
+- **Arm B — vol targeting vs matched constant exposure.** An equal-weight
+  basket scaled so its EWMA volatility forecast meets a target (the basket's
+  realised daily volatility over the 3 years before the window), rest in cash,
+  never levered. Holding less stock wins drawdowns automatically (finding F),
+  so the control holds a *constant* fraction equal to B's own average exposure
+  in that window: the same stock on average, with no volatility information.
+
+Shared: rebalanced every 5 trading days, EWMA lambda 0.94, weights for a trade
+at close t use EWMA through t−1, costs are `backtest.SLIPPAGE` on traded
+notional only (Alpaca charges no commission; a $1 fee on 12 weekly trades
+would measure fees, not sizing).
+
+**Pass criteria agreed before the first run,** on `BROAD_WINDOWS` only, each
+arm judged separately:
+
+- **A** passes if its max drawdown is shallower than the control's in at least
+  7 of 10 windows AND the mean improvement is at least 1.0pp AND its mean
+  return is no more than 2pp per window below the control's.
+- **B** passes on the same three tests with a 2.0pp drawdown bar: an
+  exposure-timing rule has more ways to look lucky.
+
+Under the confirmation protocol this probe is two draws, and a pass on
+historical windows is a lead, not a result.
+
+| Window | A DD gain | A return gap | B DD gain | B return gap | B exposure |
+|---|---|---|---|---|---|
+| late 2019 bull | −0.09pp | −3.48pp | +0.10pp | −0.38pp | 97% |
+| covid crash 2020 | +2.23pp | +1.63pp | **−5.91pp** | **−10.00pp** | 41% |
+| covid recovery 2020 | +0.39pp | −9.08pp | −0.67pp | −4.32pp | 88% |
+| bull 2021 | +1.89pp | −1.86pp | −0.02pp | −0.37pp | 100% |
+| bear 2022 | +4.55pp | +4.90pp | −2.49pp | −2.75pp | 80% |
+| recovery 2023 | +0.44pp | −20.45pp | 0.00pp | 0.00pp | 100% |
+| bull 2024 | +3.13pp | −7.76pp | −0.06pp | −1.13pp | 100% |
+| choppy 2025 | +2.53pp | −3.36pp | −1.74pp | −8.97pp | 93% |
+| rally 2025-26 | +0.77pp | −6.37pp | 0.00pp | 0.00pp | 100% |
+| recent 2026 | −0.11pp | +2.50pp | 0.00pp | 0.00pp | 100% |
+
+Gains are arm minus its control; positive drawdown gain means shallower.
+
+**Arm A: FAIL on the return guardrail.** Shallower drawdown in 8 of 10
+windows, mean +1.57pp — both drawdown tests pass — but mean return is
+−4.34pp per window against a −2pp limit. Inverse-vol weighting moves money
+from NVDA and TSLA into JNJ and XOM: a calmer basket, not a smarter one. It
+buys its drawdown gain at more than twice the agreed price, worst in the
+bull windows (2023: −20.45pp).
+
+**Arm B: FAIL on every test.** Shallower drawdown in 1 of 10 windows, mean
+−1.08pp, return −2.79pp. It is worse than holding the same average exposure
+with no timing at all. In the covid crash EWMA reacted after the fall, cut
+exposure near the bottom (41% average) and missed the rebound; the constant
+control fell less and recovered more. The target, set from three calm-ish
+prior years, sat above the basket's forecast volatility most of the time, so
+in six windows B was simply fully invested.
+
+The pre-registered consequence: **EWMA volatility does not make a better
+basket here.** A trades return for drawdown at a worse rate than agreed; B's
+timing subtracts value. Reading A on a risk-adjusted measure instead was not
+the question asked, and would be a second draw.
+
 ## Where this leaves things
 
-**The strategy does not beat buy-and-hold**, on every measurement taken: six
+**The strategy does not beat buy-and-hold**, on every measurement taken: nine
 simulated attempts to find an edge, and the live account itself at −3.23pp over
 its first six months.
 
@@ -941,6 +1095,13 @@ dead:
    and made worse by adding the model.
 6. ~~**A different label horizon.**~~ Findings G and H: every horizon from 3 to
    21 days loses by 14–25pp.
+7. ~~**Use SELL as a warning signal.**~~ Finding M: SELL days precede worse
+   returns in 5 of 10 windows — a coin flip.
+8. ~~**Forecast volatility instead of direction.**~~ Finding N: a model loses
+   to EWMA, a one-line formula, in 7 of 10 windows.
+9. ~~**Size the basket by EWMA volatility.**~~ Finding O: inverse-vol weights
+   cut drawdown but cost twice the agreed return; vol targeting cuts exposure
+   after the fall and misses the rebound, losing to a constant fraction.
 
 ### What is left
 
@@ -948,21 +1109,110 @@ dead:
 technical indicators is a crowded, well-arbitraged space. "No durable edge" is
 the expected outcome, not a bug.
 
-Six independent attempts to find one have now failed, and the most informative
+Nine independent attempts to find one have now failed, and the most informative
 of them found that a rule with no model in it beats the model. The pipeline
 around the signal — risk controls, monitoring, P&L attribution, a promotion gate
-that correctly refuses to ship a worse model, 499 tests — is sound engineering
+that correctly refuses to ship a worse model, 813 tests — is sound engineering
 regardless of whether this particular signal pays.
 
 If the project continues as a learning exercise rather than a strategy, the
 interesting next chapter is a different question, not a better answer to this
-one: a more predictable target (realised volatility rather than direction), a
-different asset class or timeframe, or continued investment in the execution and
-monitoring machinery, which is the part that works.
+one. The more predictable target suggested here first, realised volatility,
+has now been tried (findings N and O): it forecasts well, but neither a model
+nor sizing by the forecast turns that into a better basket. What remains is a
+different asset class or timeframe, or continued investment in the execution
+and monitoring machinery, which is the part that works.
 
 The promotion gate now encodes this: `beats_buy_and_hold` (added 2026-09-08)
 rejects any challenger that loses to holding the basket, so the conclusion here
 cannot be quietly forgotten by a future retrain.
+
+### Confirming a future pass (drafted 2026-09-27)
+
+**History is spent as a test set.** `BROAD_WINDOWS` covers 2019-09-01 to
+2026-09-08 continuously, and every day of it has now been scored by at least
+six probes. Each probe has its own pre-registered bar, but each is also another
+draw: if one eventually passes, it is the best of many tries, and a pass on
+historical windows is a lead, not a result. The only data no probe has touched
+is what arrives after the freeze below.
+
+These rules are fixed now, before any probe passes, for the same reason each
+probe's criteria are fixed before its run.
+
+1. **Record the draw count.** A passing probe is written up with the number of
+   probes run before it in this investigation.
+2. **Freeze on pass.** The probe's full configuration — features, model
+   settings, label definition, cost assumptions and pass criteria — is pinned to
+   a commit. Nothing changes between the pass and the confirmation verdict; any
+   change restarts the clock.
+3. **The holdout starts at the freeze commit,** not at 2026-09-08. Data between
+   those dates may already have been looked at.
+4. **Confirmation** requires the frozen criteria to hold on live data for at
+   least 6 months AND for that period to include a drawdown of at least 15%
+   in the equal-weight basket. If 24 months pass with no such drawdown, the
+   verdict is "untested under stress", not PASS. See "Choosing the drawdown
+   bar" below for why 15% and 24 months.
+5. **Refutation** has a lower bar and is checked monthly: the lead ends if its
+   mean gap against the baseline, measured cumulatively from the freeze, is at
+   or below zero at any check from 6 months on. Killing a false edge early is
+   cheap; trading one is not. There is deliberately no rolling-window test: at
+   ~12 non-overlapping observations per ticker per quarter, a real edge shows
+   the wrong sign over some short stretch by chance, and checking a rolling
+   window every month would almost surely kill it eventually. The cumulative
+   mean steadies as data accumulates, so repeated checks cost far less. There
+   is no early loss floor either: under rule 6 nothing trades before
+   confirmation, so a lead losing in its first months loses only on paper.
+6. **No production change on a historical pass alone.** Promotion waits for
+   confirmation, and `beats_buy_and_hold` still applies on top of it.
+
+Scale note: a 5-day horizon gives about 12 non-overlapping observations per
+ticker per quarter, so six months of live data is roughly one `BROAD_WINDOWS`
+window. That is why rule 4 asks for a stress period rather than a longer
+calendar span alone, and why a confirmation is weaker evidence than the 7-of-10
+bar the probes used.
+
+#### Choosing the drawdown bar (measured 2026-09-27)
+
+The first draft set the bar at 10%, on the belief that drawdowns that deep hit
+about 3 of the 10 `BROAD_WINDOWS`. Measured, it is 6 of 10: this basket holds
+NVDA, TSLA and INTC and pulls back 13–14% in ordinary bull years. Per-window
+max drawdown of the equal-weight hold, from `edge_probe.py --exposure --broad`:
+
+| Window | Hold return | Hold max DD |
+|---|---|---|
+| late 2019 bull | +24.10% | −4.62% |
+| covid crash 2020 | −5.52% | −31.06% |
+| covid recovery 2020 | +69.66% | −14.08% |
+| bull 2021 | +32.48% | −9.21% |
+| bear 2022 | −29.00% | −34.29% |
+| recovery 2023 | +75.20% | −13.44% |
+| bull 2024 | +43.33% | −13.71% |
+| choppy 2025 | +21.29% | −22.95% |
+| rally 2025-26 | +20.29% | −7.45% |
+| recent 2026 | +3.50% | −6.35% |
+
+Waiting time for each bar, starting the clock on every trading day from
+2019-09-03 to 2024-09-20 (1,272 starts, each followed for 24 months) and
+measuring drawdown from the peak since the start:
+
+| Bar | Windows clearing | Median wait | 90th pct | Untested at 12m | Untested at 24m |
+|---|---|---|---|---|---|
+| 10% | 6/10 | 4.0 mo | 10.1 mo | 6% | 0% |
+| 15% | 3/10 | 11.0 mo | 19.8 mo | 46% | 0% |
+| 20% | 3/10 | 13.4 mo | >24 mo | 54% | 15% |
+| 25% | 2/10 | 22.8 mo | >24 mo | 71% | 48% |
+
+At 10% the median wait is shorter than the 6-month minimum, so the
+requirement filters almost nothing. 15% is the lowest bar that excludes
+ordinary pullbacks: the three windows that clear it are exactly the stress
+events (covid 2020, bear 2022, April 2025). 20% selects the same three and
+leaves 15% of starts untested. At 15% the worst wait was 22.6 months, so a
+24-month cap gave every start a verdict; a 12-month cap would leave 46%
+untested.
+
+Caveats: the start days overlap heavily, so only three stress events drive the
+15%+ rows, and 2019–2024 was a turbulent stretch — calmer years will wait
+longer, and "untested under stress" is then the right verdict.
 
 ## Recommended next steps (original, from the first pass)
 
@@ -1003,6 +1253,8 @@ python edge_probe.py --horizons 3 7 21 --broad  # ten windows, not four (finding
 python edge_probe.py --exposure --broad         # F, corrected
 python edge_probe.py --tiers --broad            # position sizes (finding K)
 python edge_probe.py --exits --broad            # exit policy    (finding L)
+python edge_probe.py --sell-info --broad        # SELL -> forward return (finding M)
+python edge_probe.py --vol-info --broad         # model vs EWMA volatility (finding N)
 python edge_probe.py --exposure --window 2026-03-05 2026-09-04
                                                 # simulate one exact period
 ```

@@ -7,6 +7,27 @@
 > ⚠️  sentiment is currently being used as a veto functio
 > ⚠️  currently the bot is in paper trading phases
 
+## SETUP
+
+Always install into a virtualenv with a current pip, never the system pip:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install --upgrade pip setuptools wheel
+.venv/bin/pip install -r requirements-dev.txt
+```
+
+`ta` ships no wheel, so pip builds it from source. Debian/Ubuntu system
+Pythons carry a patched, older setuptools that fails such builds
+(`AttributeError: install_layout`); an upgraded setuptools inside a venv does
+not. CI does the equivalent (`.github/workflows/tests.yml` upgrades pip before
+installing).
+
+Alpaca access uses `alpaca-py` through `broker.py`. The deprecated
+`alpaca-trade-api` it replaced pulled in a `msgpack` pin that could not build
+its C extension on Python 3.11+. On an existing deployment, install
+`alpaca-py` before pulling the code that needs it.
+
 ## DATA COLLECTION
 
 ### `data_collector.py` 
@@ -464,10 +485,39 @@ refactor), Layer 3 will still prevent a silent execution on stale data.
 
 ### Cron schedule
 
-The `update_market_data.yml` workflow was shifted from `'0 13 * * 1-5'` (13:00 UTC)
-to `'0 12 * * 1-5'` (12:00 UTC) to widen the buffer between the market data refresh
-and the PythonAnywhere scheduled task (15:00 UTC). This gives the upload pipeline
-~3 hours of headroom instead of ~1 hour.
+The `update_market_data.yml` workflow was shifted from 13:00 UTC to 12:00 UTC to
+widen the buffer between the market data refresh and the PythonAnywhere scheduled
+task (15:00 UTC), giving the upload pipeline ~3 hours of headroom instead of ~1.
+
+**Start times come from PythonAnywhere, not GitHub cron.** GitHub's `schedule:`
+trigger is best-effort, and on 2026-09-28 it started the 12:00 data run at 19:14
+and the 14:15 pre-trade agent at 20:32: the 15:00 run halted on stale data and
+the late webhook run traded at 19:17 with the previous session's agent
+decisions. Both workflows now have only `workflow_dispatch`, and PA daily tasks
+start them on time with `dispatch_workflow.py`:
+
+| UTC | PA task | Starts |
+|---|---|---|
+| 12:00 | `python dispatch_workflow.py update_market_data.yml` | market data refresh + webhook |
+| 14:15 | `python dispatch_workflow.py agent_pretrade.yml` | pre-trade agent |
+| 15:45 | `python pipeline_check.py` | daily alarm (below) |
+
+**`pipeline_check.py` — did every step produce today's output?** Exit codes
+missed two of the September 2026 silent failures (an expired token that exited
+0, and a task nobody read the log of), so this checks each step's *output*:
+market CSVs modified today, `pending_signals.json` and `agent_decisions.json`
+dated today, the run guard stamped today and no `HALT_FLAG.txt`. It posts one
+Discord line every trading day, green or a list of failures, and exits 1 on any
+failure. The daily green line is intentional: if it stops appearing, the check
+itself has stopped running. For *why* a step failed, use `pipeline_status.py`
+or the daily-run-triage agent.
+
+`create_pa_dispatch_tasks.py` creates or updates both tasks (idempotent).
+`dispatch_workflow.py` skips weekends, retries network errors and 5xx, and posts
+a Discord alert if GitHub refuses. It needs `GITHUB_DISPATCH_TOKEN` in PA's
+`.env`: a fine-grained token for this repository only with **Actions: Read and
+write**. The after-close workflows (`agent_daily.yml`, `evaluate_signals.yml`)
+still use GitHub cron; lateness there does not affect trading.
 
 ## Execution Order
 

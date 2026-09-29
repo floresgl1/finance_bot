@@ -520,3 +520,79 @@ def test_reconcile_writes_the_resolved_position_id(log):
 
     written = [r for r in csv.DictReader(open(log)) if r["row_type"] == "EXIT"]
     assert written[0]["position_id"] == "posA"
+
+
+# --- entry price from the position's cost basis ------------------------------
+
+from types import SimpleNamespace as _NS
+
+from reconcile_stops import position_entry_price
+
+
+def _buy_row(order_id, date_, action="BUY", pid="posA"):
+    return {"date": date_, "ticker": "AAPL", "row_type": "ENTRY", "actual_action": action,
+            "qty": 10, "price": 1.0, "entry_order_id": order_id, "position_id": pid}
+
+
+def _fills(prices):
+    """api.get_order for BUYs: {order_id: (qty, price)}."""
+    def get_order(order_id):
+        qty, price = prices[order_id]
+        return _NS(filled_qty=str(qty), filled_avg_price=str(price))
+    return get_order
+
+
+def test_entry_price_is_the_qty_weighted_average_of_the_positions_buys(log):
+    _write_log(log, [_buy_row("b1", "2026-06-01"),
+                     _buy_row("b2", "2026-06-05", action="ADD_TO_POSITION")])
+    api = MagicMock()
+    api.get_order.side_effect = _fills({"b1": (10, 100.0), "b2": (30, 120.0)})
+
+    assert position_entry_price(api, "AAPL", "posA", str(log)) == (115.0, "")
+
+
+def test_other_positions_buys_are_ignored(log):
+    _write_log(log, [_buy_row("old", "2026-05-01", pid="posOld"), _buy_row("b1", "2026-06-01")])
+    api = MagicMock()
+    api.get_order.side_effect = _fills({"b1": (10, 100.0), "old": (10, 50.0)})
+
+    assert position_entry_price(api, "AAPL", "posA", str(log))[0] == 100.0
+
+
+def test_unfetchable_buy_gives_no_price_rather_than_a_partial_average(log):
+    _write_log(log, [_buy_row("b1", "2026-06-01"), _buy_row("b2", "2026-06-05")])
+    api = MagicMock()
+    api.get_order.side_effect = lambda oid: (_ for _ in ()).throw(RuntimeError("404"))
+
+    price, note = position_entry_price(api, "AAPL", "posA", str(log))
+
+    assert price is None
+    assert "could not fetch" in note
+
+
+def test_no_position_id_gives_no_price(log):
+    assert position_entry_price(MagicMock(), "AAPL", None, str(log)) == (None, "")
+
+
+def test_stop_loss_is_priced_against_the_position_not_a_stale_buy(log):
+    """find_open_entry_order_id picks the add at $80 (the open BUY after the
+    opening BUY was consumed by a trim). The position's cost basis is $110:
+    a $100 stop is a loss, not the win the old pricing reported."""
+    _write_log(log, [
+        _buy_row("b1", "2026-06-01"),                                    # 10 @ 120
+        {"date": "2026-06-03", "ticker": "AAPL", "row_type": "EXIT", "entry_order_id": "b1",
+         "exit_reason": "REBALANCE_TRIM", "shares": 2, "exit_timestamp": "2026-06-03T15:00:00",
+         "exit_price": 125.0, "realized_pnl": 10.0, "position_id": "posA"},
+        _buy_row("b2", "2026-06-05", action="ADD_TO_POSITION"),          # 10 @ 100
+    ])
+    api = MagicMock()
+    api.list_orders.return_value = [_order(filled_qty="18", filled_avg_price="100.0",
+                                           filled_at="2026-07-01T14:30:00+00:00")]
+    api.get_order.side_effect = _fills({"b1": (10, 120.0), "b2": (10, 100.0)})
+
+    result = reconcile(api, date(2026, 6, 1), log_path=str(log))
+
+    row = result["written"][0]
+    assert row["entry_price"] == 110.0
+    assert row["realized_pnl"] == -180.0          # (100 - 110) * 18
+    assert row["position_id"] == "posA"

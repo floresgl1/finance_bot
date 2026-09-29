@@ -12,9 +12,12 @@ name: Pre-Trade Agent Run
 # Permissive: if this workflow fails entirely, live_trader.py defaults to
 # ABSTAIN for all tickers (trades anyway). A VETO in agent_decisions.json
 # blocks the corresponding trade.
+#
+# Started at 14:15 UTC Mon–Fri by a PythonAnywhere scheduled task running
+# dispatch_workflow.py (see create_pa_dispatch_tasks.py). GitHub's own
+# `schedule:` trigger was removed: it once ran this workflow at 20:32 UTC,
+# after the trade it exists to inform.
 on:
-  schedule:
-    - cron: '15 14 * * 1-5'
   workflow_dispatch:
 
 # Separate concurrency group from agent-daily so they can't block each other.

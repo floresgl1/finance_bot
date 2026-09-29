@@ -851,3 +851,298 @@ def test_exit_summary_is_ascii_only():
     })
 
     summarise_exits(results).encode("ascii")
+
+
+# ---------------------------------------------------------------------------
+# SELL information probe (Stage 1)
+# ---------------------------------------------------------------------------
+
+
+def _frame(signals, fwd):
+    idx = pd.date_range("2024-01-01", periods=len(signals), freq="B")
+    return pd.DataFrame({"Signal": signals, "fwd": fwd}, index=idx)
+
+
+def test_forward_returns_look_ahead_by_the_horizon():
+    close = pd.Series([100.0, 110.0, 121.0, 133.1])
+    fwd = edge_probe._forward_returns(close, 2)
+    assert fwd.iloc[0] == pytest.approx(0.21)
+    assert fwd.iloc[2:].isna().all()
+
+
+def test_sell_days_that_precede_losses_give_a_positive_gap():
+    frames = {"AAPL": _frame(["SELL", "SELL", "HOLD", "BUY"], [-0.02, -0.02, 0.01, 0.01])}
+    r = edge_probe.sell_gap(frames)
+    assert r["gap"] == pytest.approx(0.03)
+    assert (r["n_sell"], r["n_other"]) == (2, 2)
+
+
+def test_gap_measures_timing_not_which_tickers_get_flagged():
+    """The model flags a weak ticker a lot, but within each ticker SELL days
+    are no different from other days. The pooled comparison would show a big
+    'edge'; the within-ticker gap must be zero."""
+    frames = {
+        "WEAK":   _frame(["SELL", "SELL", "SELL", "HOLD"], [-0.01] * 4),
+        "STRONG": _frame(["SELL", "BUY", "BUY", "BUY"], [0.01] * 4),
+    }
+    r = edge_probe.sell_gap(frames)
+    assert r["gap"] == pytest.approx(0.0)
+    assert r["other_fwd_mean"] - r["sell_fwd_mean"] > 0.009   # the pooled illusion
+
+
+def test_ticker_needs_both_kinds_of_day_to_count():
+    frames = {
+        "ALLSELL": _frame(["SELL", "SELL"], [-0.05, -0.05]),
+        "AAPL":    _frame(["SELL", "HOLD"], [0.00, 0.01]),
+    }
+    r = edge_probe.sell_gap(frames)
+    assert r["tickers_scored"] == 1
+    assert r["gap"] == pytest.approx(0.01)
+
+
+def test_rows_without_a_forward_return_are_dropped():
+    frames = {"AAPL": _frame(["SELL", "HOLD", "SELL"], [-0.01, 0.01, np.nan])}
+    r = edge_probe.sell_gap(frames)
+    assert r["n_sell"] == 1
+
+
+def _windows(gaps):
+    return {f"w{i}": {"gap": g} for i, g in enumerate(gaps)}
+
+
+@pytest.mark.parametrize("gaps, passed", [
+    ([0.004] * 7 + [-0.001] * 3, True),     # 7 of 10, mean 0.25%
+    ([0.004] * 6 + [-0.001] * 4, False),    # only 6 windows
+    ([0.001] * 10, False),                  # every window, but mean 0.1% < cost
+    ([0.002] * 10, False),                  # exactly the cost is not enough
+])
+def test_verdict_applies_the_pre_registered_criteria(gaps, passed):
+    assert edge_probe.sell_info_verdict(_windows(gaps))["passed"] is passed
+
+
+def test_verdict_ignores_windows_without_a_gap():
+    v = edge_probe.sell_info_verdict({**_windows([0.004] * 7), "empty": {"gap": None}})
+    assert (v["windows_scored"], v["passed"]) == (7, True)
+
+
+def test_criteria_are_the_ones_agreed_before_the_run():
+    """Changing these after seeing results is the failure mode this test exists for."""
+    assert edge_probe.SELL_INFO_MIN_WINDOWS == 7
+    assert edge_probe.SELL_INFO_MIN_MEAN_GAP == 0.002
+
+
+def test_a_run_with_missing_windows_gives_no_verdict():
+    """A data failure scored zero windows and printed FAIL. It must say NO VERDICT."""
+    text = edge_probe.summarise_sell_info({}, broad=True)
+    assert "NO VERDICT" in text
+    assert "FAIL" not in text
+
+
+# ---------------------------------------------------------------------------
+# Volatility forecast probe (Stage 1)
+# ---------------------------------------------------------------------------
+
+
+def _ohlc(n=120, seed=0):
+    rng = np.random.default_rng(seed)
+    close = 100 * np.exp(np.cumsum(rng.normal(0, 0.02, n)))
+    idx = pd.date_range("2020-01-01", periods=n, freq="B")
+    return pd.DataFrame({"Close": close, "High": close * 1.01, "Low": close * 0.99}, index=idx)
+
+
+def test_features_and_baselines_never_look_ahead():
+    """Changing prices after day t must not change anything known at day t."""
+    prices = _ohlc()
+    t = 80
+    shocked = prices.copy()
+    shocked.iloc[t + 1:, :] *= 3.0          # a huge move after t
+
+    a = edge_probe.vol_frame(prices).iloc[: t + 1]
+    b = edge_probe.vol_frame(shocked).iloc[: t + 1]
+
+    known = edge_probe.VOL_FEATURES          # includes ewma_vol and rv_20 (the baselines)
+    pd.testing.assert_frame_equal(a[known], b[known])
+
+
+def test_target_is_exactly_the_next_five_days():
+    prices = _ohlc()
+    vf = edge_probe.vol_frame(prices)
+    r = np.log(prices["Close"]).diff()
+    t = 50
+    expected = np.sqrt(np.mean(r.iloc[t + 1: t + 6] ** 2))
+    assert vf["target_rv"].iloc[t] == pytest.approx(expected)
+    assert vf["target_rv"].iloc[-5:].isna().all()   # no full forward window
+
+
+def test_target_at_t_ignores_day_t_itself():
+    prices = _ohlc()
+    t = 50
+    shocked = prices.copy()
+    shocked.iloc[t, shocked.columns.get_loc("Close")] *= 1.5   # moves r_t and r_{t+1}
+    a, b = edge_probe.vol_frame(prices), edge_probe.vol_frame(shocked)
+    # r_t changes, but the target for t-1 covers t..t+4 and the target for t
+    # covers t+1..t+5; only the latter includes r_{t+1}. The target at t-6
+    # covers t-5..t-1 and must be untouched.
+    assert a["target_rv"].iloc[t - 6] == pytest.approx(b["target_rv"].iloc[t - 6])
+
+
+def test_ewma_follows_the_riskmetrics_recursion():
+    r = pd.Series([0.01] * 20 + [0.05, -0.02])
+    var = edge_probe._ewma_variance(r, lam=0.94)
+    seed = 0.01 ** 2
+    v20 = 0.94 * seed + 0.06 * 0.05 ** 2
+    v21 = 0.94 * v20 + 0.06 * 0.02 ** 2
+    assert var.iloc[20] == pytest.approx(v20)
+    assert var.iloc[21] == pytest.approx(v21)
+    assert var.iloc[:20].isna().all()
+
+
+def test_qlike_is_zero_for_a_perfect_forecast_and_punishes_underforecasting_more():
+    realised = np.array([0.0004, 0.0009])
+    assert edge_probe.qlike(realised, realised) == pytest.approx(0.0)
+    under = edge_probe.qlike(realised / 2, realised)
+    over = edge_probe.qlike(realised * 2, realised)
+    assert under > over > 0
+
+
+def _vol_windows(pairs):
+    return {f"w{i}": {"model": m, "ewma": e} for i, (m, e) in enumerate(pairs)}
+
+
+@pytest.mark.parametrize("pairs, passed", [
+    ([(0.90, 1.0)] * 7 + [(1.02, 1.0)] * 3, True),    # 7 wins, mean 6.4%
+    ([(0.95, 1.0)] * 10, True),                         # exactly 5% passes (>=)
+    ([(0.90, 1.0)] * 6 + [(1.00, 1.0)] * 4, False),     # only 6 wins
+    ([(0.96, 1.0)] * 10, False),                        # every window, but 4% < 5%
+])
+def test_vol_verdict_applies_the_pre_registered_criteria(pairs, passed):
+    assert edge_probe.vol_info_verdict(_vol_windows(pairs))["passed"] is passed
+
+
+def test_vol_run_with_missing_windows_gives_no_verdict():
+    text = edge_probe.summarise_vol_info({}, broad=True)
+    assert "NO VERDICT" in text
+    assert "FAIL" not in text
+
+
+def test_vol_criteria_are_the_ones_agreed_before_the_run():
+    assert edge_probe.VOL_HORIZON == 5
+    assert edge_probe.VOL_EWMA_LAMBDA == 0.94
+    assert edge_probe.VOL_INFO_MIN_WINDOWS == 7
+    assert edge_probe.VOL_INFO_MIN_IMPROVEMENT == 0.05
+
+
+def test_model_that_knows_the_regime_beats_ewma():
+    """Sanity check of the scoring path: when volatility is set by a feature
+    the model can see, it must beat EWMA, which only sees past returns."""
+    rng = np.random.default_rng(1)
+    n = 4000
+    regime = rng.integers(0, 2, n)                     # visible feature
+    vol = np.where(regime == 1, 0.04, 0.01)
+    target = np.abs(rng.normal(vol, vol * 0.1))
+    frame = pd.DataFrame({"regime": regime, "target_rv": target,
+                          "ewma_vol": 0.025, "rv_20": 0.025})
+    r = edge_probe.score_vol_window(frame.iloc[:3000], frame.iloc[3000:], ["regime"])
+    assert r["model"] < r["ewma"]
+
+
+# ---------------------------------------------------------------------------
+# Volatility sizing (finding O)
+# ---------------------------------------------------------------------------
+def _closes(n=40, cols=("X", "Y"), seed=0):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2024-01-01", periods=n)
+    rets = rng.normal(0, 0.01, (n, len(cols)))
+    return pd.DataFrame(100 * np.exp(np.cumsum(rets, axis=0)), index=idx, columns=list(cols))
+
+
+def test_sizing_vol_never_reads_the_close_it_trades_on():
+    closes = _closes(60)
+    before = edge_probe._lagged_ewma_vol(closes)
+    shocked = closes.copy()
+    shocked.iloc[45:] *= 3.0                           # huge move on day 45
+    after = edge_probe._lagged_ewma_vol(shocked)
+    day = closes.index[45]
+    assert after.loc[day].equals(before.loc[day])
+    assert not after.iloc[46].equals(before.iloc[46])  # seen the next day
+
+
+def test_inverse_vol_weights_sum_to_one_and_favour_the_calm_name():
+    w = edge_probe.inverse_vol_weights(pd.Series({"calm": 0.01, "wild": 0.03}))
+    assert w.sum() == pytest.approx(1.0)
+    assert w["calm"] == pytest.approx(0.75)
+
+
+def test_vol_target_scales_down_but_never_levers_up():
+    assert edge_probe.vol_target_exposure(0.02, 0.01) == pytest.approx(0.5)
+    assert edge_probe.vol_target_exposure(0.005, 0.01) == 1.0
+
+
+def test_rebalanced_simulation_tracks_prices_and_charges_slippage_on_turnover():
+    idx = pd.bdate_range("2024-01-01", periods=3)
+    closes = pd.DataFrame({"X": [100.0, 110.0, 110.0]}, index=idx)
+    w = pd.DataFrame({"X": [1.0]}, index=idx[:1])
+    sim = edge_probe.simulate_rebalanced(closes, w, slippage=0.01)
+    assert sim["equity"].iloc[0] == pytest.approx(0.99, abs=1e-3)  # 1% on the opening buy
+    assert sim["equity"].iloc[1] == pytest.approx(0.99 * 1.10, abs=1e-3)
+    assert sim["exposure"].max() <= 1.0                     # the fee never borrows
+
+
+def test_cash_earns_nothing_and_is_not_exposed():
+    idx = pd.bdate_range("2024-01-01", periods=3)
+    closes = pd.DataFrame({"X": [100.0, 50.0, 50.0]}, index=idx)
+    w = pd.DataFrame({"X": [0.5]}, index=idx[:1])
+    sim = edge_probe.simulate_rebalanced(closes, w, slippage=0.0)
+    assert sim["equity"].iloc[1] == pytest.approx(0.75)
+    assert sim["exposure"].iloc[0] == pytest.approx(0.5)
+
+
+def test_the_b_control_holds_exactly_b_average_exposure():
+    closes = _closes(1000, cols=("X", "Y", "Z"), seed=3)
+    start, end = closes.index[800], closes.index[-1]
+    r = edge_probe.score_vol_sizing_window(closes, start, end, slippage=0.0)
+    assert r["B_control"]["avg_exposure"] == pytest.approx(r["matched_exposure"], abs=1.0)
+    assert r["A"]["avg_exposure"] == pytest.approx(100.0)
+    assert r["equal"]["avg_exposure"] == pytest.approx(100.0)
+
+
+def test_a_window_without_enough_history_for_the_target_is_skipped():
+    closes = _closes(300)
+    assert edge_probe.score_vol_sizing_window(
+        closes, closes.index[200], closes.index[-1], slippage=0.0) is None
+
+
+def _sizing_windows(rows):
+    """rows: (arm_dd, ctl_dd, arm_ret, ctl_ret) per window, applied to both arms."""
+    out = {}
+    for i, (add, cdd, aret, cret) in enumerate(rows):
+        arm = {"max_drawdown": add, "total_return": aret}
+        ctl = {"max_drawdown": cdd, "total_return": cret}
+        out[f"w{i}"] = {"A": arm, "equal": ctl, "B": arm, "B_control": ctl}
+    return out
+
+
+@pytest.mark.parametrize("rows, a_passed, b_passed", [
+    ([(-10, -12, 5, 5)] * 7 + [(-12, -11, 5, 5)] * 3, True, False),  # mean +1.1pp
+    ([(-10, -12, 5, 5)] * 10, True, True),                            # exactly +2.0pp
+    ([(-9, -12, 5, 5)] * 6 + [(-12, -11, 5, 5)] * 4, False, False),   # only 6 wins
+    ([(-8, -12, 3, 5)] * 10, True, True),                             # return cost exactly 2pp
+    ([(-8, -12, 2.9, 5)] * 10, False, False),                         # return cost 2.1pp
+])
+def test_sizing_verdict_applies_the_pre_registered_criteria(rows, a_passed, b_passed):
+    w = _sizing_windows(rows)
+    assert edge_probe.vol_sizing_verdict(w, "A")["passed"] is a_passed
+    assert edge_probe.vol_sizing_verdict(w, "B")["passed"] is b_passed
+
+
+def test_sizing_run_with_missing_windows_gives_no_verdict():
+    text = edge_probe.summarise_vol_sizing({}, broad=True)
+    assert text.count("NO VERDICT") == 2
+    assert "FAIL" not in text and "PASS" not in text
+
+
+def test_sizing_criteria_are_the_ones_agreed_before_the_run():
+    assert edge_probe.VOL_SIZING_MIN_WINDOWS == 7
+    assert edge_probe.VOL_SIZING_MIN_DD_GAIN_PP == {"A": 1.0, "B": 2.0}
+    assert edge_probe.VOL_SIZING_MAX_RETURN_COST_PP == 2.0
+    assert edge_probe.VOL_SIZING_TARGET_YEARS == 3
