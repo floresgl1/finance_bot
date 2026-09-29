@@ -8,8 +8,8 @@ docs/MICROCAP_VALUE_PREREG.md names. The other ~100 fundamentals columns
 tempt anyone into adding a signal after seeing results.
 
   fundamentals  ARY rows only (as first reported)
-  stocks        split-adjusted high/low/close, volume, closeadj
-  tickers       identity, category, SIC, delisting flag
+  stocks        split-adjusted high/low/close, volume, closeadj, closeunadj
+  tickers       identity, name, category, SIC, related tickers, delisting flag
   actions       all columns (delisting reasons, SIC and exchange changes)
 
 Files are read in chunks, so memory stays flat on the 3 GB price file.
@@ -47,13 +47,17 @@ SPECS = {
         "where": {"dimension": "ARY"},
     },
     "stocks": {
+        # closeunadj puts reported share counts on the split-adjusted basis
+        # (market-cap rule in the pre-registration).
         "columns": {"ticker": STR, "date": DATE, "high": FLOAT, "low": FLOAT,
-                    "close": FLOAT, "volume": FLOAT, "closeadj": FLOAT},
+                    "close": FLOAT, "volume": FLOAT, "closeadj": FLOAT,
+                    "closeunadj": FLOAT},
     },
     "tickers": {
-        "columns": {"permaticker": INT, "ticker": STR, "table": STR, "category": STR,
-                    "siccode": INT, "isdelisted": STR, "firstpricedate": DATE,
-                    "lastpricedate": DATE},
+        # name and relatedtickers pair a Secondary Class security with its issuer.
+        "columns": {"permaticker": INT, "ticker": STR, "table": STR, "name": STR,
+                    "category": STR, "siccode": INT, "isdelisted": STR,
+                    "relatedtickers": STR, "firstpricedate": DATE, "lastpricedate": DATE},
     },
     "actions": {
         "columns": {"date": DATE, "action": STR, "ticker": STR, "name": STR,

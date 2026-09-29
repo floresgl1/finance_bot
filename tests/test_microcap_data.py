@@ -36,10 +36,11 @@ STOCKS = (
 )
 
 TICKERS = (
-    "table,permaticker,ticker,name,exchange,isdelisted,category,siccode,firstpricedate,lastpricedate\n"
-    "fundamentals,101,AAA,A Inc,NYSE,N,Domestic Common Stock,3570,1998-01-02,2026-09-28\n"
-    "stocks,101,AAA,A Inc,NYSE,N,Domestic Common Stock,3570,1998-01-02,2026-09-28\n"
-    "fundamentals,102,BBB,B Corp,NASDAQ,Y,Domestic Common Stock Primary Class,,2001-05-01,\n"
+    "table,permaticker,ticker,name,exchange,isdelisted,category,siccode,relatedtickers,"
+    "firstpricedate,lastpricedate\n"
+    "SF1,101,AAA,A Inc,NYSE,N,Domestic Common Stock,3570,,1998-01-02,2026-09-28\n"
+    "SEP,101,AAA,A Inc,NYSE,N,Domestic Common Stock,3570,,1998-01-02,2026-09-28\n"
+    "SF1,102,BBB,B Corp,NASDAQ,Y,Domestic Common Stock Primary Class,,BBBB,2001-05-01,\n"
 )
 
 ACTIONS = (
@@ -74,11 +75,12 @@ def test_fundamentals_keep_ary_rows_and_only_named_columns(dirs):
     assert str(summary["first"]) == "2020-03-02" and str(summary["last"]) == "2021-02-15"
 
 
-def test_stocks_drop_open_and_unadjusted_close(dirs):
+def test_stocks_drop_open_and_lastupdated(dirs):
     zip_dir, out_dir = dirs
     md.convert("stocks", zip_dir, out_dir)
     t = _read(out_dir, "stocks")
-    assert t.column_names == ["ticker", "date", "high", "low", "close", "volume", "closeadj"]
+    assert t.column_names == ["ticker", "date", "high", "low", "close", "volume",
+                              "closeadj", "closeunadj"]
     assert t.column("volume").to_pylist() == [1000.0, None, 200.0]
     assert str(t.schema.field("date").type) == "date32[day]"
 
@@ -90,6 +92,8 @@ def test_tickers_types_and_missing_values(dirs):
     assert t.column("permaticker").to_pylist() == [101, 101, 102]
     assert t.column("siccode").to_pylist() == [3570, 3570, None]
     assert t.column("lastpricedate").to_pylist()[2] is None
+    assert t.column("relatedtickers").to_pylist() == [None, None, "BBBB"]
+    assert "exchange" not in t.column_names
 
 
 def test_chunked_read_equals_single_read(dirs, tmp_path):
