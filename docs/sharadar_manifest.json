@@ -1,0 +1,53 @@
+{
+  "source": "api.sharadar.com bulk download, years=full",
+  "tables": {
+    "actions": {
+      "bytes": 10543743,
+      "file": "actions.csv.zip",
+      "members": [
+        {
+          "bytes": 49614539,
+          "name": "actions.csv"
+        }
+      ],
+      "recorded_utc": "2026-09-29T21:35:22Z",
+      "sha256": "959076e17ec9b6e4cfdf897530802fa4f85e4e18b7d41ecdfaee9a94aa501b02"
+    },
+    "fundamentals": {
+      "bytes": 661465323,
+      "file": "fundamentals.csv.zip",
+      "members": [
+        {
+          "bytes": 2416054295,
+          "name": "fundamentals.csv"
+        }
+      ],
+      "recorded_utc": "2026-09-29T21:46:31Z",
+      "sha256": "dec3a497f70d1c60fd34db50eb6946230949a3e04c7458044c24d08fddfd0d1e"
+    },
+    "stocks": {
+      "bytes": 990567186,
+      "file": "stocks.csv.zip",
+      "members": [
+        {
+          "bytes": 3168084153,
+          "name": "stocks.csv"
+        }
+      ],
+      "recorded_utc": "2026-09-29T22:04:39Z",
+      "sha256": "26586b85cf708a9318d693b387585adb1293647b3238df24c6eaa2f69f97b8a4"
+    },
+    "tickers": {
+      "bytes": 4892335,
+      "file": "tickers.csv.zip",
+      "members": [
+        {
+          "bytes": 24979686,
+          "name": "tickers.csv"
+        }
+      ],
+      "recorded_utc": "2026-09-29T21:35:17Z",
+      "sha256": "a30f598babdfb8f943e7bef0786089b41c9585d51287eab9a77a23e7f582f77c"
+    }
+  }
+}
