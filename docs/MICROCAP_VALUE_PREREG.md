@@ -331,3 +331,42 @@ against the share counts on the cover page of the same 10-K on SEC EDGAR:
 
 All three match exactly, including a three-class company: `sharesbas` is the
 total of every class. The market-cap rule stands unchanged.
+
+## Backtest decisions, fixed before any backtest code (2026-09-29)
+
+Approved by the author 2026-09-29. The backtest is written and tested on
+synthetic data only; its code is then frozen in one commit, and only then run
+once on the real data. A code change after the run makes it a second draw.
+
+1. **The debt filter is part of the universe.** Net debt / EBIT ≤ 3× applies
+   to strategy, control and quintiles alike. Applied to the strategy alone,
+   the strategy would differ from the control in cheapness *and* leverage,
+   and a gap could not be attributed to the signal. Where EBIT ≤ 0 the ratio
+   is meaningless: such a company passes only if its net debt is ≤ 0.
+2. **EV ≤ 0 is excluded** from the universe: EBIT/EV changes sign and would
+   rank nonsense at the top.
+3. **Missing EBIT, debt, cash or `sharesbas`: excluded.** EV must be
+   available (universe rule); a missing value is never filled with 0.
+4. **Trades at the close on D.** The ranking uses only data from before D;
+   holding-year returns start the next trading day.
+5. **Rebalancing cost** = half spread × the weight actually traded, per name:
+   names kept from last year pay only on their trim or top-up; names dropped
+   pay on the sale; new names pay on the purchase. Each year's return includes
+   the cost of its opening trades.
+6. **A price series that ends inside a holding year** — no later price
+   anywhere in the data — is a delisting on its last price date. Its reason
+   comes from `actions` events on that ticker within 30 days of that date
+   (failure wins); none means unknown. A gap followed by more prices is not a
+   delisting: the position keeps its last price until trading resumes.
+7. **The 80% bar over 27 years (1999–2025) means ≥ 22 winning years**
+   (21.6 rounded up).
+8. **Ties in EBIT/EV are broken by `permaticker`**, ascending.
+9. **Market cap uses the primary class's price** × `sharesbas` (all classes).
+
+Clarifications the code needs, same date:
+
+- A day counts toward the ADV and spread windows only if it has
+  `volume > 0` (and, for the spread, high, low and close on it and the next
+  day). Trades after a delisting use the same trailing-252-day spread rule,
+  evaluated on the day of the trade.
+- The staircase uses the same net-of-cost returns as the other criteria.
