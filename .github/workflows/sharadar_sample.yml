@@ -1,0 +1,33 @@
+name: Sharadar Sample Discovery
+
+# Runs sharadar_sample.py --discover with the repo's SHARADAR_API_KEY secret,
+# to see which Sharadar tables and companies the key can reach before the
+# checks in docs/MICROCAP_VALUE_PREREG.md are written.
+#
+# Manual only. Prints structure (tables, columns, counts, a few tickers) to the
+# log; never prices, returns or rankings, and uploads no data.
+on:
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Discover
+        env:
+          SHARADAR_API_KEY: ${{ secrets.SHARADAR_API_KEY }}
+        run: python sharadar_sample.py --discover
