@@ -1023,11 +1023,67 @@ basket here.** A trades return for drawdown at a worse rate than agreed; B's
 timing subtracts value. Reading A on a risk-adjusted measure instead was not
 the question asked, and would be a second draw.
 
+## P. Micro-cap value: a different market, fundamentals, yearly (2026-09-30)
+
+Findings A–O all tested daily technical signals on twelve mega-caps, the most
+crowded corner of the market. P changes everything at once to go where size
+is a disadvantage: **US micro-caps ($50M–$300M), ranked by EBIT / enterprise
+value, top 30 equal-weight, rebalanced once a year**, against an equal-weight
+basket of the whole eligible universe under the same filters, dates and costs.
+
+It is also the most carefully controlled test in this document:
+
+- **Pre-registered in full before any data existed**
+  (`docs/MICROCAP_VALUE_PREREG.md`), then amended only for structure — field
+  names, identifiers, coverage — each amendment dated and committed before the
+  result.
+- **Point-in-time data including dead companies**: Sharadar full history,
+  1997–2026, 45M daily prices, fundamentals as first reported (`ARY`), each
+  usable only after its SEC filing date. Files fixed by hash in
+  `docs/sharadar_manifest.json`.
+- **Five structural checks before any return** (`microcap_checks.py`); two
+  of them changed rules (a point-in-time OTC exclusion; SPAC shells by merger
+  date), and a hand check against three 10-K cover pages confirmed the share
+  counts.
+- **Costs and delistings modelled**: half the Abdi–Ranaldo spread per trade,
+  −30% for failure delistings, reinvestment of proceeds, with a sensitivity
+  run for delistings of unknown reason.
+- **Frozen, then run once** (`microcap_backtest.py`, commit `505cae7`).
+
+Pass required all three, over 27 years (1999–2025): beat the control in ≥ 22
+years, a strict quintile staircase (cheapest highest), and ≥ 3% a year mean
+excess.
+
+| Criterion | Bar | Result |
+|---|---|---|
+| Years beating the control | ≥ 22 of 27 | **5** |
+| Quintile staircase | strict | **inverted**: Q1 +8.4% … Q5 +27.0% |
+| Mean excess a year | ≥ +3% | **−8.9%** |
+
+**FAIL on every criterion**, identically in the sensitivity run (only 1% of
+delistings had no stated reason). Full table: `docs/MICROCAP_BACKTEST_RESULT.md`.
+
+A sanity check fixed before looking — the control against the iShares
+Micro-Cap ETF, 2006–2025 — correlated at **0.97**, so the machinery is not
+grossly broken (`docs/MICROCAP_INDEX_CHECK.md`). One outlier year (2017–18,
+control +28.5 points over the ETF) is on record and cannot change the
+verdict: without that year the strategy still wins 5 of 26.
+
+**What the years show is finding F again, in a different market.** The
+strategy won almost only in crashes — 2000–01, 2007–08, 2021 — when cheap,
+profitable, low-debt companies fell less, and lagged badly in every rally.
+That is a defensive tilt, not an edge: it loses less when everything falls
+and gives back far more when everything rises. The inverted staircase fits
+the well-documented weakness of value since about 2007, and the pull of the
+speculative, loss-making names in the most expensive quintile, whose rare
+huge years (+155% in 1999, +128% in 2017) lift its average.
+
 ## Where this leaves things
 
 **The strategy does not beat buy-and-hold**, on every measurement taken: nine
 simulated attempts to find an edge, and the live account itself at −3.23pp over
-its first six months.
+its first six months. A tenth attempt in a different market altogether —
+micro-cap value, finding P — fails too.
 
 Finding I found `backtest._simulate()` had never modelled the live sizing rule.
 Finding J fixed it, and the simulator now reproduces the live account to within
@@ -1102,6 +1158,9 @@ dead:
 9. ~~**Size the basket by EWMA volatility.**~~ Finding O: inverse-vol weights
    cut drawdown but cost twice the agreed return; vol targeting cuts exposure
    after the fall and misses the rebound, losing to a constant fraction.
+10. ~~**Leave mega-caps: micro-cap value, ranked on fundamentals, yearly.**~~
+    Finding P: beats its control in 5 of 27 years, −8.9% a year, quintiles
+    inverted. Defensive in crashes, far behind in rallies.
 
 ### What is left
 
@@ -1109,19 +1168,21 @@ dead:
 technical indicators is a crowded, well-arbitraged space. "No durable edge" is
 the expected outcome, not a bug.
 
-Nine independent attempts to find one have now failed, and the most informative
+Ten independent attempts to find one have now failed, and the most informative
 of them found that a rule with no model in it beats the model. The pipeline
 around the signal — risk controls, monitoring, P&L attribution, a promotion gate
-that correctly refuses to ship a worse model, 813 tests — is sound engineering
+that correctly refuses to ship a worse model, 926 tests — is sound engineering
 regardless of whether this particular signal pays.
 
 If the project continues as a learning exercise rather than a strategy, the
 interesting next chapter is a different question, not a better answer to this
 one. The more predictable target suggested here first, realised volatility,
 has now been tried (findings N and O): it forecasts well, but neither a model
-nor sizing by the forecast turns that into a better basket. What remains is a
-different asset class or timeframe, or continued investment in the execution
-and monitoring machinery, which is the part that works.
+nor sizing by the forecast turns that into a better basket. A different market
+and timeframe has now been tried too (finding P: micro-caps, fundamentals,
+yearly) and fails the same way — a defensive tilt rather than an edge. What
+remains is deciding what the project is for, and continued investment in the
+execution and monitoring machinery, which is the part that works.
 
 The promotion gate now encodes this: `beats_buy_and_hold` (added 2026-09-08)
 rejects any challenger that loses to holding the basket, so the conclusion here
