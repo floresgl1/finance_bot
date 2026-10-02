@@ -11,6 +11,10 @@ unnamed), its FY2025 revenue split by geographic origin (Taiwan 31%), and Taiwan
 Mask's FY2025 annual revenue (about TWD 3.6B). No monthly or quarterly figure
 for either company has been looked at.
 
+*Amended 2026-10-02, still before any data exists:* the baseline now includes
+UMC's monthly revenue as a sector series, so TMC has to add information beyond
+mature-node wafer volume, not just beyond PLAB's own trend.
+
 ## Why this
 
 Ten probes found no edge in price-derived signals, mega-caps or micro-cap value
@@ -42,7 +46,7 @@ working mechanism underneath it would most likely be luck.
 | 2 | Target | PLAB **total** quarterly revenue, as **year-over-year growth**, in USD, as first reported (not restated) |
 | 3 | Alignment | PLAB fiscal quarter Q uses TMC revenue for its three calendar months. Each month is treated as available on the **10th of the following month**. A quarter whose PLAB earnings date falls before the third month's availability date is **excluded** |
 | 4 | Date range | From the first PLAB quarter whose YoY comparison falls entirely after the PDMC joint venture was consolidated, through **FY2026 Q3** (May–Jul 2026). Exact start fixed in the structural checks from the 10-K, before any revenue figure is read |
-| 5 | Baseline | **Model A:** PLAB's YoY growth this quarter = a + b × PLAB's YoY growth last quarter. **Model B:** Model A + c × TMC's YoY growth this quarter. Both fitted on an **expanding window**; the first **12** usable quarters are training only; every later quarter is scored out of sample |
+| 5 | Baseline | **Model A:** PLAB's YoY growth this quarter = a + b × PLAB's YoY growth last quarter + d × UMC's YoY growth this quarter. **Model B:** Model A + c × TMC's YoY growth this quarter. UMC's growth is built exactly as TMC's is in rows 1 and 3: three calendar months summed, YoY, in TWD, each month available on the 10th of the following month. Both fitted on an **expanding window**; the first **12** usable quarters are training only; every later quarter is scored out of sample |
 
 ### Why each choice
 
@@ -70,10 +74,18 @@ working mechanism underneath it would most likely be luck.
 5. **Baseline.** The obvious failure mode: both companies sell into the same
    semiconductor cycle, so their growth rates will correlate whether or not TMC
    carries any information PLAB's own history does not. Model A captures the
-   cycle's persistence. TMC passes only if it improves on PLAB's own trend,
+   cycle two ways: PLAB's own persistence, and UMC's revenue as the
+   mature-node Taiwan cycle. UMC was chosen over global chip sales (WSTS/SIA)
+   and TSMC because it is the same market PLAB's Taiwan business serves, it is
+   public on the same day as TMC, and it tests the mechanism directly: the
+   claim is that masks follow design starts, not wafer volume, so TMC should
+   carry information UMC's wafer revenue does not. If UMC explains PLAB just as
+   well, the mechanism adds nothing. TMC passes only if it improves on model A
    out of sample. 12 training quarters is three years — enough for a
-   three-parameter regression to be fitted at all, short enough to leave most
-   of the sample for scoring.
+   four-parameter regression to be fitted at all, short enough to leave most
+   of the sample for scoring; the extra parameter makes model A's early fits
+   noisier, which is why the bar is an out-of-sample count rather than an
+   in-sample fit.
 
 ## Structural checks — before any result
 
@@ -89,8 +101,8 @@ two series.
    design starts.)
 3. **Earnings dates.** Record PLAB's actual earnings date for every quarter.
    Apply row 3's exclusion rule and report how many quarters it drops.
-4. **Coverage.** Every TMC month in range present on MOPS. A missing month
-   excludes its quarter.
+4. **Coverage.** Every TMC and UMC month in range present on MOPS. A missing
+   month for either company excludes its quarter.
 
 ## Pass criteria
 
