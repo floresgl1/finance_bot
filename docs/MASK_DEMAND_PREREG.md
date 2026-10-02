@@ -268,3 +268,32 @@ TMC or UMC to PLAB was ever computed.
 What this does not close: the mechanism (mask demand follows design starts,
 not wafer volume) is untouched. A future test of it needs a predictor that
 measures merchant mask demand alone and reports more often than PLAB does.
+
+## Replacement predictor search — Faraday NRE (2026-10-02)
+
+Candidate: Faraday Technology (TWSE 3035), UMC's ASIC design-service
+affiliate. Its NRE revenue is paid around tape-out, so it measures design
+starts directly. Its monthly total does not: mass production (resold wafers)
+is the largest category (73% in Q2 2026 per press coverage), which is wafer
+volume and largely duplicates UMC in the baseline. Only quarterly NRE could
+serve, and Faraday's quarter (Jul–Sep) is reported about six weeks before
+PLAB's (Aug–Oct), so it would still lead.
+
+**It fails two checks before any test design:**
+
+- **History.** Exact quarterly NRE figures appear in Faraday's English
+  quarterly reports from 2Q22 only (~17 quarters to 2Q26); earlier press
+  releases mention NRE inconsistently ("exceeded NT$200M" in 3Q16). Seventeen
+  quarters leave five to score after the twelve-quarter training window.
+- **Foundry.** Faraday is multi-foundry (UMC, Samsung, Intel,
+  GlobalFoundries). Per its annual report as quoted in the press, UMC was
+  20.64% of 2025 purchases against 63.23% from an unnamed supplier, and 33.37%
+  in Q1 2026. The years with clean NRE data are the years it is least tied to
+  UMC.
+
+**Data seen** (Faraday only, nothing relating it to PLAB): NRE of "over
+NT$200M" in 3Q16, NT$649M in 3Q24, NT$931M in 4Q25; MP NT$2.43B (73%) in
+2Q26; total revenue NT$3.31B in 2Q26 and NT$11.06B in 2024.
+
+Unchecked: whether Faraday's Chinese-language investor presentations on MOPS
+give exact quarterly NRE before 2022.
