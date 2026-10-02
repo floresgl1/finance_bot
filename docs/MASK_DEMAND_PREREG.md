@@ -306,3 +306,11 @@ archive (`doc.twse.com.tw`) rejects this environment as MOPS does. The
 remaining source is Faraday's quarterly financial statements, whose IFRS 15
 revenue-disaggregation note may split NRE, IP and mass production from 2018,
 reachable only by hand.
+
+**Stop rule, agreed 2026-10-02 before the check.** One last source is checked:
+the revenue-disaggregation note (收入之細分 / 客戶合約之收入) in Faraday's 2018
+Q1 consolidated financial statements. If it gives exact quarterly NRE, this
+document is amended to use quarterly Faraday NRE as the predictor, with the
+post-2022 foundry shift handled by a rule fixed before any model is fitted.
+If it does not, the mechanism — mask demand follows design starts — is closed
+as unmeasurable with public data, and no further dataset is searched for it.
