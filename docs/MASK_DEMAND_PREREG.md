@@ -251,3 +251,20 @@ company 2338, and record whether the page reports a parent-only revenue line
 alongside the consolidated one, and from what year. If it does, row 1 is
 amended to that line before any model is fitted. If it does not, the
 hypothesis is closed as untestable with public data.
+
+### Option 2 result — closed as untestable (2026-10-02)
+
+Checked by hand on MOPS (`t05st10_ifrs`, company 2338, 民國115年08月) from a
+network MOPS accepts. The page reports **one** revenue line (營業收入淨額), with
+no parent-only line. Its figures — August 2026 TWD 494,412k, August 2025
+543,000k, January–August 2026 4,052,183k — match the FinMind series exactly,
+so that one line is the consolidated revenue already ruled out above.
+
+There is no public monthly series of TMC's mask business alone. Under the rule
+written before the check, **the hypothesis is closed as untestable with public
+data.** Neither a pass nor a fail: no model was fitted, and nothing relating
+TMC or UMC to PLAB was ever computed.
+
+What this does not close: the mechanism (mask demand follows design starts,
+not wafer volume) is untouched. A future test of it needs a predictor that
+measures merchant mask demand alone and reports more often than PLAB does.
