@@ -224,3 +224,30 @@ its first one.
 Checks 3 and 4 (earnings dates, coverage) were not completed for PLAB; TMC
 and UMC coverage is complete (201 months each, none missing or duplicated).
 How to proceed is an amendment to be decided before any model is fitted.
+
+### Option 2 attempt — parent-only TMC revenue (2026-10-02)
+
+Chosen after the stop above: replace row 1's consolidated TMC revenue with
+TMC's parent-only (個體) revenue, which is the mask business without the
+subsidiaries. No model has been fitted.
+
+**Not obtainable from this environment.** MOPS (`mops.twse.com.tw`,
+`mopsov.twse.com.tw`) and the TWSE open API return the exchange's own
+"FOR SECURITY REASONS" page to this server; Goodinfo returns 403; FinMind
+carries consolidated revenue only. Whether MOPS publishes a parent-only
+*monthly* series at all is unconfirmed: parent-only financial statements are
+an annual filing, and the parent-only figures found so far appear only in
+occasional company commentary reported by the press, not as a series.
+
+**Data seen during the attempt** (TMC only; nothing relating TMC or UMC to
+PLAB): a news search reported TMC's January 2026 consolidated revenue as
+TWD 537M, of which the core mask business was TWD 340M ("over 60%"), and that
+the mask business is about 60% of group revenue; February 2026 revenue as
+TWD 459.4M, down 14.5% YoY; February 2024 revenue as TWD 520M, down 4% YoY.
+
+**Status: still not testable as specified.** Next step needs a person on a
+network MOPS accepts: open MOPS → 營運概況 → 每月營收 (t05st10_ifrs) for
+company 2338, and record whether the page reports a parent-only revenue line
+alongside the consolidated one, and from what year. If it does, row 1 is
+amended to that line before any model is fitted. If it does not, the
+hypothesis is closed as untestable with public data.
