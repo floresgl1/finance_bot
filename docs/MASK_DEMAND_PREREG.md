@@ -158,3 +158,69 @@ re-tested: each of those is a second draw.
 A pass is a lead, not a result. It justifies designing stage 2 — whether the
 same information predicts PLAB's returns between the 10th and earnings — as a
 separate pre-registration.
+
+## Structural check results (2026-10-02) — stopped before any model was fitted
+
+**Data acquired.** TMC (2338) and UMC (2303) monthly revenue, December 2009 to
+August 2026, from FinMind's mirror of MOPS (`api.finmindtrade.com`, dataset
+`TaiwanStockMonthRevenue`). MOPS itself rejects requests from the environment
+these checks ran in ("FOR SECURITY REASONS, THIS PAGE CAN NOT BE ACCESSED"), so
+the source differs from the one written above; FinMind's values are a
+third-party copy and may reflect revisions rather than first reports. PLAB's
+XBRL company facts, submissions index and FY2013–FY2025 10-Ks from SEC EDGAR.
+
+| File | sha256 |
+|---|---|
+| `fm_2338.json` | `8804fec99fc60b7104f6b1fef6d7665cc6b11ded50c5bdf8fc9c9396e7763b23` |
+| `fm_2303.json` | `206f977a3b8788f189f48098f72f6cf59779bdc5cbde05b44a1ea5b25474fc5f` |
+| `plab_facts.json` | `d5be2991411bc641e8aa7927cb0e1493ce5d2a881d09bcbfbf0bc3ad262750a2` |
+| `plab_sub.json` | `e6a6147424c9e0712e0d8d4adbf42956e916fde6aaea61b20e789945528850a8` |
+
+**Data seen.** No PLAB revenue figure. 10-K text was read with dollar amounts
+masked. Two TMC figures were seen: a news search result reported TMC's
+consolidated revenue for H1 2018 as TWD 1.374B, up 128.4% on H1 2017, and the
+FinMind series was summed over H1 2018 and H1 2017 (TWD 1.374B and 0.602B) to
+establish what it measures. Nothing relating either Taiwan series to PLAB has
+been computed or looked at.
+
+**Check 1 — PDMC.** Confirmed from the FY2014 10-K: DPTT merged into PSMC to
+form PDMC on **April 4, 2014** (PLAB FY2014 Q2), Photronics 50.01%. The memory
+in row 4 was right; the FY2016 Q1 fallback is not needed.
+
+**Check 2 — M&A and capacity jumps.**
+
+| Company | Event | Date (PLAB fiscal quarter) | Source |
+|---|---|---|---|
+| PLAB | PDMC formed | Apr 2014 (FY2014 Q2) | FY2014 10-K |
+| PLAB | Sold MP Mask joint venture investment | FY2016 | FY2016 10-K — equity-method, no consolidated revenue, not excluded |
+| PLAB | Acquired a large-area IC mask business | FY2017 Q1 (Nov 2016 – Jan 2017) | FY2017 10-K |
+| PLAB | Hefei FPD plant starts production | FY2019 Q2 | FY2019 10-K |
+| PLAB | Xiamen IC plant starts production | FY2019 Q3 | FY2019 10-K |
+| PLAB | Bought out PKL minority interest | FY2019 | FY2019 10-K — already consolidated, not excluded |
+| TMC | Acquired 100% of 美祿科技, a wafer-capacity agent | closing by Oct 31, 2017 (FY2017 Q4) | news, 2017-09-29 |
+| TMC | Acquired 威達高科 (touch-panel ICs) and 群豐科技 (flash packaging) | 2017–2018, exact dates not yet found | zh.wikipedia, news |
+
+**The finding that stops the test.** The FinMind series is TMC's
+*consolidated* revenue: its H1 2018 sum matches the reported consolidated
+figure exactly. From late 2017 the predictor therefore measures masks plus
+wafer brokering, touch-panel ICs and flash packaging. H1 2018 revenue more
+than doubled on the acquisition alone, so the non-mask businesses are at least
+as large as the mask business.
+
+Check 2's rule — exclude quarters whose YoY comparison spans an event — does
+not cover this. It removes the year in which an acquisition enters the YoY
+comparison, but after that year the predictor is permanently a different
+quantity. Applied mechanically, it would test a mixed series and call the
+result a test of mask demand.
+
+Before late 2017 the predictor is clean, but the window is too short. The
+first PLAB quarter whose YoY growth and lagged YoY growth both fall after PDMC
+is FY2015 Q4; PLAB's FY2017 Q1 acquisition excludes FY2017 Q1–Q4; TMC's
+acquisitions start in FY2017 Q4. That leaves FY2015 Q4 – FY2016 Q4, five
+quarters — fewer than the twelve the expanding window needs before scoring
+its first one.
+
+**Status: not testable as specified.** This is neither a pass nor a fail.
+Checks 3 and 4 (earnings dates, coverage) were not completed for PLAB; TMC
+and UMC coverage is complete (201 months each, none missing or duplicated).
+How to proceed is an amendment to be decided before any model is fitted.
