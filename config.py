@@ -327,3 +327,18 @@ FEATURE_COLUMNS = [
     "VIX_Level",
     "VIX_Change"
 ]
+
+# ── Passive allocation (passive_allocator.py) ───────────────────────────────
+# A separate track from the model bot: hold a fixed stock allocation, invest
+# deposits into whichever fund is underweight, and sell only when drift leaves
+# the band. Chosen 2026-10-03 for a 10+ year horizon; see passive_allocator.py.
+PASSIVE_TARGETS = {"VTI": 0.60, "VXUS": 0.40}   # fixed weights, must sum to 1
+PASSIVE_BAND = 0.05            # sell only if a fund is > 5pp from its target
+PASSIVE_MIN_ORDER_USD = 1.00   # Alpaca's notional minimum; smaller orders are skipped
+PASSIVE_CASH_BUFFER_USD = 1.00 # left uninvested so a price tick cannot overdraw
+# False if the account cannot trade fractional shares (unconfirmed for Alpaca
+# IRAs): orders are then rounded down to whole shares.
+PASSIVE_FRACTIONAL = True
+PASSIVE_LOG_PATH = os.path.join(_REPO_ROOT, "data", "passive_log.csv")
+PASSIVE_RUN_GUARD_PATH = os.path.join(_REPO_ROOT, "data", "passive_last_run.txt")
+PASSIVE_FILL_TIMEOUT_S = 60    # max wait for a sell to fill before buying
