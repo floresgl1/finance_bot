@@ -297,3 +297,12 @@ NT$200M" in 3Q16, NT$649M in 3Q24, NT$931M in 4Q25; MP NT$2.43B (73%) in
 
 Unchecked: whether Faraday's Chinese-language investor presentations on MOPS
 give exact quarterly NRE before 2022.
+
+**Follow-up, same day.** MOPS monthly revenue for 3035 (checked by hand,
+民國115年08月) reports one total line — August 2026 NT$1,183,747k — so there
+is no monthly NRE. Faraday's own site serves quarterly reports from 2Q22 only,
+in English and Chinese; no earlier file names were found. The TWSE e-filing
+archive (`doc.twse.com.tw`) rejects this environment as MOPS does. The
+remaining source is Faraday's quarterly financial statements, whose IFRS 15
+revenue-disaggregation note may split NRE, IP and mass production from 2018,
+reachable only by hand.
