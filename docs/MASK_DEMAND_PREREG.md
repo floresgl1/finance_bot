@@ -384,3 +384,32 @@ reported first). After them, at least **32** usable quarters are required:
 12 to train, 20 to score. With fewer, the mechanism is closed as unmeasurable
 with public data, per the stop rule. The training window and the minimum are
 not reduced to make the count reach 32.
+
+### Rule A result — closed (2026-10-03)
+
+Faraday's annual reports were not reachable from this environment, but the
+exact year is not needed. UMC's share of 2025 purchases (20.64%, recorded
+above before Rule A was written) is below 50%, so Y ≤ 2025 and the sample
+ends no later than Faraday 2023 Q4, aligned with PLAB FY2024 Q1. Best case:
+
+| Step | PLAB quarters |
+|---|---|
+| FY2015 Q4 (first with clean YoY and lagged YoY after PDMC) → FY2024 Q1 | 34 |
+| FY2017 Q1 acquisition: FY2017 Q1–Q4, plus FY2018 Q1 for the lagged term | −5 |
+| Hefei and Xiamen: FY2019 Q2–FY2020 Q2, plus FY2020 Q3 for the lagged term | −6 |
+| **Usable** | **23** |
+
+The minimum is 32. Without the lagged-term exclusions the count is 25; any
+quarter where PLAB reported before Faraday's figures were public lowers it
+further. No reading of the remaining open items reaches 32.
+
+**The mechanism — merchant mask demand follows design starts — is closed as
+unmeasurable with public data**, per the stop rule agreed before the last
+check. No model was fitted at any point, and no figure relating TMC, UMC or
+Faraday to PLAB was computed or seen.
+
+Recorded for a possible future, separate hypothesis: Faraday's quarterly
+statements disclose the transaction price allocated to unsatisfied services
+and IP obligations (NT$1,254,894k at 2018-03-31) — a contracted design
+backlog. It is a different predictor of a different quantity and would need
+its own pre-registration.
