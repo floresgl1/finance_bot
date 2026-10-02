@@ -15,6 +15,12 @@ for either company has been looked at.
 UMC's monthly revenue as a sector series, so TMC has to add information beyond
 mature-node wafer volume, not just beyond PLAB's own trend.
 
+*Amended again 2026-10-02, still before any data exists:* the currency cost of
+row 1 is stated; a negative TMC coefficient is recorded as an observation, never
+a pass; the date range has a fallback start fixed now, and the structural
+check that confirms it is limited to the filing text describing the joint
+venture and the plants.
+
 ## Why this
 
 Ten probes found no edge in price-derived signals, mega-caps or micro-cap value
@@ -45,7 +51,7 @@ working mechanism underneath it would most likely be luck.
 | 1 | Predictor | TMC revenue summed over the three calendar months of PLAB's fiscal quarter, as **year-over-year growth**, in **TWD** |
 | 2 | Target | PLAB **total** quarterly revenue, as **year-over-year growth**, in USD, as first reported (not restated) |
 | 3 | Alignment | PLAB fiscal quarter Q uses TMC revenue for its three calendar months. Each month is treated as available on the **10th of the following month**. A quarter whose PLAB earnings date falls before the third month's availability date is **excluded** |
-| 4 | Date range | From the first PLAB quarter whose YoY comparison falls entirely after the PDMC joint venture was consolidated, through **FY2026 Q3** (May–Jul 2026). Exact start fixed in the structural checks from the 10-K, before any revenue figure is read |
+| 4 | Date range | From the first PLAB quarter whose YoY comparison falls entirely after the PDMC joint venture was consolidated, through **FY2026 Q3** (May–Jul 2026). Exact start fixed in the structural checks from the 10-K. **Fallback: FY2016 Q1** if the filings do not state the consolidation date clearly |
 | 5 | Baseline | **Model A:** PLAB's YoY growth this quarter = a + b × PLAB's YoY growth last quarter + d × UMC's YoY growth this quarter. **Model B:** Model A + c × TMC's YoY growth this quarter. UMC's growth is built exactly as TMC's is in rows 1 and 3: three calendar months summed, YoY, in TWD, each month available on the 10th of the following month. Both fitted on an **expanding window**; the first **12** usable quarters are training only; every later quarter is scored out of sample |
 
 ### Why each choice
@@ -56,6 +62,11 @@ working mechanism underneath it would most likely be luck.
    add a common exchange-rate component to both series, which can create
    correlation with no mask demand behind it. Leaving TMC in TWD can only
    weaken the relationship, never inflate it — the "err late" side.
+   **The cost, stated in advance:** PLAB reports in USD and translates its
+   Taiwan revenue from TWD, so a TWD move shifts PLAB's reported growth while
+   leaving TMC's and UMC's TWD growth untouched. That is noise neither model
+   can explain, and it makes a pass harder. A fail should be read knowing this
+   noise was left in on purpose.
 2. **Target.** Total revenue, not the IC segment or Taiwan alone: TMC also makes
    display masks, so an IC-only target would mismatch, and segment and
    geographic splits are reported less consistently than the top line. As first
@@ -70,7 +81,10 @@ working mechanism underneath it would most likely be luck.
    joint venture was formed; YoY growth across that boundary measures
    consolidation, not demand. FY2026 Q3 is the latest quarter reported as of
    this draft, and fixing the end date now stops the sample being extended
-   until it passes.
+   until it passes. The PDMC date in mind when this was written — the joint
+   venture with DNP closing in early 2014 — is from memory, not a filing. The
+   FY2016 Q1 fallback (two years after that) is fixed now so that confirming
+   the date cannot become a choice made after seeing data.
 5. **Baseline.** The obvious failure mode: both companies sell into the same
    semiconductor cycle, so their growth rates will correlate whether or not TMC
    carries any information PLAB's own history does not. Model A captures the
@@ -93,11 +107,17 @@ Run on the downloaded data before either model is fitted. Each may exclude
 quarters or fix the start date; none may look at the relationship between the
 two series.
 
-1. **PDMC consolidation date**, from the 10-K, sets row 4's start.
+Checks 1 and 2 read only the filing text that describes the joint venture,
+acquisitions and plants. Revenue tables often sit next to that text; any
+revenue figure seen while doing so is recorded in the amendment log.
+
+1. **PDMC consolidation date**, from the 10-K, sets row 4's start; FY2016 Q1
+   if no filing states it clearly.
 2. **M&A and capacity jumps.** List every acquisition, divestiture, or new fab
    start in either company's filings within the date range. Quarters whose YoY
-   comparison spans one are excluded. (PLAB's China mask plants, ramped around
-   2019–2020, are the known case: their growth is new capacity, not Taiwan
+   comparison spans one are excluded. (PLAB's China mask plants — Xiamen for
+   IC masks, Hefei for display masks, starting production around 2019 from
+   memory — are the known case: their growth is new capacity, not Taiwan
    design starts.)
 3. **Earnings dates.** Record PLAB's actual earnings date for every quarter.
    Apply row 3's exclusion rule and report how many quarters it drops.
@@ -111,7 +131,10 @@ All three must hold:
 1. **Direction.** Coefficient c, fitted on the full sample after scoring, is
    **positive**. The mechanism is market-wide demand, so TMC up should mean
    PLAB up. A negative c — share shifting between competitors — is a fail,
-   however strong.
+   however strong. It is recorded as an observation that may motivate a
+   separate pre-registration with its own mechanism, never as a pass of this
+   one; accepting either sign here would roughly double the chance a useless
+   predictor passes.
 2. **Model B beats model A in enough out-of-sample quarters.** With no
    information, each quarter is a coin flip:
 
