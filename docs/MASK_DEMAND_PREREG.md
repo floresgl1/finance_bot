@@ -353,3 +353,34 @@ Under the stop rule this document is now amended to use Faraday's quarterly
    ending one month later, and the row-3 exclusion when PLAB reports first.
 4. **Foundry shift.** A rule, fixed now, for the years Faraday moved most
    purchases away from UMC.
+
+### Rule A — sample cut at the foundry shift (fixed 2026-10-03, before the cutoff date is looked up)
+
+**Why.** A design is tied to the foundry it is taped out at, so Faraday's
+NRE moves to a new foundry before its wafer purchases do. Samsung and Intel,
+like TSMC, make their own masks, so NRE for designs taped out there creates no
+merchant-mask demand — and advanced-node projects are large enough to dominate
+NRE. After the shift, Faraday NRE measures a different market. A test that
+includes those years would be uninformative if it failed and suspect if it
+passed.
+
+**The cutoff.** For each year, UMC's share of Faraday's purchases is read
+from the major-supplier disclosure (主要進貨廠商) in Faraday's annual report
+(年報). Let Y be the first year UMC's share is below 50%, or is not stated (an
+unnamed supplier, or no disclosure). The sample ends with the last Faraday
+quarter of year **Y − 2**: one year earlier than the purchases show, because
+NRE leads purchases.
+
+**The start.** The first Faraday quarter whose YoY change in 提供勞務 can be
+computed from figures as filed, including prior-year comparatives printed in a
+later report. Expected 2018 Q1, using the 2017 Q1 comparative; if earlier
+reports carry a services line comparable to 提供勞務, the start moves back to
+match, and the comparability is judged on line labels and accounting policy
+text only, never on values.
+
+**Minimum.** All other exclusions still apply (PDMC, the FY2017 Q1
+acquisition, the FY2019 Hefei and Xiamen start-ups, quarters where PLAB
+reported first). After them, at least **32** usable quarters are required:
+12 to train, 20 to score. With fewer, the mechanism is closed as unmeasurable
+with public data, per the stop rule. The training window and the minimum are
+not reduced to make the count reach 32.
