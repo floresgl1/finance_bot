@@ -314,3 +314,42 @@ document is amended to use quarterly Faraday NRE as the predictor, with the
 post-2022 foundry shift handled by a rule fixed before any model is fitted.
 If it does not, the mechanism — mask demand follows design starts — is closed
 as unmeasurable with public data, and no further dataset is searched for it.
+
+### Last check result — condition met (2026-10-03)
+
+Faraday's 2018 Q1 consolidated financial statements (`201801_3035_AI1.pdf`,
+uploaded to the TWSE e-filing archive 2018-04-20; sha256
+`0ddc89423fa5e970546dd22ee3b2c76ef71ee6a6c02ef06d8b869dba71f290cb`), note
+六.15 "營業收入淨額", subsection (1) 收入細分, page 53, splits quarterly revenue
+into exact amounts:
+
+| Category | Line | 2018 Q1 (NT$k) |
+|---|---|---|
+| Mass production | 銷售商品 | 573,890 |
+| Design services (NRE) | 提供勞務 | 373,331 |
+| IP licensing | 矽智財授權收入 | 95,719 |
+
+The same note gives the 2017 Q1 comparative (商品 1,057,445; 勞務 374,707; no
+separate IP line under the old standard), so 2017 comparatives may extend the
+series one year back. It also states the transaction price allocated to
+unsatisfied services and IP obligations — NT$1,254,894k at 2018-03-31, to be
+recognised over 1–1.5 years — a design backlog figure. Neither is used yet.
+
+**Data seen:** only the Faraday figures above, plus the other notes on pages
+53–58 (receivables, leases, staff costs, other income). Nothing relating
+Faraday to PLAB.
+
+Under the stop rule this document is now amended to use Faraday's quarterly
+提供勞務 revenue as the predictor. Open before any model is fitted:
+
+1. **Label mapping.** 提供勞務 is "provision of services", not literally
+   "NRE". Confirm it matches the NRE Faraday reports in its quarterly results
+   for at least two quarters where both exist (2Q22 onward).
+2. **Availability date.** The financial statements are the certain public
+   date (2018 Q1: April 20; 2018 Q4: February 26 of the next year). Whether an
+   earlier date — the quarterly results release — may be used depends on that
+   release stating the same figure.
+3. **Alignment.** Faraday's calendar quarter Q against PLAB's fiscal quarter
+   ending one month later, and the row-3 exclusion when PLAB reports first.
+4. **Foundry shift.** A rule, fixed now, for the years Faraday moved most
+   purchases away from UMC.
