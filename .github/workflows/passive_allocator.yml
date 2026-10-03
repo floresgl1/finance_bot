@@ -3,7 +3,8 @@ name: Passive Allocator
 # Started at 16:00 UTC Mon–Fri by a PythonAnywhere scheduled task running
 # dispatch_workflow.py (see create_pa_dispatch_tasks.py) — inside market hours
 # in both EDT and EST. Trades its own paper account (PASSIVE_ALPACA_* secrets),
-# never the model bot's.
+# never the model bot's. The secret PASSIVE_ALPACA_API_SECRET is passed in
+# as PASSIVE_ALPACA_SECRET_KEY, the name the code reads.
 #
 # The runner is fresh each time, so passive_allocator.py's run guard does not
 # persist between runs. It does not need to: a second run the same day buys
@@ -36,7 +37,7 @@ jobs:
       - name: Run passive allocator
         env:
           PASSIVE_ALPACA_API_KEY: ${{ secrets.PASSIVE_ALPACA_API_KEY }}
-          PASSIVE_ALPACA_SECRET_KEY: ${{ secrets.PASSIVE_ALPACA_SECRET_KEY }}
+          PASSIVE_ALPACA_SECRET_KEY: ${{ secrets.PASSIVE_ALPACA_API_SECRET }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python passive_allocator.py
 
