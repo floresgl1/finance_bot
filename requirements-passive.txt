@@ -1,0 +1,8 @@
+# Only what passive_allocator.py imports, directly or via broker.py, config.py
+# and run_bot.py — so its workflow installs in seconds rather than pulling
+# torch, transformers and the rest of requirements.txt. Keep this in step
+# with requirements.txt if any of these four change there.
+alpaca-py
+pandas
+python-dotenv
+requests

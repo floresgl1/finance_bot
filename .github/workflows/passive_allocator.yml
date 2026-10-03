@@ -4,7 +4,10 @@ name: Passive Allocator
 # dispatch_workflow.py (see create_pa_dispatch_tasks.py) — inside market hours
 # in both EDT and EST. Trades its own paper account (PASSIVE_ALPACA_* secrets),
 # never the model bot's. The secret PASSIVE_ALPACA_API_SECRET is passed in
-# as PASSIVE_ALPACA_SECRET_KEY, the name the code reads.
+# as PASSIVE_ALPACA_SECRET_KEY, the name the code reads. Discord messages go
+# to PASSIVE_DISCORD_WEBHOOK_URL, its own channel, falling back to the model
+# bot's DISCORD_WEBHOOK_URL if that secret is missing — so a misnamed secret
+# moves the alerts to the main channel rather than silently dropping them.
 #
 # The runner is fresh each time, so passive_allocator.py's run guard does not
 # persist between runs. It does not need to: a second run the same day buys
@@ -32,13 +35,14 @@ jobs:
           python-version: '3.13'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        # The allocator's four packages only — see requirements-passive.txt.
+        run: pip install -r requirements-passive.txt
 
       - name: Run passive allocator
         env:
           PASSIVE_ALPACA_API_KEY: ${{ secrets.PASSIVE_ALPACA_API_KEY }}
           PASSIVE_ALPACA_SECRET_KEY: ${{ secrets.PASSIVE_ALPACA_API_SECRET }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.PASSIVE_DISCORD_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL }}
         run: python passive_allocator.py
 
       - name: Keep the order log
@@ -53,7 +57,7 @@ jobs:
       - name: Notify Discord on failure
         if: failure()
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.PASSIVE_DISCORD_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL }}
         run: |
           curl -H "Content-Type: application/json" \
                -X POST \
