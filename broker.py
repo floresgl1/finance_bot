@@ -135,15 +135,30 @@ class AlpacaREST:
 
     def submit_order(self, symbol: str, qty, side: str, type: str, time_in_force: str,
                      order_class: str | None = None, stop_loss: dict | None = None,
-                     stop_price: float | None = None, limit_price: float | None = None):
+                     stop_price: float | None = None, limit_price: float | None = None,
+                     notional: float | None = None):
         """Only the order shapes the bot places are supported; anything else
-        raises rather than being silently approximated."""
+        raises rather than being silently approximated.
+
+        `notional` (a dollar amount, in place of `qty`) is accepted only for a
+        plain market DAY order — the only shape Alpaca takes it in."""
         from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
         from alpaca.trading.requests import (
             MarketOrderRequest,
             StopLossRequest,
             StopOrderRequest,
         )
+
+        if notional is not None:
+            if (qty is not None or type != "market" or order_class not in (None, "simple")
+                    or time_in_force != "day"):
+                raise ValueError(
+                    f"broker.submit_order: notional orders must be plain market DAY "
+                    f"orders with qty=None; got qty={qty!r} type={type!r} "
+                    f"order_class={order_class!r} time_in_force={time_in_force!r}")
+            return _entity(self._trading.submit_order(order_data=MarketOrderRequest(
+                symbol=symbol, notional=round(float(notional), 2), side=OrderSide(side),
+                time_in_force=TimeInForce.DAY)))
 
         common = dict(symbol=symbol, qty=qty, side=OrderSide(side),
                       time_in_force=TimeInForce(time_in_force))

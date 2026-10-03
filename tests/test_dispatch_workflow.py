@@ -86,9 +86,10 @@ def test_usage_error_without_a_workflow_argument():
     assert dw.main([], now=MONDAY) == 1
 
 
-def test_setup_script_targets_the_two_pre_trade_workflows_at_the_right_times():
+def test_setup_script_targets_each_dispatched_workflow_at_the_right_time():
     import create_pa_dispatch_tasks as setup
-    assert setup.TASKS == [("update_market_data.yml", 12, 0), ("agent_pretrade.yml", 14, 15)]
+    assert setup.TASKS == [("update_market_data.yml", 12, 0), ("agent_pretrade.yml", 14, 15),
+                           ("passive_allocator.yml", 16, 0)]
     assert setup._command("bob", "agent_pretrade.yml") == \
         "cd /home/bob/finance_bot && python dispatch_workflow.py agent_pretrade.yml"
     assert setup._find([{"id": 7, "command": setup._command("bob", "agent_pretrade.yml")}],

@@ -198,6 +198,27 @@ def test_an_order_shape_the_bot_never_places_is_refused(fakes):
         api.submit_order(symbol="AAPL", qty=3, side="buy", type="limit", time_in_force="day")
 
 
+def test_notional_market_buy_sends_a_dollar_amount(fakes):
+    trading, api = fakes
+    api.submit_order(symbol="VTI", qty=None, side="buy", type="market",
+                     time_in_force="day", notional=120.004)
+    req = _last(trading, "submit_order")
+    assert isinstance(req, MarketOrderRequest)
+    assert (req.notional, req.qty, req.side, req.time_in_force) == (
+        120.0, None, OrderSide.BUY, TimeInForce.DAY)
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(qty=1, type="market", time_in_force="day"),        # both qty and notional
+    dict(qty=None, type="market", time_in_force="gtc"),     # Alpaca: notional is DAY only
+    dict(qty=None, type="stop", time_in_force="day", stop_price=1.0),
+])
+def test_a_notional_order_outside_the_supported_shape_is_refused(fakes, kwargs):
+    _, api = fakes
+    with pytest.raises(ValueError, match="notional orders must be"):
+        api.submit_order(symbol="VTI", side="buy", notional=50.0, **kwargs)
+
+
 def test_list_orders_translates_the_reconciler_query(fakes):
     trading, api = fakes
     api.list_orders(status="closed", after=date(2026, 9, 1).isoformat(), limit=500,

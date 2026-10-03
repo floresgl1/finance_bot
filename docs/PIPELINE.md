@@ -501,6 +501,7 @@ start them on time with `dispatch_workflow.py`:
 | 12:00 | `python dispatch_workflow.py update_market_data.yml` | market data refresh + webhook |
 | 14:15 | `python dispatch_workflow.py agent_pretrade.yml` | pre-trade agent |
 | 15:45 | `python pipeline_check.py` | daily alarm (below) |
+| 16:00 | `python dispatch_workflow.py passive_allocator.yml` | passive VTI/VXUS allocator — its own paper account, independent of the model bot |
 
 **`pipeline_check.py` — did every step produce today's output?** Exit codes
 missed two of the September 2026 silent failures (an expired token that exited
