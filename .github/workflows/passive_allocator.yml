@@ -1,0 +1,60 @@
+name: Passive Allocator
+
+# Started at 16:00 UTC Mon–Fri by a PythonAnywhere scheduled task running
+# dispatch_workflow.py (see create_pa_dispatch_tasks.py) — inside market hours
+# in both EDT and EST. Trades its own paper account (PASSIVE_ALPACA_* secrets),
+# never the model bot's.
+#
+# The runner is fresh each time, so passive_allocator.py's run guard does not
+# persist between runs. It does not need to: a second run the same day buys
+# only new cash and sells only outside the band, so it places no extra orders.
+# The concurrency group stops two runs overlapping mid-trade.
+# Can also be triggered manually from the Actions tab.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: passive-allocator
+  cancel-in-progress: false
+
+jobs:
+  allocate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run passive allocator
+        env:
+          PASSIVE_ALPACA_API_KEY: ${{ secrets.PASSIVE_ALPACA_API_KEY }}
+          PASSIVE_ALPACA_SECRET_KEY: ${{ secrets.PASSIVE_ALPACA_SECRET_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python passive_allocator.py
+
+      - name: Keep the order log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: passive-log-${{ github.run_id }}
+          path: data/passive_log.csv
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d "{\"content\": \"🚨 **PASSIVE ALLOCATOR FAILED**\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\nTimestamp: $(date -u)\"}" \
+               "$DISCORD_WEBHOOK_URL"

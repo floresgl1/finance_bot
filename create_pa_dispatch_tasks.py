@@ -4,6 +4,7 @@ that start GitHub workflows on time via dispatch_workflow.py.
 
     12:00 UTC  update_market_data.yml   (fresh CSVs before the 15:00 trade)
     14:15 UTC  agent_pretrade.yml       (agent decisions before the 15:00 trade)
+    16:00 UTC  passive_allocator.yml    (passive VTI/VXUS account, own keys)
 
 These replace the workflows' own `schedule:` crons, which GitHub ran up to
 seven hours late (see dispatch_workflow.py). PA daily tasks also fire at
@@ -32,6 +33,7 @@ load_dotenv()
 TASKS = [
     ("update_market_data.yml", 12, 0),
     ("agent_pretrade.yml", 14, 15),
+    ("passive_allocator.yml", 16, 0),
 ]
 
 
