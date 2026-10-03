@@ -32,7 +32,8 @@ jobs:
           python-version: '3.13'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        # The allocator's four packages only — see requirements-passive.txt.
+        run: pip install -r requirements-passive.txt
 
       - name: Run passive allocator
         env:
