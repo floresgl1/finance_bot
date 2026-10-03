@@ -16,6 +16,11 @@ name: Passive Allocator
 # Can also be triggered manually from the Actions tab.
 on:
   workflow_dispatch:
+    inputs:
+      discord_test:
+        description: "Send a Discord test message and skip the allocator"
+        type: boolean
+        default: false
 
 concurrency:
   group: passive-allocator
@@ -38,7 +43,28 @@ jobs:
         # The allocator's four packages only — see requirements-passive.txt.
         run: pip install -r requirements-passive.txt
 
+      - name: Send Discord test message
+        if: inputs.discord_test
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.PASSIVE_DISCORD_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL }}
+          WHICH: ${{ secrets.PASSIVE_DISCORD_WEBHOOK_URL && 'PASSIVE_DISCORD_WEBHOOK_URL' || 'DISCORD_WEBHOOK_URL (fallback — passive secret not found)' }}
+        run: |
+          echo "Posting via $WHICH"
+          # Posts directly, not via run_bot.send_discord, which swallows
+          # errors: a bad or empty webhook must turn this run red.
+          python - <<'PY'
+          import os, requests
+          url = os.environ["DISCORD_WEBHOOK_URL"]
+          if not url:
+              raise SystemExit("No Discord webhook secret is set.")
+          r = requests.post(url, timeout=10, json={"content":
+              f"✅ [passive] Discord test message — sent via {os.environ['WHICH']}."})
+          r.raise_for_status()
+          print(f"Discord answered HTTP {r.status_code}")
+          PY
+
       - name: Run passive allocator
+        if: ${{ !inputs.discord_test }}
         env:
           PASSIVE_ALPACA_API_KEY: ${{ secrets.PASSIVE_ALPACA_API_KEY }}
           PASSIVE_ALPACA_SECRET_KEY: ${{ secrets.PASSIVE_ALPACA_API_SECRET }}
