@@ -180,7 +180,9 @@ class FakeAPI:
         return SimpleNamespace(price=PRICES[symbol])
 
     def get_account(self):
-        return SimpleNamespace(cash=str(self.cash), buying_power=str(self.cash * 2))
+        equity = self.cash + sum(self.holdings.values())
+        return SimpleNamespace(cash=str(self.cash), buying_power=str(self.cash * 2),
+                               equity=str(equity))
 
     def submit_order(self, symbol, qty, side, type, time_in_force, notional=None):
         assert (type, time_in_force) == ("market", "day")
@@ -193,7 +195,13 @@ class FakeAPI:
         return SimpleNamespace(id=f"o{len(self.submitted)}", status="accepted")
 
     def get_order(self, order_id):
-        return SimpleNamespace(status=self.fill_status)
+        symbol, _, notional, qty = self.submitted[int(order_id[1:]) - 1]
+        if self.fill_status != "filled":
+            return SimpleNamespace(status=self.fill_status, filled_qty="0",
+                                   filled_avg_price=None)
+        shares = notional / PRICES[symbol] if notional is not None else qty
+        return SimpleNamespace(status="filled", filled_qty=str(shares),
+                               filled_avg_price=str(PRICES[symbol]))
 
     def list_orders(self, status=None, after=None, limit=None):
         assert status == "all"
@@ -259,6 +267,73 @@ def test_a_buy_still_open_at_the_timeout_is_logged_and_fails_the_run(paths):
     assert pa.run(api, today="2026-10-05", **paths) == 1
     rows = list(csv.DictReader(open(paths["log_path"])))
     assert [r["status"] for r in rows] == ["new", "new"]
+
+
+def test_the_log_records_what_each_order_filled_at(paths):
+    api = FakeAPI(cash=1000.0)
+    pa.run(api, today="2026-10-05", **paths)
+    vti = next(csv.DictReader(open(paths["log_path"])))
+    assert float(vti["filled_avg_price"]) == PRICES["VTI"]
+    assert float(vti["filled_qty"]) == pytest.approx(599.40 / PRICES["VTI"])
+
+
+def test_an_old_log_is_rewritten_under_the_new_header(paths):
+    old = ["date", "symbol", "side", "notional", "qty", "status", "order_id", "reason"]
+    with open(paths["log_path"], "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(old)
+        w.writerow(["2026-10-02", "VTI", "buy", "10.0", "", "filled", "x1", "DEPOSIT"])
+    pa.run(FakeAPI(cash=1000.0), today="2026-10-05", **paths)
+    rows = list(csv.DictReader(open(paths["log_path"])))
+    assert [r["date"] for r in rows] == ["2026-10-02", "2026-10-05", "2026-10-05"]
+    assert rows[0]["filled_qty"] == "" and rows[1]["filled_qty"] != ""
+
+
+def test_discord_gets_one_summary_when_orders_are_placed(paths, monkeypatch):
+    sent = []
+    monkeypatch.setattr(pa, "send_discord", sent.append)
+    pa.run(FakeAPI(cash=1000.0), today="2026-10-05", **paths)
+    assert len(sent) == 1
+    assert sent[0].startswith("**Passive Allocator — Trade Results** | ")
+    assert "Portfolio value: **$1,000.00**" in sent[0]
+
+
+def test_discord_stays_quiet_when_there_is_nothing_to_do(paths, monkeypatch):
+    sent = []
+    monkeypatch.setattr(pa, "send_discord", sent.append)
+    api = FakeAPI(holdings={"VTI": 600.0, "VXUS": 400.0}, cash=0.0)
+    assert pa.run(api, today="2026-10-05", **paths) == 0
+    assert api.submitted == [] and sent == []
+
+
+def _row(symbol, status, filled_qty=None, price=None, notional=100.0):
+    return {"symbol": symbol, "side": "buy", "notional": notional, "qty": None,
+            "status": status, "order_id": f"id-{symbol}", "reason": "DEPOSIT",
+            "filled_qty": filled_qty, "filled_avg_price": price}
+
+
+def test_build_summary_sorts_orders_into_filled_unfilled_and_errors():
+    msg = pa.build_summary([_row("VTI", "filled", 1.0412, 287.55),
+                            _row("VXUS", "new"),
+                            _row("VEA", "error: 422 insufficient buying power")],
+                           portfolio_value=500.0, timestamp="2026-10-05 16:00:00 UTC")
+    assert msg.splitlines() == [
+        "**Passive Allocator — Trade Results** | 2026-10-05 16:00:00 UTC",
+        "Portfolio value: **$500.00**",
+        "```",
+        "Filled:",
+        "  BUY  VTI    x1.0412    @ $  287.55  (DEPOSIT)  order id-VTI",
+        "Unfilled:",
+        "  BUY  VXUS   $100.00    — new  order id-VXUS",
+        "Errors:",
+        "  BUY  VEA    $100.00    — error: 422 insufficient buying power",
+        "```",
+    ]
+
+
+def test_build_summary_says_none_for_empty_sections():
+    msg = pa.build_summary([_row("VTI", "filled", 1.0, 100.0)], 100.0, "t")
+    assert "Unfilled: none" in msg and "Errors:  none" in msg
 
 
 def test_an_account_holding_other_symbols_is_refused(paths):

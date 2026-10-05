@@ -22,6 +22,7 @@ Execution sequence (one run per trading day):
     market open? → run guard → read account → refuse foreign positions
       → plan_sells → submit, wait for fills → re-read account
       → plan_buys → submit, wait for fills → log, Discord summary
+                                                   (only if it traded)
 
 The run guard asks the broker, not a file: any order the account placed
 since midnight UTC today means today's run already happened. On GitHub
@@ -65,7 +66,7 @@ from config import (
 _EPS = 1e-9                     # float slack: a weight exactly on the band edge is inside it
 _TERMINAL = {"filled", "canceled", "expired", "rejected", "done_for_day"}
 _LOG_FIELDS = ["date", "symbol", "side", "notional", "qty", "status",
-               "order_id", "reason"]
+               "order_id", "reason", "filled_qty", "filled_avg_price"]
 
 
 @dataclass(frozen=True)
@@ -184,18 +185,38 @@ def _submit(api, order: Order):
                             type="market", time_in_force="day")
 
 
-def _wait_for_fill(api, order_id: str, timeout_s: float, poll_s: float = 1.0) -> str:
+def _status(order) -> str:
+    return str(order.status).lower().split(".")[-1]
+
+
+def _wait_for_fill(api, order_id: str, timeout_s: float, poll_s: float = 1.0):
+    """The order once it reaches a terminal status, or as it stands at the timeout."""
     deadline = time.monotonic() + timeout_s
     while True:
-        status = str(api.get_order(order_id).status).lower().split(".")[-1]
-        if status in _TERMINAL or time.monotonic() >= deadline:
-            return status
+        order = api.get_order(order_id)
+        if _status(order) in _TERMINAL or time.monotonic() >= deadline:
+            return order
         time.sleep(poll_s)
+
+
+def _as_float(raw) -> float | None:
+    """Alpaca sends fill fields as strings, or None before a fill."""
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _log(rows: list[dict], path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     new = not os.path.exists(path)
+    if not new:
+        with open(path, newline="") as fh:
+            reader = csv.DictReader(fh)
+            if reader.fieldnames != _LOG_FIELDS:   # a log from before a column was added:
+                rows, new = list(reader) + rows, True  # rewrite it under the new header
+        if new:
+            os.remove(path)
     with open(path, "a", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=_LOG_FIELDS)
         if new:
@@ -218,20 +239,65 @@ def _place(api, orders: list[Order], today: str, rows: list[dict],
     status. Returns a one-line summary per order."""
     lines = []
     for o in orders:
+        filled_qty = filled_avg_price = None
         try:
             placed = _submit(api, o)
-            status = str(placed.status).lower().split(".")[-1]
-            if wait_s is not None:
-                status = _wait_for_fill(api, placed.id, wait_s)
-            order_id = placed.id
+            order = _wait_for_fill(api, placed.id, wait_s) if wait_s is not None else placed
+            status, order_id = _status(order), placed.id
+            filled_qty = _as_float(getattr(order, "filled_qty", None))
+            filled_avg_price = _as_float(getattr(order, "filled_avg_price", None))
         except Exception as exc:             # one bad order must not stop the rest
             status, order_id = f"error: {exc}", ""
         rows.append({"date": today, "symbol": o.symbol, "side": o.side,
                      "notional": o.notional, "qty": o.qty, "status": status,
-                     "order_id": order_id, "reason": o.reason})
+                     "order_id": order_id, "reason": o.reason,
+                     "filled_qty": filled_qty, "filled_avg_price": filled_avg_price})
         size = f"${o.notional:,.2f}" if o.notional is not None else f"{o.qty} sh"
         lines.append(f"{o.side.upper()} {o.symbol} {size} ({o.reason}) → {status}")
     return lines
+
+
+def build_summary(rows: list[dict], portfolio_value: float, timestamp: str) -> str:
+    """The Discord message for a run that placed orders — the same layout as
+    the model bot's live_trader.build_post_order_alert. Pure, so it is tested
+    without an account."""
+    def is_error(r):
+        return r["status"].startswith("error") or r["status"] == "rejected"
+
+    filled = [r for r in rows if r["status"] == "filled"]
+    errors = [r for r in rows if is_error(r)]
+    unfilled = [r for r in rows if r["status"] != "filled" and not is_error(r)]
+
+    def size(r):
+        return f"${r['notional']:,.2f}" if r["notional"] is not None else f"{r['qty']} sh"
+
+    lines = [f"**Passive Allocator — Trade Results** | {timestamp}",
+             f"Portfolio value: **${portfolio_value:,.2f}**",
+             "```"]
+    if filled:
+        lines.append("Filled:")
+        for r in filled:
+            qty = f"x{r['filled_qty']:.4f}" if r["filled_qty"] is not None else "x?"
+            px = f"@ ${r['filled_avg_price']:>8.2f}" if r["filled_avg_price"] is not None else "@ ?"
+            lines.append(f"  {r['side'].upper():<4} {r['symbol']:<6} {qty:<10} {px}  "
+                         f"({r['reason']})  order {r['order_id']}")
+    else:
+        lines.append("Filled:  none")
+    if unfilled:
+        lines.append("Unfilled:")
+        for r in unfilled:
+            lines.append(f"  {r['side'].upper():<4} {r['symbol']:<6} {size(r):<10} "
+                         f"— {r['status']}  order {r['order_id']}")
+    else:
+        lines.append("Unfilled: none")
+    if errors:
+        lines.append("Errors:")
+        for r in errors:
+            lines.append(f"  {r['side'].upper():<4} {r['symbol']:<6} {size(r):<10} — {r['status']}")
+    else:
+        lines.append("Errors:  none")
+    lines.append("```")
+    return "\n".join(lines)
 
 
 def run(api, today: str | None = None,
@@ -264,17 +330,15 @@ def run(api, today: str | None = None,
     lines += _place(api, plan_buys(values, cash, prices, targets), today, rows,
                     wait_s=fill_timeout_s)
 
-    if rows:
-        _log(rows, log_path)
+    if not rows:
+        print(f"[passive] {today}: on target, cash ${cash:,.2f} — nothing to do.")
+        return 0
 
-    held = sum(values.values())
-    weights = ", ".join(f"{s} {values.get(s, 0.0) / held:.1%}" for s in targets) if held else "empty"
-    summary = f"[passive] {today}: before buys {weights}; cash ${cash:,.2f}"
-    if lines:
-        summary += "\n" + "\n".join(lines)
-    print(summary)
-    if lines:
-        send_discord(summary)
+    _log(rows, log_path)
+    print("\n".join(lines))
+    portfolio_value = float(api.get_account().equity)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    send_discord(build_summary(rows, portfolio_value, timestamp))
     # Every order was waited on, so anything short of filled — an error, a
     # rejection, or an order still open at the timeout — needs a person.
     return 1 if any(r["status"] != "filled" for r in rows) else 0
