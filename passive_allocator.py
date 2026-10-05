@@ -21,7 +21,14 @@ Execution sequence (one run per trading day):
 
     market open? → run guard → read account → refuse foreign positions
       → plan_sells → submit, wait for fills → re-read account
-      → plan_buys → submit → log, guard, Discord summary
+      → plan_buys → submit, wait for fills → log, Discord summary
+
+The run guard asks the broker, not a file: any order the account placed
+since midnight UTC today means today's run already happened. On GitHub
+Actions every runner starts fresh, so a file would never be there; the
+account is the only state that outlives a run. It also covers an earlier
+run whose buys are still open — those show in neither positions nor cash,
+so without the guard a second run would buy the same deposit again.
 
 The account must hold nothing but the target funds and cash. A position in
 any other symbol means the account is shared — with the model bot, say — and
@@ -41,6 +48,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import broker
 from config import (
@@ -50,7 +58,6 @@ from config import (
     PASSIVE_FRACTIONAL,
     PASSIVE_LOG_PATH,
     PASSIVE_MIN_ORDER_USD,
-    PASSIVE_RUN_GUARD_PATH,
     PASSIVE_TARGETS,
     today_utc,
 )
@@ -196,18 +203,13 @@ def _log(rows: list[dict], path: str) -> None:
         w.writerows(rows)
 
 
-def _already_ran(today: str, guard_path: str) -> bool:
-    try:
-        with open(guard_path) as fh:
-            return fh.read().strip() == today
-    except FileNotFoundError:
-        return False
-
-
-def _write_guard(today: str, guard_path: str) -> None:
-    os.makedirs(os.path.dirname(guard_path), exist_ok=True)
-    with open(guard_path, "w") as fh:
-        fh.write(today)
+def _already_ran(api, today: str) -> bool:
+    """True if the account has placed any order since midnight UTC `today`
+    — the same UTC date today_utc() gives. The allocator only trades while
+    the market is open (13:30–21:00 UTC), so yesterday's run can never land
+    after midnight UTC."""
+    midnight = datetime.fromisoformat(today).replace(tzinfo=timezone.utc)
+    return bool(api.list_orders(status="all", after=midnight, limit=1))
 
 
 def _place(api, orders: list[Order], today: str, rows: list[dict],
@@ -235,7 +237,6 @@ def _place(api, orders: list[Order], today: str, rows: list[dict],
 def run(api, today: str | None = None,
         targets: dict[str, float] = PASSIVE_TARGETS,
         log_path: str = PASSIVE_LOG_PATH,
-        guard_path: str = PASSIVE_RUN_GUARD_PATH,
         fill_timeout_s: float = PASSIVE_FILL_TIMEOUT_S) -> int:
     """One allocation pass. Returns a process exit code: 0 for done or
     nothing to do, 1 for a refusal or failure that needs a person."""
@@ -243,7 +244,7 @@ def run(api, today: str | None = None,
     if not api.get_clock().is_open:
         print("[passive] Market closed — nothing to do.")
         return 0
-    if _already_ran(today, guard_path):
+    if _already_ran(api, today):
         print(f"[passive] Already ran {today}.")
         return 0
 
@@ -260,11 +261,11 @@ def run(api, today: str | None = None,
                    wait_s=fill_timeout_s)
     if lines:                                 # sale proceeds are now cash
         values, cash, prices, _ = _read_state(api, targets)
-    lines += _place(api, plan_buys(values, cash, prices, targets), today, rows)
+    lines += _place(api, plan_buys(values, cash, prices, targets), today, rows,
+                    wait_s=fill_timeout_s)
 
     if rows:
         _log(rows, log_path)
-    _write_guard(today, guard_path)
 
     held = sum(values.values())
     weights = ", ".join(f"{s} {values.get(s, 0.0) / held:.1%}" for s in targets) if held else "empty"
@@ -274,8 +275,9 @@ def run(api, today: str | None = None,
     print(summary)
     if lines:
         send_discord(summary)
-    return 1 if any(r["status"].startswith("error") or r["status"] == "rejected"
-                    for r in rows) else 0
+    # Every order was waited on, so anything short of filled — an error, a
+    # rejection, or an order still open at the timeout — needs a person.
+    return 1 if any(r["status"] != "filled" for r in rows) else 0
 
 
 def connect() -> broker.AlpacaREST:

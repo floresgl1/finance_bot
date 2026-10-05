@@ -9,10 +9,12 @@ name: Passive Allocator
 # bot's DISCORD_WEBHOOK_URL if that secret is missing — so a misnamed secret
 # moves the alerts to the main channel rather than silently dropping them.
 #
-# The runner is fresh each time, so passive_allocator.py's run guard does not
-# persist between runs. It does not need to: a second run the same day buys
-# only new cash and sells only outside the band, so it places no extra orders.
-# The concurrency group stops two runs overlapping mid-trade.
+# The runner is fresh each time, so passive_allocator.py keeps its run guard
+# at the broker: any order the account placed since midnight UTC stops a
+# second run that day. A file would not survive the runner, and without a
+# guard a second run would re-buy a deposit whose first buys are still open
+# (open orders show in neither positions nor cash). The concurrency group
+# stops two runs overlapping mid-trade.
 # Can also be triggered manually from the Actions tab.
 on:
   workflow_dispatch:

@@ -15,6 +15,8 @@ Constants are asserted up front so a config change surfaces here as an
 explicit failure, not as silently rewritten expectations.
 """
 
+import csv
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -150,14 +152,19 @@ def test_targets_that_do_not_sum_to_one_are_refused(bad):
 
 
 class FakeAPI:
-    """Holds positions and cash; a notional order fills instantly at PRICES."""
+    """Holds positions and cash; a notional order fills instantly at PRICES.
+    Orders are stamped with `now`, which list_orders filters on like Alpaca."""
 
-    def __init__(self, holdings=None, cash=0.0, is_open=True, foreign=()):
+    def __init__(self, holdings=None, cash=0.0, is_open=True, foreign=(),
+                 now=datetime(2026, 10, 5, 16, 0, tzinfo=timezone.utc)):
         self.holdings = dict(holdings or {})
         self.cash = cash
         self.is_open = is_open
         self.foreign = list(foreign)
+        self.now = now
         self.submitted = []
+        self.submitted_at = []
+        self.fill_status = "filled"
 
     def get_clock(self):
         return SimpleNamespace(is_open=self.is_open)
@@ -182,31 +189,37 @@ class FakeAPI:
         self.holdings[symbol] = self.holdings.get(symbol, 0.0) + sign * amount
         self.cash -= sign * amount
         self.submitted.append((symbol, side, notional, qty))
+        self.submitted_at.append(self.now)
         return SimpleNamespace(id=f"o{len(self.submitted)}", status="accepted")
 
     def get_order(self, order_id):
-        return SimpleNamespace(status="filled")
+        return SimpleNamespace(status=self.fill_status)
+
+    def list_orders(self, status=None, after=None, limit=None):
+        assert status == "all"
+        hits = [SimpleNamespace(submitted_at=t) for t in self.submitted_at
+                if after is None or t > after]
+        return hits[:limit]
 
 
 @pytest.fixture
 def paths(tmp_path, monkeypatch):
     monkeypatch.setattr(pa, "send_discord", lambda msg: None)
-    return dict(log_path=str(tmp_path / "log.csv"),
-                guard_path=str(tmp_path / "guard.txt"))
+    return dict(log_path=str(tmp_path / "log.csv"), fill_timeout_s=0)
 
 
-def test_market_closed_places_nothing_and_writes_no_guard(paths):
+def test_market_closed_places_nothing(paths):
     api = FakeAPI(cash=1000.0, is_open=False)
     assert pa.run(api, today="2026-10-05", **paths) == 0
     assert api.submitted == []
-    assert pa._already_ran("2026-10-05", paths["guard_path"]) is False
 
 
-def test_first_run_invests_the_deposit_and_writes_the_guard(paths):
+def test_first_run_invests_the_deposit_and_logs_the_fills(paths):
     api = FakeAPI(cash=1000.0)
     assert pa.run(api, today="2026-10-05", **paths) == 0
     assert api.submitted == [("VTI", "buy", 599.40, None), ("VXUS", "buy", 399.60, None)]
-    assert pa._already_ran("2026-10-05", paths["guard_path"])
+    rows = list(csv.DictReader(open(paths["log_path"])))
+    assert [r["status"] for r in rows] == ["filled", "filled"]
 
 
 def test_a_second_run_the_same_day_does_nothing(paths):
@@ -216,6 +229,36 @@ def test_a_second_run_the_same_day_does_nothing(paths):
     n = len(api.submitted)
     assert pa.run(api, today="2026-10-05", **paths) == 0
     assert len(api.submitted) == n
+
+
+def test_a_second_run_while_the_first_runs_buys_are_open_does_not_rebuy(paths):
+    # An open buy shows in neither positions nor cash: the account looks
+    # exactly as it did before the first run. Only the guard stops a re-buy.
+    api = FakeAPI(cash=1000.0)
+    api.fill_status = "new"
+    pa.run(api, today="2026-10-05", **paths)
+    api.holdings, api.cash = {}, 1000.0
+    n = len(api.submitted)
+    assert pa.run(api, today="2026-10-05", **paths) == 0
+    assert len(api.submitted) == n
+
+
+def test_yesterdays_orders_do_not_block_today(paths):
+    api = FakeAPI(cash=1000.0, now=datetime(2026, 10, 2, 16, 0, tzinfo=timezone.utc))
+    pa.run(api, today="2026-10-02", **paths)
+    api.cash += 500.0
+    api.now = datetime(2026, 10, 5, 16, 0, tzinfo=timezone.utc)
+    n = len(api.submitted)
+    pa.run(api, today="2026-10-05", **paths)
+    assert len(api.submitted) > n
+
+
+def test_a_buy_still_open_at_the_timeout_is_logged_and_fails_the_run(paths):
+    api = FakeAPI(cash=1000.0)
+    api.fill_status = "new"
+    assert pa.run(api, today="2026-10-05", **paths) == 1
+    rows = list(csv.DictReader(open(paths["log_path"])))
+    assert [r["status"] for r in rows] == ["new", "new"]
 
 
 def test_an_account_holding_other_symbols_is_refused(paths):
