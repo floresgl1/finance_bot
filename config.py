@@ -340,5 +340,4 @@ PASSIVE_CASH_BUFFER_USD = 1.00 # left uninvested so a price tick cannot overdraw
 # IRAs): orders are then rounded down to whole shares.
 PASSIVE_FRACTIONAL = True
 PASSIVE_LOG_PATH = os.path.join(_REPO_ROOT, "data", "passive_log.csv")
-PASSIVE_RUN_GUARD_PATH = os.path.join(_REPO_ROOT, "data", "passive_last_run.txt")
-PASSIVE_FILL_TIMEOUT_S = 60    # max wait for a sell to fill before buying
+PASSIVE_FILL_TIMEOUT_S = 60    # max wait per order to fill; still open after that fails the run
